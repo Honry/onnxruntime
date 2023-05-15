@@ -23,7 +23,7 @@ class UnaryOpBuilder : public BaseOpBuilder {
 // Add operator related.
 
 Status UnaryOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
-                                              const logging::Logger& /* logger */) const {
+                                             const logging::Logger& /* logger */) const {
   const auto& op_type(node.OpType());
 
   emscripten::val input = model_builder.GetOperand(node.InputDefs()[0]->Name());
