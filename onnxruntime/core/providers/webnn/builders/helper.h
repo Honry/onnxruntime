@@ -39,6 +39,8 @@ std::string GetShapeString(std::vector<T>& shape) {
   return shape_info.str();
 }
 
+bool GetShapeByTensor(const onnx::TensorProto& tensor, std::vector<int64_t>& shape, const logging::Logger& logger);
+
 bool IsInputSupported(const NodeArg& node_arg, const std::string& parent_name, const logging::Logger& logger);
 
 // Get a list of groups of supported nodes, each group represents a subgraph supported by WebNN EP.

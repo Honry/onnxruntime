@@ -32,31 +32,6 @@ class ExpandOpBuilder : public BaseOpBuilder {
                          const logging::Logger& logger) const override;
 };
 
-bool GetExpandShape(const onnx::TensorProto& tensor, std::vector<int64_t>& shape, const logging::Logger& logger) {
-  std::vector<uint8_t> unpacked_tensor;
-  auto status = onnxruntime::utils::UnpackInitializerData(tensor, unpacked_tensor);
-  if (!status.IsOK()) {
-    LOGS(logger, ERROR) << "Error while unpacking shape: " << status.ErrorMessage();
-    return false;
-  }
-  const auto& dims = tensor.dims();
-  if (dims.empty() || dims[0] == 0) {
-    LOGS(logger, VERBOSE) << "The shape of expand cannot be empty.";
-    return false;
-  }
-  if (dims.size() != 1) {
-    LOGS(logger, VERBOSE) << "The shape of expand must be 1D.";
-    return false;
-  }
-  if (tensor.data_type() != ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
-    LOGS(logger, VERBOSE) << "The shape element data type must be INT64.";
-    return false;
-  }
-  const int64_t* shape_data = reinterpret_cast<const int64_t*>(unpacked_tensor.data());
-  shape = std::vector<int64_t>{shape_data, shape_data + dims[0]};
-  return true;
-}
-
 // Add operator related.
 
 void ExpandOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
@@ -70,7 +45,7 @@ Status ExpandOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   const auto& initializers(model_builder.GetInitializerTensors());
   const auto& shape_tensor = *initializers.at(input_defs[1]->Name());
   std::vector<int64_t> raw_shape;
-  ORT_RETURN_IF_NOT(GetExpandShape(shape_tensor, raw_shape, logger), "Cannot get shape.");
+  ORT_RETURN_IF_NOT(GetShapeByTensor(shape_tensor, raw_shape, logger), "Cannot get shape.");
   std::vector<int32_t> new_shape;
   std::transform(raw_shape.cbegin(), raw_shape.cend(),
                  std::back_inserter(new_shape),
@@ -102,7 +77,7 @@ bool ExpandOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers
 
   std::vector<int64_t> new_shape;
   const auto& shape_tensor = *initializers.at(shape_name);
-  if (!GetExpandShape(shape_tensor, new_shape, logger)) {
+  if (!GetShapeByTensor(shape_tensor, new_shape, logger)) {
     LOGS(logger, VERBOSE) << "Cannot get shape.";
     return false;
   }
