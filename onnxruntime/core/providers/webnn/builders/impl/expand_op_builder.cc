@@ -44,12 +44,8 @@ Status ExpandOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   const auto& input_defs = node.InputDefs();
   const auto& initializers(model_builder.GetInitializerTensors());
   const auto& shape_tensor = *initializers.at(input_defs[1]->Name());
-  std::vector<int64_t> raw_shape;
-  ORT_RETURN_IF_NOT(GetShapeByTensor(shape_tensor, raw_shape, logger), "Cannot get shape.");
   std::vector<int32_t> new_shape;
-  std::transform(raw_shape.cbegin(), raw_shape.cend(),
-                 std::back_inserter(new_shape),
-                 [](int64_t dim) -> int32_t { return SafeInt<int32_t>(dim); });
+  ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(shape_tensor, new_shape, logger), "Cannot get shape.");
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
   std::vector<int64_t> input_shape;
   ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input's shape.");
@@ -77,7 +73,7 @@ bool ExpandOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers
 
   std::vector<int64_t> new_shape;
   const auto& shape_tensor = *initializers.at(shape_name);
-  if (!GetShapeByTensor(shape_tensor, new_shape, logger)) {
+  if (!ReadIntArrayFrom1DTensor(shape_tensor, new_shape, logger)) {
     LOGS(logger, VERBOSE) << "Cannot get shape.";
     return false;
   }

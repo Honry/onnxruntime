@@ -47,16 +47,12 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   if (input_defs.size() == 2) {
     // Inputs contains optional 'split' input
-    std::vector<int64_t> split;
+    std::vector<int32_t> splits;
     const auto& initializers(model_builder.GetInitializerTensors());
     const auto& split_tensor = *initializers.at(input_defs[1]->Name());
-    ORT_RETURN_IF_NOT(GetShapeByTensor(split_tensor, split, logger), "Cannot get split.");
-    std::vector<int32_t> splits;
-    std::transform(split.cbegin(), split.cend(),
-                   std::back_inserter(splits),
-                   [](int64_t dim) -> int32_t { return SafeInt<int32_t>(dim); });
+    ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(split_tensor, splits, logger), "Cannot get split.");
     output_array = model_builder.GetBuilder().call<emscripten::val>("split", input, emscripten::val::array(splits), options);
-    ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(split.size()), "The size of outputs must be equal to the size of 'split' input.");
+    ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(splits.size()), "The size of outputs must be equal to the size of 'split' input.");
   } else {
     if (helper.HasAttr("num_outputs")) {
       const int64_t num_outputs = helper.Get("num_outputs", 1);
@@ -118,7 +114,7 @@ bool SplitOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
     // Values should be >= 0.Sum of the values must be equal to the dim value at 'axis' specified.
     std::vector<int64_t> split;
     const auto& split_tensor = *initializers.at(input_defs[1]->Name());
-    if (!GetShapeByTensor(split_tensor, split, logger)) {
+    if (!ReadIntArrayFrom1DTensor(split_tensor, split, logger)) {
       LOGS(logger, VERBOSE) << "Cannot get split.";
       return false;
     }

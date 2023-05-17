@@ -7,8 +7,6 @@
 #include "helper.h"
 #include <core/graph/graph_viewer.h>
 
-#include "core/optimizer/initializer.h"
-#include "core/providers/shared/utils/utils.h"
 #include "op_builder_factory.h"
 
 namespace onnxruntime {
@@ -26,31 +24,6 @@ bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const loggin
     shape.push_back(dim.dim_value());
   }
 
-  return true;
-}
-
-bool GetShapeByTensor(const onnx::TensorProto& tensor, std::vector<int64_t>& shape, const logging::Logger& logger) {
-  std::vector<uint8_t> unpacked_tensor;
-  auto status = onnxruntime::utils::UnpackInitializerData(tensor, unpacked_tensor);
-  if (!status.IsOK()) {
-    LOGS(logger, ERROR) << "Error while unpacking shape: " << status.ErrorMessage();
-    return false;
-  }
-  const auto& dims = tensor.dims();
-  if (dims.empty() || dims[0] == 0) {
-    LOGS(logger, VERBOSE) << "The shape cannot be empty.";
-    return false;
-  }
-  if (dims.size() != 1) {
-    LOGS(logger, VERBOSE) << "The shape must be 1D.";
-    return false;
-  }
-  if (tensor.data_type() != ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
-    LOGS(logger, VERBOSE) << "The shape element data type must be INT64.";
-    return false;
-  }
-  const int64_t* shape_data = reinterpret_cast<const int64_t*>(unpacked_tensor.data());
-  shape = std::vector<int64_t>{shape_data, shape_data + dims[0]};
   return true;
 }
 
