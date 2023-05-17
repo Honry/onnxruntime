@@ -97,8 +97,8 @@ Status ModelBuilder::RegisterInitializers() {
     const auto& shape = tensor.dims();
     std::vector<int32_t> dims;
     if (shape.empty()) {
-      // This is a scalar initializer, WebNN requires a shape, make this a {1} tensor.
-      dims = {1};
+      // This is a scalar initializer.
+      dims = {};
     } else {
       std::transform(shape.cbegin(), shape.cend(),
                      std::back_inserter(dims),
