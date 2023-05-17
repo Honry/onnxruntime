@@ -52,7 +52,6 @@ Status SliceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   emscripten::val inputs = model_builder.GetOperand(input_defs[0]->Name());
   std::vector<int32_t> starts(rank, 0);
   std::vector<int32_t> sizes(input_shape.begin(), input_shape.end());
-  const std::string& axes_name = std::string("axes");
 
   // Copy the data from the starts/ends/axes/steps initializers.
   TensorShapeVector input_starts;
