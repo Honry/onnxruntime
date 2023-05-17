@@ -56,7 +56,7 @@ bool GatherOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers
     return false;
   const auto rank = input_shape.size();
   if (rank < 1) {
-    LOGS(logger, VERBOSE) << "Gathe only support input size >= 1d shape, input is "
+    LOGS(logger, VERBOSE) << "Gather only supports input shapes >= 1D, but input is "
                           << rank << "d shape";
     return false;
   }
