@@ -96,14 +96,10 @@ Status ModelBuilder::RegisterInitializers() {
 
     const auto& shape = tensor.dims();
     std::vector<int32_t> dims;
-    if (shape.empty()) {
-      // This is a scalar initializer.
-      dims = {};
-    } else {
-      std::transform(shape.cbegin(), shape.cend(),
-                     std::back_inserter(dims),
-                     [](int64_t dim) -> int32_t { return SafeInt<int32_t>(dim); });
-    }
+    // When the shape is empty, it is scalar initializer that dims = {};
+    std::transform(shape.cbegin(), shape.cend(),
+                   std::back_inserter(dims),
+                   [](int64_t dim) -> int32_t { return SafeInt<int32_t>(dim); });
 
     emscripten::val desc = emscripten::val::object();
     desc.set("dimensions", emscripten::val::array(dims));

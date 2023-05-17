@@ -18,6 +18,10 @@ class GatherOpBuilder : public BaseOpBuilder {
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
+
+  // Operator support related.
+  bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+                         const logging::Logger& logger) const override;
 };
 
 // Add operator related.
@@ -27,11 +31,8 @@ Status GatherOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                               const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   std::vector<int64_t> input_shape;
-  if (!GetShape(*input_defs[0], input_shape, logger)) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
-                           "GatherOpBuilder::AddToModelBuilderImpl, cannot get input shape");
-  }
-  auto rank = input_shape.size();
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get shape");
+  const auto rank = input_shape.size();
   NodeAttrHelper helper(node);
   const uint32_t axis = static_cast<uint32_t>(HandleNegativeAxis(helper.Get("axis", 1), rank));
 
@@ -43,6 +44,24 @@ Status GatherOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   return Status::OK();
+}
+
+// Operator support related.
+
+bool GatherOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+                                         const logging::Logger& logger) const {
+  const auto& input_defs = node.InputDefs();
+  std::vector<int64_t> input_shape;
+  if (!GetShape(*input_defs[0], input_shape, logger))
+    return false;
+  const auto rank = input_shape.size();
+  if (rank < 1) {
+    LOGS(logger, VERBOSE) << "Gathe only support input size >= 1d shape, input is "
+                          << rank << "d shape";
+    return false;
+  }
+
+  return true;
 }
 
 void CreateGatherOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {
