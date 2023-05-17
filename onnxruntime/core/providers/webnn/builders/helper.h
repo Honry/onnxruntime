@@ -92,6 +92,7 @@ static const InlinedHashMap<std::string, std::string> op_map = {
     {"Relu", "relu"},
     {"LeakyRelu", "leakyRelu"},
     {"Sigmoid", "sigmoid"},
+    {"Slice", "slice"},
     {"Softmax", "softmax"},
     {"Cast", "cast"},
     {"Clip", "clamp"},
