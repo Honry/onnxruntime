@@ -60,11 +60,10 @@ bool ReadIntArrayFrom1DTensor(const onnx::TensorProto& tensor, std::vector<T>& a
     return false;
   }
   const int64_t* array_data = reinterpret_cast<const int64_t*>(unpacked_tensor.data());
-  if (std::is_same<T, int64_t>::value) {
+  if constexpr (std::is_same<T, int64_t>::value) {
     array.assign(array_data, array_data + rank);
-  } else if (std::is_same<T, int32_t>::value) {
-    std::vector<int64_t> raw_array = std::vector<int64_t>{array_data, array_data + rank};
-    std::transform(raw_array.cbegin(), raw_array.cend(),
+  } else if constexpr (std::is_same<T, int32_t>::value) {
+    std::transform(array_data, array_data + rank,
                    std::back_inserter(array),
                    [](int64_t dim) -> int32_t { return SafeInt<int32_t>(dim); });
   }
