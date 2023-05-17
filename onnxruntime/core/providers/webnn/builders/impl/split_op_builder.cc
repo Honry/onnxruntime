@@ -56,6 +56,7 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   } else {
     if (helper.HasAttr("num_outputs")) {
       const int64_t num_outputs = helper.Get("num_outputs", 1);
+      ORT_RETURN_IF_NOT(num_outputs > 0, "The 'num_outputs' must be a positive integer.");
       if (input_shape[axis] % num_outputs == 0) {
         // The 'num_outputs' evenly divide the dim value at 'axis' specified.
         output_array = model_builder.GetBuilder().call<emscripten::val>("split", input, static_cast<int32_t>(num_outputs), options);
@@ -72,12 +73,15 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(num_outputs), "The size of outputs must be equal to 'num_outputs'.");
     } else {
       // w/o 'split' input for opset 13
-      // split: Optional length of each output. Values should be >= 0.Sum of the values must be equal to the dim value at 'axis' specified.
-      output_array = model_builder.GetBuilder().call<emscripten::val>("split", input, static_cast<int32_t>(1), options);
-      ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(1), "The size of outputs must be equal to 1.");
+      // Refer to https://github.com/microsoft/onnxruntime/blob/a7ad859e3ab60bddfcf2fefa96bfcb550f0fc04c/onnxruntime/core/providers/dml/OperatorAuthorHelper/OperatorHelper.cpp#L984-L989
+      // split input stream equally across output streams.
+      const auto& output_defs = node.OutputDefs();
+      auto output_count = output_defs.size();
+      output_array = model_builder.GetBuilder().call<emscripten::val>("split", input, static_cast<int32_t>(output_count), options);
+      ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(output_count), "The size of outputs must be equal to the count of output nodes.");
     }
   }
-  for (int64_t i = 0; i < output_array["length"].as<int32_t>(); i++) {
+  for (int64_t i = 0, count = output_array["length"].as<int32_t>(); i < count; i++) {
     model_builder.AddOperand(node.OutputDefs()[i]->Name(), std::move(output_array[i]));
   }
   return Status::OK();
@@ -111,7 +115,7 @@ bool SplitOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
       LOGS(logger, VERBOSE) << "The split must be a constant initializer.";
       return false;
     }
-    // Values should be >= 0.Sum of the values must be equal to the dim value at 'axis' specified.
+    // Values should be >= 0. Sum of the values must be equal to the dim value at 'axis' specified.
     std::vector<int64_t> split;
     const auto& split_tensor = *initializers.at(input_defs[1]->Name());
     if (!ReadIntArrayFrom1DTensor(split_tensor, split, logger)) {
@@ -140,7 +144,7 @@ bool SplitOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
       }
     } else {
       const auto opset = node.SinceVersion();
-      if (opset == 18) {
+      if (opset >= 18) {
         LOGS(logger, VERBOSE) << "The 'num_outputs' should be specified when 'split' isn't specified.";
         return false;
       }
