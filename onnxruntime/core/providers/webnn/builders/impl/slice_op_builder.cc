@@ -45,48 +45,44 @@ Status SliceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                              const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   std::vector<int64_t> input_shape;
-  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get shape");
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
   auto rank = input_shape.size();
   NodeAttrHelper helper(node);
 
   emscripten::val inputs = model_builder.GetOperand(input_defs[0]->Name());
-  std::vector<int32_t> starts(rank, 0);
-  std::vector<int32_t> sizes(input_shape.begin(), input_shape.end());
+  std::vector<int32_t> starts(rank);
+  std::vector<int32_t> sizes(rank);
 
   // Copy the data from the starts/ends/axes/steps initializers.
-  TensorShapeVector input_starts;
-  TensorShapeVector input_ends;
-  TensorShapeVector input_axes;
-  TensorShapeVector input_steps;
+  std::vector<int64_t> input_starts;
+  std::vector<int64_t> input_ends;
+  std::vector<int64_t> input_axes;
+  std::vector<int64_t> input_steps;
   SliceOp::PrepareForComputeMetadata compute_metadata(input_shape);
-  const auto CopyInputData = [&input_defs, &model_builder](size_t input_idx, TensorShapeVector& data) {
+  const auto CopyInputData = [&input_defs, &model_builder, &logger](size_t input_idx, std::vector<int64_t>& data,
+                                                                    bool is_required = false) {
     data.clear();
-
+    std::string input_name;
     // This is an optional input, return empty vector.
-    if (input_defs.size() <= input_idx)
-      return Status::OK();
-
-    const auto& input_name = input_defs[input_idx]->Name();
+    if (!is_required) {
+      if (input_defs.size() <= input_idx)
+        return Status::OK();
+      input_name = input_defs[input_idx]->Name();
+      if (input_name.empty())
+        return Status::OK();
+    }
+    input_name = input_defs[input_idx]->Name();
     const auto& initializers(model_builder.GetInitializerTensors());
     const auto& tensor = *initializers.at(input_name);
-    Initializer unpacked_tensor(tensor, model_builder.GetGraphViewer().ModelPath());
-    const auto data_type = tensor.data_type();
-    if (data_type == ONNX_NAMESPACE::TensorProto_DataType_INT64) {
-      auto tensor_data = unpacked_tensor.DataAsSpan<int64_t>();
-      data.insert(data.end(), tensor_data.begin(), tensor_data.end());
-    } else if (data_type == ONNX_NAMESPACE::TensorProto_DataType_INT32) {
-      auto tensor_data = unpacked_tensor.DataAsSpan<int32_t>();
-      data.insert(data.end(), tensor_data.begin(), tensor_data.end());
-    } else {
+    if (!ReadIntArrayFrom1DTensor(tensor, data, logger)) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
-                             "Data type for starts and ends inputs' is not supported in this build. Got ",
-                             data_type);
+                             "Data type for starts and ends inputs' is not supported in this build");
     }
 
     return Status::OK();
   };
-  ORT_RETURN_IF_ERROR(CopyInputData(1, input_starts));
-  ORT_RETURN_IF_ERROR(CopyInputData(2, input_ends));
+  ORT_RETURN_IF_ERROR(CopyInputData(1, input_starts, true));
+  ORT_RETURN_IF_ERROR(CopyInputData(2, input_ends, true));
   ORT_RETURN_IF_ERROR(CopyInputData(3, input_axes));
   ORT_RETURN_IF_ERROR(CopyInputData(4, input_steps));
   ORT_RETURN_IF_ERROR(
@@ -116,7 +112,7 @@ bool SliceOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
   if (!GetShape(*input_defs[0], input_shape, logger)) {
     return false;
   }
-  if (input_defs.size() == 5) { // Check steps.
+  if (input_defs.size() == 5) {  // Check steps.
     const auto& steps_tensor = *initializers.at(input_defs[4]->Name());
     std::vector<uint8_t> unpacked_tensor;
     auto status = onnxruntime::utils::UnpackInitializerData(steps_tensor, unpacked_tensor);
@@ -127,20 +123,26 @@ bool SliceOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
     const auto data_type = steps_tensor.data_type();
     // WebNN doesn't support steps other than 1.
     if (data_type == ONNX_NAMESPACE::TensorProto_DataType_INT64) {
-      auto tensor_data = std::vector<int64_t>(reinterpret_cast<int64_t*>(unpacked_tensor.data()),
-                                              reinterpret_cast<int64_t*>(unpacked_tensor.data() +
-                                                                         unpacked_tensor.size()));
-      if (!std::all_of(tensor_data.begin(), tensor_data.end(), [](int64_t i) { return i == 1; })) {
+      if (!std::all_of(reinterpret_cast<int64_t*>(unpacked_tensor.data()),
+                       reinterpret_cast<int64_t*>(unpacked_tensor.data()) +
+                           unpacked_tensor.size() / sizeof(int64_t),
+                       [](int64_t i) { return i == 1; })) {
         return false;
       }
     } else if (data_type == ONNX_NAMESPACE::TensorProto_DataType_INT32) {
-      auto tensor_data = std::vector<int32_t>(reinterpret_cast<int32_t*>(unpacked_tensor.data()),
-                                              reinterpret_cast<int32_t*>(unpacked_tensor.data() +
-                                                                         unpacked_tensor.size()));
-      if (!std::all_of(tensor_data.begin(), tensor_data.end(), [](int32_t i) { return i == 1; })) {
+      if (!std::all_of(reinterpret_cast<int32_t*>(unpacked_tensor.data()),
+                       reinterpret_cast<int32_t*>(unpacked_tensor.data()) +
+                           unpacked_tensor.size() / sizeof(int32_t),
+                       [](int32_t i) { return i == 1; })) {
         return false;
       }
     }
+  }
+
+  if (input_defs.size() < 3) {
+    LOGS(logger, VERBOSE) << op_type << " [" << name << "] requires at least 3 inputs (data starts and ends) but got "
+                          << input_defs.size();
+    return false;
   }
 
   const auto& starts_name = input_defs[1]->Name();
