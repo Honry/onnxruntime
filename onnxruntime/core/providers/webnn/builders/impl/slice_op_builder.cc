@@ -124,8 +124,7 @@ bool SliceOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
     // WebNN doesn't support steps other than 1.
     if (data_type == ONNX_NAMESPACE::TensorProto_DataType_INT64) {
       if (!std::all_of(reinterpret_cast<int64_t*>(unpacked_tensor.data()),
-                       reinterpret_cast<int64_t*>(unpacked_tensor.data()) +
-                           unpacked_tensor.size() / sizeof(int64_t),
+                       reinterpret_cast<int64_t*>(unpacked_tensor.data() + unpacked_tensor.size()),
                        [](int64_t i) { return i == 1; })) {
         return false;
       }
