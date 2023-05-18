@@ -76,7 +76,7 @@ Status SliceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     const auto& tensor = *initializers.at(input_name);
     if (!ReadIntArrayFrom1DTensor(tensor, data, logger)) {
       return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
-                             "Data type for starts and ends inputs' is not supported in this build");
+                             "Data type for starts and ends inputs is not supported in this build.");
     }
 
     return Status::OK();
