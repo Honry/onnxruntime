@@ -58,19 +58,21 @@ Status UnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   if (node.SinceVersion() >= 13) {
     // Input axes is provided, use axes initializer data.
-    const auto& initializers(model_builder.GetInitializerTensors());
+    const auto& initializers = model_builder.GetInitializerTensors();
     const auto& axes_tensor = *initializers.at(input_defs[1]->Name());
     Initializer axes_initializer(axes_tensor);
     const auto axes_data_span = axes_initializer.DataAsSpan<int64_t>();
+    const auto output_rank = input_rank + axes_data_span.size();
     std::transform(
         axes_data_span.begin(), axes_data_span.end(), std::back_inserter(axes_data),
-        [input_rank](int64_t axis) -> int32_t { return HandleNegativeAxis(axis, input_rank); });
+        [output_rank](int64_t axis) -> int32_t { return HandleNegativeAxis(axis, output_rank); });
   } else {
     if (helper.HasAttr("axes")) {
       auto axes = helper.Get("axes", std::vector<int64_t>{});
+      const auto output_rank = input_rank + axes.size();
       std::transform(
           axes.begin(), axes.end(), std::back_inserter(axes_data),
-          [input_rank](int64_t axis) -> int32_t { return HandleNegativeAxis(axis, input_rank); });
+          [output_rank](int64_t axis) -> int32_t { return HandleNegativeAxis(axis, output_rank); });
     }
   }
 
@@ -83,10 +85,10 @@ Status UnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   return Status::OK();
 }
 
-// Operator support related
+// Operator support related.
 
 bool UnsqueezeOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                                         const logging::Logger& logger) const {
+                                           const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   std::vector<int64_t> input_shape;
   if (!GetShape(*input_defs[0], input_shape, logger))
@@ -95,12 +97,17 @@ bool UnsqueezeOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializ
   // Unsqueeze opset 13 uses input 1 as axes, it needs to be an initializer.
   if (node.SinceVersion() >= 13) {
     if (input_defs.size() < 2) {
-      LOGS(logger, ERROR) << "Input axes of Unsqueeze must be provided.";
+      LOGS(logger, ERROR) << "Input axes of Unsqueeze must be provided";
       return false;
     }
     const auto& axes_name = input_defs[1]->Name();
     if (!Contains(initializers, axes_name)) {
       LOGS(logger, ERROR) << "Input axes of Unsqueeze must be known";
+      return false;
+    }
+  } else {
+    if (input_defs.size() < 1) {
+      LOGS(logger, ERROR) << "Unsqueeze has no input tensor";
       return false;
     }
   }
