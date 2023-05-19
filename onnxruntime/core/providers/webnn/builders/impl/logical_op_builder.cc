@@ -18,15 +18,16 @@ class LogicalOpBuilder : public BaseOpBuilder {
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
+  // Operator support related.
+  bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+                         const logging::Logger& logger) const override;
 };
 
 // Add operator related.
 
 Status LogicalOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                                const logging::Logger& /* logger */) const {
-  const auto& op_type(node.OpType());
-
-  ORT_RETURN_IF_NOT(input_defs.size() < 2, "Operator requires at least two inputs");
+  const auto& op_type = node.OpType();
   emscripten::val input0 = model_builder.GetOperand(node.InputDefs()[0]->Name());
   emscripten::val input1 = model_builder.GetOperand(node.InputDefs()[1]->Name());
   emscripten::val output = emscripten::val::object();
@@ -54,6 +55,19 @@ void CreateLogicalOpBuilder(const std::string& op_type, OpBuilderRegistrations& 
   for (const auto& type : op_types) {
     op_registrations.op_builder_map.emplace(type, op_registrations.builders.back().get());
   }
+}
+
+bool LogicalOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+                                         const logging::Logger& logger) const {
+  const auto& name = node.Name();
+  const auto& op_type = node.OpType();
+  const auto& input_defs = node.InputDefs();
+  if (input_defs.size() < 2) {
+    LOGS(logger, VERBOSE) << op_type << " [" << name << "] requires at least 2 inputs, actual: "
+                          << input_defs.size();
+    return false;
+  }
+  return true;
 }
 
 }  // namespace webnn
