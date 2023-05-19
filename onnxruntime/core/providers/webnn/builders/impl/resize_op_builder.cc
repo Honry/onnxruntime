@@ -255,26 +255,6 @@ bool ResizeOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers
                               << ". input_size_c, " << input_shape[c_idx] << ", output_size_c, " << output_sizes[c_idx];
         return false;
       }
-
-      // For now we only support upscale, so the output_size_h and output_size_w should be an integer >= 1.
-      // TODO support ResizeBilinear
-      auto output_size_h = output_sizes[2];
-      auto output_size_w = output_sizes[3];
-      auto input_size_h = input_shape[2];
-      auto input_size_w = input_shape[3];
-
-      // Onnx spec requires output sizes to be a positive integer, so we are not checking that here.
-      if (output_size_h % input_size_h != 0) {
-        LOGS(logger, VERBOSE) << "Resize: output_size_h: " << output_size_h
-                              << " is not a multiple of input_size_h: " << input_size_h;
-        return false;
-      }
-
-      if (output_size_w % input_size_w != 0) {
-        LOGS(logger, VERBOSE) << "Resize: output_size_w: " << output_size_w
-                              << " is not a multiple of input_size_w: " << input_size_w;
-        return false;
-      }
     }
   }
 
