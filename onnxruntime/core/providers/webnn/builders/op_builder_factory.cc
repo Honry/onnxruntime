@@ -19,6 +19,7 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateUnaryOpBuilder("Cos", op_registrations);
     CreateUnaryOpBuilder("Erf", op_registrations);
     CreateUnaryOpBuilder("Floor", op_registrations);
+    CreateUnaryOpBuilder("Not", op_registrations);
     CreateUnaryOpBuilder("Sin", op_registrations);
     CreateUnaryOpBuilder("Sqrt", op_registrations);
   }
@@ -67,9 +68,17 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateGatherOpBuilder("Gather", op_registrations);
   }
 
+  {  // Flatten
+    CreateFlattenOpBuilder("Flatten", op_registrations);
+  }
+
   {  // Gemm/MatMul
     CreateGemmOpBuilder("Gemm", op_registrations);
     CreateGemmOpBuilder("MatMul", op_registrations);
+  }
+
+  {  // Logical
+    CreateLogicalOpBuilder("Equal", op_registrations);
   }
 
   {  // Pool
