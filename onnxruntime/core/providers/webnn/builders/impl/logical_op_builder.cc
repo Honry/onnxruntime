@@ -26,6 +26,7 @@ Status LogicalOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, cons
                                                const logging::Logger& /* logger */) const {
   const auto& op_type(node.OpType());
 
+  ORT_RETURN_IF_NOT(input_defs.size() < 2, "Operator requires at least two inputs");
   emscripten::val input0 = model_builder.GetOperand(node.InputDefs()[0]->Name());
   emscripten::val input1 = model_builder.GetOperand(node.InputDefs()[1]->Name());
   emscripten::val output = emscripten::val::object();
