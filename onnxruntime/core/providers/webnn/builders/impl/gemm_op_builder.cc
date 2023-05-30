@@ -23,8 +23,8 @@ class GemmOpBuilder : public BaseOpBuilder {
 
   // Operator support related.
  private:
-  bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& /* node */,
-                         const logging::Logger& /* logger */) const override;
+  bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 // Add operator related.
@@ -65,7 +65,9 @@ Status GemmOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
 
 // Operator support related.
 
-bool GemmOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+bool GemmOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
+                                      const Node& node,
+                                      const WnnDeviceType /* device_type */,
                                       const logging::Logger& logger) const {
   (void)initializers;
   const auto& op_type = node.OpType();

@@ -26,7 +26,7 @@ class SliceOpBuilder : public BaseOpBuilder {
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
   bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const logging::Logger& logger) const override;
+                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
   // TODO: Support Slice opset < 10, which uses attributes for starts and ends.
   int GetMinSupportedOpSet(const Node& /* node */) const override { return 10; }
 };
@@ -103,7 +103,9 @@ Status SliceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   return Status::OK();
 }
 
-bool SliceOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+bool SliceOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
+                                       const Node& node,
+                                       const WnnDeviceType /* device_type */,
                                        const logging::Logger& logger) const {
   const auto& name = node.Name();
   const auto& op_type = node.OpType();

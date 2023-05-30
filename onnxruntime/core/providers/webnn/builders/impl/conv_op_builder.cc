@@ -27,8 +27,8 @@ class ConvOpBuilder : public BaseOpBuilder {
 
   // Operator support related.
  private:
-  bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& /* node */,
-                         const logging::Logger& /* logger */) const override;
+  bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 void ConvOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
@@ -96,7 +96,7 @@ Status AddInitializerInNewLayout(ModelBuilder& model_builder,
                                  bool is_conv) {
   const auto& tensor = *model_builder.GetInitializerTensors().at(name);
   auto data_type = tensor.data_type();
-  if (!IsSupportedDataType(data_type)) {
+  if (!IsSupportedDataType(data_type, model_builder.GetWnnDeviceType())) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
                            "The initializer of graph has unsupported type, name: ",
                            tensor.name(), " type: ", data_type);
@@ -194,7 +194,6 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
   const auto dilations = helper.Get("dilations", std::vector<int32_t>{1, 1});
   auto pads = helper.Get("pads", std::vector<int32_t>{0, 0, 0, 0});
   const auto& weight = input_defs[1]->Name();
-
   if (op_type == "Conv") {
     emscripten::val options = emscripten::val::object();
     ORT_RETURN_IF_ERROR(SetConvBaseOptions(model_builder, node, options, strides, dilations, pads, logger));
@@ -212,6 +211,7 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
       }
     }
     emscripten::val filter = model_builder.GetOperand(input_defs[1]->Name());
+
     output = model_builder.GetBuilder().call<emscripten::val>("conv2d", input, filter, options);
   } else {
     emscripten::val options = emscripten::val::object();
@@ -261,7 +261,6 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
       options.set("outputPadding", emscripten::val::array(output_padding));
     }
     emscripten::val filter = model_builder.GetOperand(input_defs[1]->Name());
-
     output = model_builder.GetBuilder().call<emscripten::val>("convTranspose2d", input, filter, options);
   }
 
@@ -271,7 +270,9 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
 
 // Operator support related.
 
-bool ConvOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+bool ConvOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
+                                      const Node& node,
+                                      const WnnDeviceType /* device_type */,
                                       const logging::Logger& logger) const {
   const auto& name = node.Name();
   const auto& op_type = node.OpType();

@@ -21,8 +21,8 @@ class CastOpBuilder : public BaseOpBuilder {
 
   // Operator support related.
  private:
-  bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const logging::Logger& logger) const override;
+  bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& node,
+                         const WnnDeviceType device_type, const logging::Logger& logger) const override;
 
   int GetMinSupportedOpSet(const Node& node) const override;
 };
@@ -78,14 +78,15 @@ int CastOpBuilder::GetMinSupportedOpSet(const Node& /* node */) const {
   return 6;
 }
 
-bool CastOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+bool CastOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& /* initializers */,
+                                      const Node& node,
+                                      const WnnDeviceType device_type,
                                       const logging::Logger& logger) const {
   NodeAttrHelper helper(node);
   // Check cast output type.
   const auto to_type = helper.Get("to", ONNX_NAMESPACE::TensorProto_DataType_UNDEFINED);
-  if (!IsSupportedDataType(to_type)) {
-    LOGS(logger, VERBOSE) << "Invalid cast to type " << to_type
-                          << " . Current WebNN only support cast to bool, float32, float16, int32, int64 or uint32.";
+  if (!IsSupportedDataType(to_type, device_type)) {
+    LOGS(logger, VERBOSE) << "Invalid cast to type " << to_type << ".";
     return false;
   }
 

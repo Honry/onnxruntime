@@ -24,7 +24,7 @@ class SplitOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const logging::Logger& logger) const override;
+                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 
   int GetMinSupportedOpSet(const Node& node) const override;
 };
@@ -51,15 +51,22 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     const auto& initializers(model_builder.GetInitializerTensors());
     const auto& split_tensor = *initializers.at(input_defs[1]->Name());
     ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(split_tensor, splits, logger), "Cannot get split.");
-    output_array = model_builder.GetBuilder().call<emscripten::val>("split", input, emscripten::val::array(splits), options);
-    ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(splits.size()), "The size of outputs must be equal to the size of 'split' input.");
+    output_array = model_builder.GetBuilder().call<emscripten::val>("split",
+                                                                    input,
+                                                                    emscripten::val::array(splits),
+                                                                    options);
+    ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(splits.size()),
+                      "The size of outputs must be equal to the size of 'split' input.");
   } else {
     if (helper.HasAttr("num_outputs")) {
       const int64_t num_outputs = helper.Get("num_outputs", 1);
       ORT_RETURN_IF_NOT(num_outputs > 0, "The 'num_outputs' must be a positive integer.");
       if (input_shape[axis] % num_outputs == 0) {
         // The 'num_outputs' evenly divide the dim value at 'axis' specified.
-        output_array = model_builder.GetBuilder().call<emscripten::val>("split", input, static_cast<int32_t>(num_outputs), options);
+        output_array = model_builder.GetBuilder().call<emscripten::val>("split",
+                                                                        input,
+                                                                        static_cast<int32_t>(num_outputs),
+                                                                        options);
       } else {
         std::vector<int64_t> mapping_split;
         mapping_split.insert(mapping_split.begin(), num_outputs - 1, input_shape[axis] / num_outputs);
@@ -68,17 +75,24 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
         std::transform(mapping_split.cbegin(), mapping_split.cend(),
                        std::back_inserter(converted_splits),
                        [](int64_t dim) -> int32_t { return SafeInt<int32_t>(dim); });
-        output_array = model_builder.GetBuilder().call<emscripten::val>("split", input, emscripten::val::array(converted_splits), options);
+        output_array = model_builder.GetBuilder().call<emscripten::val>("split",
+                                                                        input,
+                                                                        emscripten::val::array(converted_splits),
+                                                                        options);
       }
-      ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(num_outputs), "The size of outputs must be equal to 'num_outputs'.");
+      ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(num_outputs),
+                        "The size of outputs must be equal to 'num_outputs'.");
     } else {
       // w/o 'split' input for opset 13
       // Refer to https://github.com/microsoft/onnxruntime/blob/a7ad859e3ab60bddfcf2fefa96bfcb550f0fc04c/onnxruntime/core/providers/dml/OperatorAuthorHelper/OperatorHelper.cpp#L984-L989
       // split input stream equally across output streams.
       const auto& output_defs = node.OutputDefs();
       auto output_count = output_defs.size();
-      output_array = model_builder.GetBuilder().call<emscripten::val>("split", input, static_cast<int32_t>(output_count), options);
-      ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(output_count), "The size of outputs must be equal to the count of output nodes.");
+      output_array = model_builder.GetBuilder().call<emscripten::val>("split",
+                                                                      input, static_cast<int32_t>(output_count),
+                                                                      options);
+      ORT_RETURN_IF_NOT(output_array["length"].as<int32_t>() == static_cast<int32_t>(output_count),
+                        "The size of outputs must be equal to the count of output nodes.");
     }
   }
   for (int64_t i = 0, count = output_array["length"].as<int32_t>(); i < count; i++) {
@@ -94,7 +108,9 @@ int SplitOpBuilder::GetMinSupportedOpSet(const Node& /* node */) const {
   return 13;
 }
 
-bool SplitOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+bool SplitOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
+                                       const Node& node,
+                                       const WnnDeviceType /* device_type */,
                                        const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   std::vector<int64_t> input_shape;

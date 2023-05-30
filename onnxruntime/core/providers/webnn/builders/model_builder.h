@@ -9,6 +9,7 @@
 
 #include "model.h"
 #include "core/framework/execution_provider.h"
+#include "core/providers/webnn/builders/helper.h"
 
 #include <emscripten.h>
 #include <emscripten/val.h>
@@ -20,8 +21,9 @@ class IOpBuilder;
 
 class ModelBuilder {
  public:
-  ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger, const emscripten::val& context,
-               const emscripten::val& builder, const DataLayout preferred_layout);
+  ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger,
+               const emscripten::val& context, const emscripten::val& builder,
+               const DataLayout preferred_layout, const WnnDeviceType wnn_device_type);
   ~ModelBuilder() = default;
 
   Status Compile(std::unique_ptr<Model>& model) ORT_MUST_USE_RESULT;
@@ -50,6 +52,8 @@ class ModelBuilder {
 
   DataLayout GetPreferredLayout() const { return preferred_layout_; }
 
+  WnnDeviceType GetWnnDeviceType() const { return wnn_device_type_; }
+
   // The initializer will be processed separately, skip it as an initializer.
   void AddInitializerToSkip(const std::string& tensor_name);
 
@@ -66,6 +70,7 @@ class ModelBuilder {
   emscripten::val wnn_context_ = emscripten::val::object();
   emscripten::val wnn_builder_ = emscripten::val::object();
   DataLayout preferred_layout_;
+  WnnDeviceType wnn_device_type_;
   std::vector<std::vector<uint8_t>> unpacked_tensors_;
   InlinedHashMap<std::string, emscripten::val> wnn_operands_;
   std::vector<std::string> input_names_;

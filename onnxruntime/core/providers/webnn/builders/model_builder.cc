@@ -19,12 +19,13 @@ namespace webnn {
 
 ModelBuilder::ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger,
                            const emscripten::val& context, const emscripten::val& builder,
-                           const DataLayout preferred_layout)
+                           const DataLayout preferred_layout, const WnnDeviceType wnn_device_type)
     : graph_viewer_(graph_viewer),
       logger_(logger),
       wnn_context_(context),
       wnn_builder_(builder),
-      preferred_layout_(preferred_layout) {}
+      preferred_layout_(preferred_layout),
+      wnn_device_type_(wnn_device_type) {}
 
 Status ModelBuilder::Initialize() {
   PreprocessInitializers();
@@ -106,7 +107,7 @@ Status ModelBuilder::RegisterInitializers() {
     desc.set("dimensions", emscripten::val::array(dims));
     auto data_type = tensor.data_type();
     emscripten::val operand = emscripten::val::object();
-    if (IsSupportedDataType(data_type)) {
+    if (IsSupportedDataType(data_type, wnn_device_type_)) {
       unpacked_tensors_.push_back({});
       std::vector<uint8_t>& unpacked_tensor = unpacked_tensors_.back();
       ORT_RETURN_IF_ERROR(onnxruntime::utils::UnpackInitializerData(tensor, unpacked_tensor));
