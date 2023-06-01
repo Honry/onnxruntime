@@ -140,6 +140,9 @@ Status AddInitializerInNewLayout(ModelBuilder& model_builder,
     case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
       element_size = sizeof(uint32_t);
       break;
+    case ONNX_NAMESPACE::TensorProto_DataType_UINT64:
+      element_size = sizeof(uint64_t);
+      break;
     default:
       break;
   }

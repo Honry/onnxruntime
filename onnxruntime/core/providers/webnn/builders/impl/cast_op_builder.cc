@@ -58,6 +58,9 @@ Status CastOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
       operand_type = "uint32";
       break;
+    case ONNX_NAMESPACE::TensorProto_DataType_UINT64:
+      operand_type = "uint64";
+      break;
     default:
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
                              "The Cast node has unsupported 'to' type, name: ",

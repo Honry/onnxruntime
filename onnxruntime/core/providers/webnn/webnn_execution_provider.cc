@@ -325,6 +325,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
             case ONNX_NAMESPACE::TensorProto_DataType_INT32:
             case ONNX_NAMESPACE::TensorProto_DataType_INT64:
             case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
+            case ONNX_NAMESPACE::TensorProto_DataType_UINT64:
               output_buffer = output_tensor.GetTensorMutableRawData();
               break;
             default:

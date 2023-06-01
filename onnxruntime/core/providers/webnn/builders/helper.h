@@ -143,13 +143,14 @@ constexpr std::array<ONNX_NAMESPACE::TensorProto_DataType, 1> supported_cpu_data
     ONNX_NAMESPACE::TensorProto_DataType_FLOAT,
 };
 
-constexpr std::array<ONNX_NAMESPACE::TensorProto_DataType, 6> supported_gpu_data_types = {
+constexpr std::array<ONNX_NAMESPACE::TensorProto_DataType, 7> supported_gpu_data_types = {
     ONNX_NAMESPACE::TensorProto_DataType_BOOL,
     ONNX_NAMESPACE::TensorProto_DataType_FLOAT16,
     ONNX_NAMESPACE::TensorProto_DataType_FLOAT,
     ONNX_NAMESPACE::TensorProto_DataType_INT32,
     ONNX_NAMESPACE::TensorProto_DataType_INT64,
     ONNX_NAMESPACE::TensorProto_DataType_UINT32,
+    ONNX_NAMESPACE::TensorProto_DataType_UINT64,
 };
 
 bool IsSupportedDataType(const int32_t data_type, const WebnnDeviceType device_type);
