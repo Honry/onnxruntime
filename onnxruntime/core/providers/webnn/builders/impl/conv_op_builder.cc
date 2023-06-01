@@ -28,7 +28,7 @@ class ConvOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 void ConvOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
@@ -96,7 +96,7 @@ Status AddInitializerInNewLayout(ModelBuilder& model_builder,
                                  bool is_conv) {
   const auto& tensor = *model_builder.GetInitializerTensors().at(name);
   auto data_type = tensor.data_type();
-  if (!IsSupportedDataType(data_type, model_builder.GetWnnDeviceType())) {
+  if (!IsSupportedDataType(data_type, model_builder.GetWebnnDeviceType())) {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
                            "The initializer of graph has unsupported type, name: ",
                            tensor.name(), " type: ", data_type);
@@ -272,7 +272,7 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
 
 bool ConvOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
                                       const Node& node,
-                                      const WnnDeviceType /* device_type */,
+                                      const WebnnDeviceType /* device_type */,
                                       const logging::Logger& logger) const {
   const auto& name = node.Name();
   const auto& op_type = node.OpType();

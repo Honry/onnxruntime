@@ -52,10 +52,10 @@ WebNNExecutionProvider::WebNNExecutionProvider(
   // WebNN EP uses NHWC layout for CPU XNNPACK backend and NCHW for GPU DML backend.
   if (webnn_device_flags.compare("cpu") == 0) {
     preferred_layout_ = DataLayout::NHWC;
-    wnn_device_type_ = webnn::WnnDeviceType::CPU;
+    wnn_device_type_ = webnn::WebnnDeviceType::CPU;
   } else {
     preferred_layout_ = DataLayout::NCHW;
-    wnn_device_type_ = webnn::WnnDeviceType::GPU;
+    wnn_device_type_ = webnn::WebnnDeviceType::GPU;
   }
   if (webnn_power_flags.compare("default") != 0) {
     context_options.set("powerPreference", emscripten::val(webnn_power_flags));

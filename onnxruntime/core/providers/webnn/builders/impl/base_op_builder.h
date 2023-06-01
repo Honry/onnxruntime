@@ -28,15 +28,15 @@ class BaseOpBuilder : public IOpBuilder {
   // Operator support related.
  public:
   bool IsOpSupported(const InitializedTensorSet& initializers, const Node& node,
-                     const WnnDeviceType device_type, const logging::Logger& logger) const override;
+                     const WebnnDeviceType device_type, const logging::Logger& logger) const override;
 
  protected:
   virtual bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& /* node */,
-                                 const WnnDeviceType /* device_type */, const logging::Logger& /* logger */) const {
+                                 const WebnnDeviceType /* device_type */, const logging::Logger& /* logger */) const {
     return true;
   }
 
-  virtual bool HasSupportedInputsImpl(const Node& node, const WnnDeviceType device_type,
+  virtual bool HasSupportedInputsImpl(const Node& node, const WebnnDeviceType device_type,
                                       const logging::Logger& logger) const;
 
   virtual int GetMinSupportedOpSet(const Node& /* node */) const { return 1; }
@@ -44,7 +44,7 @@ class BaseOpBuilder : public IOpBuilder {
 
  private:
   bool HasSupportedOpSet(const Node& node, const logging::Logger& logger) const;
-  bool HasSupportedInputs(const Node& node, const WnnDeviceType device_type, const logging::Logger& logger) const;
+  bool HasSupportedInputs(const Node& node, const WebnnDeviceType device_type, const logging::Logger& logger) const;
 };
 
 }  // namespace webnn

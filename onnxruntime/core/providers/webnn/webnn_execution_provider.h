@@ -45,7 +45,7 @@ class WebNNExecutionProvider : public IExecutionProvider {
   emscripten::val wnn_builder_ = emscripten::val::object();
 
   DataLayout preferred_layout_;
-  webnn::WnnDeviceType wnn_device_type_;
+  webnn::WebnnDeviceType wnn_device_type_;
   InlinedHashMap<std::string, std::unique_ptr<onnxruntime::webnn::Model>> models_;
 };
 }  // namespace onnxruntime

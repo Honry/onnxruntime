@@ -22,7 +22,7 @@ class CastOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& node,
-                         const WnnDeviceType device_type, const logging::Logger& logger) const override;
+                         const WebnnDeviceType device_type, const logging::Logger& logger) const override;
 
   int GetMinSupportedOpSet(const Node& node) const override;
 };
@@ -80,7 +80,7 @@ int CastOpBuilder::GetMinSupportedOpSet(const Node& /* node */) const {
 
 bool CastOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& /* initializers */,
                                       const Node& node,
-                                      const WnnDeviceType device_type,
+                                      const WebnnDeviceType device_type,
                                       const logging::Logger& logger) const {
   NodeAttrHelper helper(node);
   // Check cast output type.

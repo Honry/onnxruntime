@@ -29,7 +29,7 @@ class ReductionOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& node,
-                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 // Add operator related.
@@ -108,7 +108,7 @@ Status ReductionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 // Operator support related.
 bool ReductionOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& /* initializers */,
                                            const Node& node,
-                                           const WnnDeviceType /* device_type */,
+                                           const WebnnDeviceType /* device_type */,
                                            const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
 

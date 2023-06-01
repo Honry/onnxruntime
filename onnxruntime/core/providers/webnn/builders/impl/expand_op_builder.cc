@@ -29,7 +29,7 @@ class ExpandOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 // Add operator related.
@@ -64,7 +64,7 @@ Status ExpandOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
 bool ExpandOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
                                         const Node& node,
-                                        const WnnDeviceType /* device_type */,
+                                        const WebnnDeviceType /* device_type */,
                                         const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   const auto& shape_name = input_defs[1]->Name();

@@ -30,7 +30,7 @@ class ResizeOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 
   // Resize opset 10- is very different than Resize opset 11+, with many key attributes missing.
   // We only support Resize opset 11+ here.
@@ -161,7 +161,7 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
 bool ResizeOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
                                         const Node& node,
-                                        const WnnDeviceType /* device_type */,
+                                        const WebnnDeviceType /* device_type */,
                                         const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
 

@@ -28,7 +28,7 @@ class UnsqueezeOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 // Add operator related.
@@ -89,7 +89,7 @@ Status UnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
 bool UnsqueezeOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
                                            const Node& node,
-                                           const WnnDeviceType /* device_type */,
+                                           const WebnnDeviceType /* device_type */,
                                            const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   std::vector<int64_t> input_shape;

@@ -28,7 +28,7 @@ bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const loggin
 }
 
 bool IsNodeSupported(const Node& node, const GraphViewer& graph_viewer,
-                     const WnnDeviceType device_type, const logging::Logger& logger) {
+                     const WebnnDeviceType device_type, const logging::Logger& logger) {
   const auto& op_builders = GetOpBuilders();
   if (Contains(op_builders, node.OpType())) {
     const auto* op_builder = op_builders.at(node.OpType());
@@ -64,7 +64,7 @@ bool IsInputSupported(const NodeArg& input, const std::string& parent_name, cons
 
 std::vector<std::vector<NodeIndex>> GetSupportedNodes(const GraphViewer& graph_viewer,
                                                       const emscripten::val& wnn_builder_,
-                                                      const WnnDeviceType device_type,
+                                                      const WebnnDeviceType device_type,
                                                       const logging::Logger& logger) {
   std::vector<std::vector<size_t>> supported_node_groups;
 
@@ -109,10 +109,10 @@ std::vector<std::vector<NodeIndex>> GetSupportedNodes(const GraphViewer& graph_v
   return supported_node_groups;
 }
 
-bool IsSupportedDataType(const int32_t data_type, const WnnDeviceType device_type) {
+bool IsSupportedDataType(const int32_t data_type, const WebnnDeviceType device_type) {
   // Current data type implementation status of WebNN is inconsistent along with different backends,
   // The XNNPack backend supports only FP32, while the DML backend POC supports more.
-  if (device_type == WnnDeviceType::CPU) {
+  if (device_type == WebnnDeviceType::CPU) {
     return std::find(supported_cpu_data_types.begin(), supported_cpu_data_types.end(), data_type) !=
            supported_cpu_data_types.end();
   } else {

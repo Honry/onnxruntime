@@ -38,7 +38,7 @@ bool HasExternalInitializer(const InitializedTensorSet& initializers, const Node
 Status BaseOpBuilder::AddToModelBuilder(ModelBuilder& model_builder, const Node& node,
                                         const logging::Logger& logger) const {
   ORT_RETURN_IF_NOT(
-      IsOpSupported(model_builder.GetInitializerTensors(), node, model_builder.GetWnnDeviceType(), logger),
+      IsOpSupported(model_builder.GetInitializerTensors(), node, model_builder.GetWebnnDeviceType(), logger),
       "Unsupported operator ",
       node.OpType());
   ORT_RETURN_IF_ERROR(AddToModelBuilderImpl(model_builder, node, logger));
@@ -50,7 +50,7 @@ Status BaseOpBuilder::AddToModelBuilder(ModelBuilder& model_builder, const Node&
 // Operator support related.
 
 bool BaseOpBuilder::IsOpSupported(const InitializedTensorSet& initializers, const Node& node,
-                                  const WnnDeviceType device_type, const logging::Logger& logger) const {
+                                  const WebnnDeviceType device_type, const logging::Logger& logger) const {
   if (!HasSupportedInputs(node, device_type, logger))
     return false;
 
@@ -64,7 +64,7 @@ bool BaseOpBuilder::IsOpSupported(const InitializedTensorSet& initializers, cons
   return IsOpSupportedImpl(initializers, node, device_type, logger);
 }
 
-bool BaseOpBuilder::HasSupportedInputs(const Node& node, const WnnDeviceType device_type,
+bool BaseOpBuilder::HasSupportedInputs(const Node& node, const WebnnDeviceType device_type,
                                        const logging::Logger& logger) const {
   const auto node_name = MakeString("Node [", node.Name(), "] type [", node.OpType(), "]");
   for (const auto* input : node.InputDefs()) {
@@ -77,7 +77,7 @@ bool BaseOpBuilder::HasSupportedInputs(const Node& node, const WnnDeviceType dev
 }
 
 bool BaseOpBuilder::HasSupportedInputsImpl(const Node& node,
-                                           const WnnDeviceType device_type,
+                                           const WebnnDeviceType device_type,
                                            const logging::Logger& logger) const {
   // We only check the type of input 0 by default, specific op builder can override this.
   const auto& input = *node.InputDefs()[0];

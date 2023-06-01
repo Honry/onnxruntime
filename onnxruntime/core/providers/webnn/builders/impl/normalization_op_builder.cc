@@ -24,7 +24,7 @@ class NormalizationOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
@@ -101,7 +101,7 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
 
 bool NormalizationOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
                                                const Node& node,
-                                               const WnnDeviceType /* device_type */,
+                                               const WebnnDeviceType /* device_type */,
                                                const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   if (input_defs.size() < 2) {

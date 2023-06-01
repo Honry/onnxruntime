@@ -19,7 +19,7 @@ namespace webnn {
 
 ModelBuilder::ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger,
                            const emscripten::val& context, const emscripten::val& builder,
-                           const DataLayout preferred_layout, const WnnDeviceType wnn_device_type)
+                           const DataLayout preferred_layout, const WebnnDeviceType wnn_device_type)
     : graph_viewer_(graph_viewer),
       logger_(logger),
       wnn_context_(context),

@@ -29,7 +29,7 @@ class IOpBuilder {
  public:
   // Check if an operator is supported.
   virtual bool IsOpSupported(const InitializedTensorSet& initializers, const Node& node,
-                             const WnnDeviceType device_type, const logging::Logger& logger) const = 0;
+                             const WebnnDeviceType device_type, const logging::Logger& logger) const = 0;
 };
 
 }  // namespace webnn

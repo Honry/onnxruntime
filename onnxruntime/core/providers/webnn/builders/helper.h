@@ -25,7 +25,7 @@ class Logger;
 
 namespace webnn {
 
-enum WnnDeviceType {
+enum class WebnnDeviceType {
   CPU,
   GPU,
 };
@@ -89,7 +89,7 @@ bool IsInputSupported(const NodeArg& node_arg, const std::string& parent_name, c
 // Get a list of groups of supported nodes, each group represents a subgraph supported by WebNN EP.
 std::vector<std::vector<NodeIndex>> GetSupportedNodes(const GraphViewer& graph_viewer,
                                                       const emscripten::val& wnn_builder_,
-                                                      const WnnDeviceType device_type,
+                                                      const WebnnDeviceType device_type,
                                                       const logging::Logger& logger);
 static const InlinedHashMap<std::string, std::string> op_map = {
     {"ArgMax", "argMax"},
@@ -152,7 +152,7 @@ constexpr std::array<ONNX_NAMESPACE::TensorProto_DataType, 6> supported_gpu_data
     ONNX_NAMESPACE::TensorProto_DataType_UINT32,
 };
 
-bool IsSupportedDataType(const int32_t data_type, const WnnDeviceType device_type);
+bool IsSupportedDataType(const int32_t data_type, const WebnnDeviceType device_type);
 
 bool IsValidMultidirectionalBroadcast(std::vector<int64_t>& shape_a,
                                       std::vector<int64_t>& shape_b,

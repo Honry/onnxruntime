@@ -22,7 +22,7 @@ class SoftmaxOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& node,
-                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 Status SoftmaxOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
@@ -62,7 +62,7 @@ Status SoftmaxOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
 bool SoftmaxOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& /* initializers */,
                                          const Node& node,
-                                         const WnnDeviceType /* device_type */,
+                                         const WebnnDeviceType /* device_type */,
                                          const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   std::vector<int64_t> input_shape;
@@ -82,7 +82,7 @@ bool SoftmaxOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& /* initiali
     return false;
   }
 
-return true;
+  return true;
 }
 
 void CreateSoftmaxOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {

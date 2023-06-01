@@ -24,7 +24,7 @@ class SplitOpBuilder : public BaseOpBuilder {
   // Operator support related.
  private:
   bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const WnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 
   int GetMinSupportedOpSet(const Node& node) const override;
 };
@@ -110,7 +110,7 @@ int SplitOpBuilder::GetMinSupportedOpSet(const Node& /* node */) const {
 
 bool SplitOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers,
                                        const Node& node,
-                                       const WnnDeviceType /* device_type */,
+                                       const WebnnDeviceType /* device_type */,
                                        const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   std::vector<int64_t> input_shape;
