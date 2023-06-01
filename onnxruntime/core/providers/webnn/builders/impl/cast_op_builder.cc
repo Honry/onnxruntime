@@ -39,7 +39,7 @@ Status CastOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   // We already checked the "to" type in IsOpSupportedImpl.
   const auto to_type = helper.Get("to", ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
   std::string operand_type;
-  switch(to_type) {
+  switch (to_type) {
     case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
       operand_type = "uint8";
       break;
