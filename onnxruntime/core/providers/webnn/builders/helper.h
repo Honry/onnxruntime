@@ -25,6 +25,11 @@ class Logger;
 
 namespace webnn {
 
+enum class WebnnDeviceType {
+  CPU,
+  GPU,
+};
+
 bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const logging::Logger& logger);
 
 template <typename T>
@@ -84,6 +89,7 @@ bool IsInputSupported(const NodeArg& node_arg, const std::string& parent_name, c
 // Get a list of groups of supported nodes, each group represents a subgraph supported by WebNN EP.
 std::vector<std::vector<NodeIndex>> GetSupportedNodes(const GraphViewer& graph_viewer,
                                                       const emscripten::val& wnn_builder_,
+                                                      const WebnnDeviceType device_type,
                                                       const logging::Logger& logger);
 static const InlinedHashMap<std::string, std::string> op_map = {
     {"ArgMax", "argMax"},
@@ -133,16 +139,21 @@ inline bool CheckSingleOp(const std::string& op_type, const emscripten::val& wnn
   return op_map.find(op_type) != op_map.end() && wnn_builder_[op_map.find(op_type)->second].as<bool>();
 }
 
-constexpr std::array<ONNX_NAMESPACE::TensorProto_DataType, 6> supported_data_types = {
+constexpr std::array<ONNX_NAMESPACE::TensorProto_DataType, 1> supported_cpu_data_types = {
+    ONNX_NAMESPACE::TensorProto_DataType_FLOAT,
+};
+
+constexpr std::array<ONNX_NAMESPACE::TensorProto_DataType, 7> supported_gpu_data_types = {
     ONNX_NAMESPACE::TensorProto_DataType_BOOL,
     ONNX_NAMESPACE::TensorProto_DataType_FLOAT16,
     ONNX_NAMESPACE::TensorProto_DataType_FLOAT,
     ONNX_NAMESPACE::TensorProto_DataType_INT32,
     ONNX_NAMESPACE::TensorProto_DataType_INT64,
     ONNX_NAMESPACE::TensorProto_DataType_UINT32,
+    ONNX_NAMESPACE::TensorProto_DataType_UINT64,
 };
 
-bool IsSupportedDataType(int32_t data_type);
+bool IsSupportedDataType(const int32_t data_type, const WebnnDeviceType device_type);
 
 bool IsValidMultidirectionalBroadcast(std::vector<int64_t>& shape_a,
                                       std::vector<int64_t>& shape_b,

@@ -52,8 +52,10 @@ WebNNExecutionProvider::WebNNExecutionProvider(
   // WebNN EP uses NHWC layout for CPU XNNPACK backend and NCHW for GPU DML backend.
   if (webnn_device_flags.compare("cpu") == 0) {
     preferred_layout_ = DataLayout::NHWC;
+    wnn_device_type_ = webnn::WebnnDeviceType::CPU;
   } else {
     preferred_layout_ = DataLayout::NCHW;
+    wnn_device_type_ = webnn::WebnnDeviceType::GPU;
   }
   if (webnn_power_flags.compare("default") != 0) {
     context_options.set("powerPreference", emscripten::val(webnn_power_flags));
@@ -100,7 +102,7 @@ WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_view
 
   const auto& logger = *GetLogger();
 
-  const auto node_groups = webnn::GetSupportedNodes(graph_viewer, wnn_builder_, logger);
+  const auto node_groups = webnn::GetSupportedNodes(graph_viewer, wnn_builder_, wnn_device_type_, logger);
 
   if (node_groups.empty()) {
     return result;
@@ -218,7 +220,8 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
     Node& fused_node = fused_node_and_graph.fused_node;
     const onnxruntime::GraphViewer& graph_viewer(fused_node_and_graph.filtered_graph);
 
-    webnn::ModelBuilder builder(graph_viewer, *GetLogger(), wnn_context_, wnn_builder_, preferred_layout_);
+    webnn::ModelBuilder builder(graph_viewer, *GetLogger(), wnn_context_,
+                                wnn_builder_, preferred_layout_, wnn_device_type_);
     std::unique_ptr<webnn::Model> model;
     ORT_RETURN_IF_ERROR(builder.Compile(model));
     // Build map from input name to its index in input definitions.
@@ -322,6 +325,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
             case ONNX_NAMESPACE::TensorProto_DataType_INT32:
             case ONNX_NAMESPACE::TensorProto_DataType_INT64:
             case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
+            case ONNX_NAMESPACE::TensorProto_DataType_UINT64:
               output_buffer = output_tensor.GetTensorMutableRawData();
               break;
             default:

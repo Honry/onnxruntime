@@ -20,8 +20,8 @@ class GatherOpBuilder : public BaseOpBuilder {
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
 
   // Operator support related.
-  bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const logging::Logger& logger) const override;
+  bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& node,
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 // Add operator related.
@@ -48,8 +48,10 @@ Status GatherOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
 // Operator support related.
 
-bool GatherOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                                         const logging::Logger& logger) const {
+bool GatherOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& /* initializers */,
+                                        const Node& node,
+                                        const WebnnDeviceType /* device_type */,
+                                        const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   std::vector<int64_t> input_shape;
   if (!GetShape(*input_defs[0], input_shape, logger))

@@ -19,8 +19,8 @@ class LogicalOpBuilder : public BaseOpBuilder {
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
   // Operator support related.
-  bool IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
-                         const logging::Logger& logger) const override;
+  bool IsOpSupportedImpl(const InitializedTensorSet& /* initializers */, const Node& node,
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 // Add operator related.
@@ -57,7 +57,9 @@ void CreateLogicalOpBuilder(const std::string& op_type, OpBuilderRegistrations& 
   }
 }
 
-bool LogicalOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& initializers, const Node& node,
+bool LogicalOpBuilder::IsOpSupportedImpl(const InitializedTensorSet& /* initializers */,
+                                         const Node& node,
+                                         const WebnnDeviceType /* device_type */,
                                          const logging::Logger& logger) const {
   const auto& name = node.Name();
   const auto& op_type = node.OpType();
