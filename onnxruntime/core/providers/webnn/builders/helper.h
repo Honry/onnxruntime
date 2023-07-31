@@ -162,6 +162,7 @@ static const InlinedHashMap<std::string, std::string> op_map = {
     {"LayerNormalization", "meanVarianceNormalization"},
     {"LeakyRelu", "leakyRelu"},
     {"Less", "lesser"},
+    {"Log", "log"},
     {"MatMul", "matmul"},
     {"Max", "max"},
     {"MaxPool", "maxPool2d"},
