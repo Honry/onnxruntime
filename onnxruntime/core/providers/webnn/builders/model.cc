@@ -155,22 +155,27 @@ onnxruntime::common::Status Model::Compute(const InlinedHashMap<std::string, Onn
 onnxruntime::common::Status Model::Dispatch(const InlinedHashMap<std::string, OnnxTensorData>& inputs,
                                             const InlinedHashMap<std::string, OnnxTensorData>& outputs) {
   auto jsepEnsureTensor = emscripten::val::module_property("jsepEnsureTensor");
+  emscripten::val console = emscripten::val::global("console");
+  console.call<void>("log", emscripten::val("Dispatch: inputs..."));
   auto promises = emscripten::val::array();
-  for (const auto& [_, tensor] : inputs) {
+  for (const auto& [name, tensor] : inputs) {
     emscripten::val shape = emscripten::val::array();
     for (const auto& dim : tensor.tensor_info.shape) {
       uint32_t dim_val = SafeInt<uint32_t>(dim);
       shape.call<void>("push", dim_val);
     }
+    console.call<void>("log", emscripten::val(name));
     auto buffer = jsepEnsureTensor(reinterpret_cast<intptr_t>(tensor.buffer), tensor.tensor_info.data_type, shape, true);
     promises.call<void>("push", buffer);
   }
-  for (const auto& [_, tensor] : outputs) {
+  console.call<void>("log", emscripten::val("Dispatch: outputs..."));
+  for (const auto& [name, tensor] : outputs) {
     emscripten::val shape = emscripten::val::array();
     for (const auto& dim : tensor.tensor_info.shape) {
       uint32_t dim_val = SafeInt<uint32_t>(dim);
       shape.call<void>("push", dim_val);
     }
+    console.call<void>("log", emscripten::val(name));
     auto buffer = jsepEnsureTensor(reinterpret_cast<intptr_t>(tensor.buffer), tensor.tensor_info.data_type, shape, false);
     promises.call<void>("push", buffer);
   }

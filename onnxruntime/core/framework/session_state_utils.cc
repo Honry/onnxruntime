@@ -32,6 +32,8 @@
 #include "core/framework/memory_info.h"
 #endif
 
+#include <emscripten.h>
+#include <emscripten/val.h>
 namespace onnxruntime {
 namespace session_state_utils {
 
@@ -117,10 +119,13 @@ static common::Status DeserializeTensorProto(const Env& env, const std::basic_st
 
   auto& memory_info = (alloc != nullptr) ? alloc->Info() : m->GetAllocInfo();
   auto device_type = memory_info.device.Type();
-
+  emscripten::val console = emscripten::val::global("console");
+    console.call<void>("log", emscripten::val("before has external data..."));
   if (utils::HasExternalData(tensor_proto)) {
+    console.call<void>("log", emscripten::val("has external data..."));
     auto external_data_loader = external_data_loader_mgr.GetExternalDataLoader(memory_info);
     if (external_data_loader) {
+      console.call<void>("log", emscripten::val("has external_data_loader..."));
       // if custom external data loader is used, always allocate memory on device - p_tensor
       ORT_RETURN_IF_ERROR(AllocateTensor(m, p_tensor, type, tensor_shape, use_device_allocator_for_initializers, alloc));
 
@@ -131,6 +136,7 @@ static common::Status DeserializeTensorProto(const Env& env, const std::basic_st
       ort_value.Init(p_tensor.release(), ml_tensor, ml_tensor->GetDeleteFunc());
       return common::Status::OK();
     } else if (device_type == OrtDevice::CPU) {
+      console.call<void>("log", emscripten::val("has not external_data_loader..."));
       // for external initializer on CPU we will use mmap for large initializers so don't need to allocate memory in advance
       p_tensor = std::make_unique<Tensor>();
 

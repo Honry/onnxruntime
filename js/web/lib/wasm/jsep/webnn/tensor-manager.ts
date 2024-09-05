@@ -235,6 +235,7 @@ class TensorManagerImpl implements TensorManager {
           dataType
         }, dimensions: ${dimensions}, copyOld: ${copyOld}}`,
     );
+    console.log("tensor-manager.ts: ensureBuffer id: ", tensorId);
     const tensor = this.tensorsById.get(tensorId);
     if (!tensor) {
       throw new Error('Tensor not found.');

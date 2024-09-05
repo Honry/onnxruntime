@@ -55,8 +55,8 @@ bool BaseOpBuilder::IsOpSupported(const InitializedTensorSet& initializers, cons
     return false;
 
   // We do not support external initializers for now.
-  if (HasExternalInitializer(initializers, node, logger))
-    return false;
+  // if (HasExternalInitializer(initializers, node, logger))
+  //   return false;
 
   if (!HasSupportedOpSet(node, logger))
     return false;

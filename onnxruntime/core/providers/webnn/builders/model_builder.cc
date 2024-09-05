@@ -84,8 +84,9 @@ void ModelBuilder::PreprocessInitializers() {
 }
 
 Status ModelBuilder::RegisterInitializers() {
+  emscripten::val console = emscripten::val::global("console");
   for (const auto& pair : GetInitializerTensors()) {
-    const auto& tensor = *pair.second;
+    auto& tensor = *pair.second;
     const auto& name = tensor.name();
     // Optional tensors can be indicated by an empty name, just ignore it.
     if (name.empty() || Contains(skipped_initializers_, name))
@@ -109,6 +110,18 @@ Status ModelBuilder::RegisterInitializers() {
       std::byte* tensor_ptr = nullptr;
       if (tensor.has_raw_data()) {
         tensor_ptr = reinterpret_cast<std::byte*>(const_cast<char*>(tensor.raw_data().c_str()));
+      } else if (tensor.data_location() == onnx::TensorProto_DataLocation_EXTERNAL) {
+        // Load external data from file.
+        // Store temporary unpacked_tensor.
+        // unpacked_tensors_.push_back({});
+        // std::vector<uint8_t>& unpacked_external_tensor = unpacked_tensors_.back();
+        console.call<void>("log", emscripten::val("unpacked_external_tensor: " + name));
+        // ORT_RETURN_IF_ERROR(onnxruntime::utils::UnpackInitializerData(tensor, unpacked_external_tensor));
+        // ORT_RETURN_IF_ERROR(onnxruntime::utils::UnpackInitializerData(tensor, graph_viewer_.ModelPath(), unpacked_external_tensor));
+        console.call<void>("log", emscripten::val("unpacked_external_tensor done " + name));
+        // tensor_ptr = reinterpret_cast<std::byte*>(unpacked_external_tensor.data());
+        auto mutable_tensor = tensor.raw_data();
+        console.call<void>("log", emscripten::val("unpacked_external_tensor done " + mutable_tensor));
       } else {
         // Store temporary unpacked_tensor.
         unpacked_tensors_.push_back({});

@@ -48,7 +48,7 @@ std::vector<std::unique_ptr<ComputeCapability>>
 WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_viewer,
                                       const IKernelLookup& /*kernel_registries*/) const {
   std::vector<std::unique_ptr<ComputeCapability>> result;
-
+  emscripten::val console = emscripten::val::global("console");
   // For subgraph which is the attribute of the control flow nodes, part of its initializers are stored in its
   // ancestor graphs as common initializers shared for other subgraphs. We need to collect all of them used for
   // identifying the required initializer names and storing into 'meta_def->constant_initializers'.
@@ -196,7 +196,7 @@ WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_view
       " number of partitions supported by WebNN: ", num_of_partitions,
       " number of nodes in the graph: ", graph_viewer.NumberOfNodes(),
       " number of nodes supported by WebNN: ", num_of_supported_nodes);
-
+  console.call<void>("log", emscripten::val(summary_msg));
   // If the graph is partitioned in multiple subgraphs, and this may impact performance,
   // we want to give users a summary message at warning level.
   if (num_of_partitions > 1) {

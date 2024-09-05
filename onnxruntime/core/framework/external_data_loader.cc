@@ -33,6 +33,7 @@ common::Status LoadWebAssemblyExternalData(const Env& env,
                                  return 1;  // "Module.MountedFiles" is not available.
                                }
                                let fileName = UTF8ToString($0 >>> 0);
+                               console.log("file name: ", fileName);
                                if (fileName.startsWith('./')) {
                                  fileName = fileName.substring(2);
                                }
@@ -51,6 +52,8 @@ common::Status LoadWebAssemblyExternalData(const Env& env,
 
                                try {
                                  const data = fileData.subarray(offset, offset + length);
+                                 console.log("data: ", data);
+                                 console.log("dataIdOrBuffer: ", dataIdOrBuffer);
                                  switch (loadType) {
                                    case 0:
                                      // Load external data to CPU memory.
