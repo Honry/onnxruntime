@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+/* eslint-disable @typescript-eslint/naming-convention */
+
 interface NavigatorML {
   readonly ml: ML;
 }
@@ -30,7 +32,7 @@ type MLInputOperandLayout = 'nchw'|'nhwc';
 type MLOperandDataType = 'float32'|'float16'|'int32'|'uint32'|'int64'|'uint64'|'int8'|'uint8';
 interface MLOperandDescriptor {
   dataType: MLOperandDataType;
-  dimensions?: number[];
+  dimensions?: readonly number[];
 }
 interface MLOperand {
   dataType(): MLOperandDataType;
@@ -379,23 +381,32 @@ interface MLGraphBuilder {
   where(condition: MLOperand, input: MLOperand, other: MLOperand): MLOperand;
 }
 
-// Experimental MLBuffer interface
+// Experimental MLTensor interface
 
-type MLSize64Out = number;
-interface MLBuffer {
-  readonly size: MLSize64Out;
+interface MLTensor {
   destroy(): void;
 }
-type MLSize64 = number;
-interface MLBufferDescriptor {
-  size: MLSize64;
+
+type MLNamedBuffers = Record<string, MLTensor>;
+
+type MLTensorUsageFlags = number;
+
+declare const MLTensorUsage: {
+  readonly WEBGPU_INTEROP: MLTensorUsageFlags;
+  readonly READ_FROM: MLTensorUsageFlags;
+  readonly WRITE_TO: MLTensorUsageFlags;
+};
+
+interface MLTensorDescriptor extends MLOperandDescriptor {
+  usage: MLTensorUsageFlags;
 }
-type MLNamedBuffers = Record<string, MLBuffer>;
+
 interface MLContext {
-  createBuffer(descriptor: MLBufferDescriptor): MLBuffer;
-  writeBuffer(
-      dstBuffer: MLBuffer, srcData: ArrayBufferView|ArrayBuffer, srcElementOffset?: MLSize64,
-      srcElementSize?: MLSize64): void;
-  readBuffer(srcBuffer: MLBuffer): Promise<ArrayBuffer>;
+  createTensor(descriptor: MLTensorDescriptor): Promise<MLTensor>;
+  writeTensor(
+      destinationTensor: MLTensor, sourceData: ArrayBufferView|ArrayBuffer, sourceElementOffset?: number,
+      srcElementSize?: number): void;
+  readTensor(sourceTensor: MLTensor): Promise<ArrayBuffer>;
+  readTensor(sourceTensor: MLTensor, destinationData: ArrayBufferView|ArrayBuffer): Promise<undefined>;
   dispatch(graph: MLGraph, inputs: MLNamedBuffers, outputs: MLNamedBuffers): void;
 }
