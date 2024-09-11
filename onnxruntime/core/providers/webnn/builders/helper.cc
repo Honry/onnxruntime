@@ -117,7 +117,7 @@ std::vector<std::vector<NodeIndex>> GetSupportedNodes(const GraphViewer& graph_v
     bool supported = false;
     // Firstly check if platform supports the WebNN op.
     if (CheckSingleOp(node->OpType(), wnn_builder, device_type)) {
-      LOGS(logger, VERBOSE) << "Operator type: [" << node->OpType() << "] is supported by browser";
+      // LOGS(logger, VERBOSE) << "Operator type: [" << node->OpType() << "] is supported by browser";
       supported = IsNodeSupported(*node, graph_viewer, device_type, logger);
     }
 

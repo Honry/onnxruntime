@@ -13,7 +13,7 @@
 #include "core/framework/tensorprotoutils.h"
 #include "core/providers/common.h"
 #include "core/providers/shared/utils/utils.h"
-
+#include "core/framework/tensor_external_data_info.h"
 #include <utility>
 
 namespace onnxruntime {
@@ -85,6 +85,7 @@ void ModelBuilder::PreprocessInitializers() {
 
 Status ModelBuilder::RegisterInitializers() {
   emscripten::val console = emscripten::val::global("console");
+  console.call<void>("log", emscripten::val("model_builder.cc: RegisterInitializers"));
   for (const auto& pair : GetInitializerTensors()) {
     auto& tensor = *pair.second;
     const auto& name = tensor.name();
@@ -110,18 +111,70 @@ Status ModelBuilder::RegisterInitializers() {
       std::byte* tensor_ptr = nullptr;
       if (tensor.has_raw_data()) {
         tensor_ptr = reinterpret_cast<std::byte*>(const_cast<char*>(tensor.raw_data().c_str()));
-      } else if (tensor.data_location() == onnx::TensorProto_DataLocation_EXTERNAL) {
+      } else if (utils::HasExternalData(tensor)) {
+        std::basic_string<ORTCHAR_T> external_file_path;
+        onnxruntime::FileOffsetType data_offset;
+        SafeInt<size_t> tensor_byte_size;
+        // if (!model_path.empty()) {
+        //  ORT_RETURN_IF_ERROR(GetDirNameFromFilePath(model_path, tensor_proto_dir));
+        // }
+        console.call<void>("log", emscripten::val("graph_viewer_.ModelPath: "));
+        console.call<void>("log", emscripten::val(graph_viewer_.ModelPath().c_str()));
+        ORT_RETURN_IF_ERROR(
+            utils::GetExternalDataInfo(tensor, graph_viewer_.ModelPath(), external_file_path, data_offset, tensor_byte_size));
+        // std::string external_file_absolute_path = std::filesystem::absolute(std::filesystem::path(external_file_path)).string();
+
+        // auto err_code = EM_ASM_INT(({
+        //                              // If available, "Module.MountedFiles" is a Map for all preloaded files.
+        //                              if (typeof Module == 'undefined' || !Module.MountedFiles) {
+        //                                return 0;  // "Module.MountedFiles" is not available.
+        //                              }
+        //                              let fileName = UTF8ToString($0 >>> 0);
+        //                              console.log("model_builder.cc: file name: ", fileName);
+        //                              if (fileName.startsWith('./')) {
+        //                                fileName = fileName.substring(2);
+        //                              }
+        //                              const fileData = Module.MountedFiles.get(fileName);
+        //                              if (!fileData) {
+        //                                return 0;  // File not found in preloaded files.
+        //                              }
+        //                              const offset = $1 >>> 0;
+        //                              const length = $2 >>> 0;
+        //                              const constantId = Module.jsepReserveTensorId(1);
+        //                              if (offset + length > fileData.byteLength) {
+        //                                return 0;  // Out of bounds.
+        //                              }
+
+        //                              try {
+        //                               //  Module.jsepSetCurrentBuilder();
+        //                               //  const wnn_builder = Module['currentBuilder'];
+        //                               //  console.log("model_builder.cc: wnn_builder 1: ", wnn_builder);
+        //                                const data = fileData.subarray(offset, offset + length);
+        //                                console.log("data: ", data);
+        //                                console.log("dataIdOrBuffer: ", constantId);
+        //                                // Load external data to WebNN memory.
+        //                                Module.jsepUploadExternalBuffer(constantId, data);
+        //                                return constantId;
+        //                              } catch {
+        //                                //  return 4;
+        //                                console.log("model_builder.cc throws");
+        //                                return 0;
+        //                              }
+        //                            }),
+        //                            external_file_path.c_str(),
+        //                            static_cast<int32_t>(data_offset),
+        //                            static_cast<int32_t>(tensor_byte_size));
+        auto jsepRegisterMLConstant = emscripten::val::module_property("jsepRegisterMLConstant");
+        // operand = jsepRegisterMLConstant(err_code, wnn_builder_, desc);
+        operand = jsepRegisterMLConstant(emscripten::val(external_file_path),
+                                         static_cast<int32_t>(data_offset),
+                                         static_cast<int32_t>(tensor_byte_size),
+                                         wnn_builder_,
+                                         desc).await();
+
         // Load external data from file.
-        // Store temporary unpacked_tensor.
-        // unpacked_tensors_.push_back({});
-        // std::vector<uint8_t>& unpacked_external_tensor = unpacked_tensors_.back();
         console.call<void>("log", emscripten::val("unpacked_external_tensor: " + name));
-        // ORT_RETURN_IF_ERROR(onnxruntime::utils::UnpackInitializerData(tensor, unpacked_external_tensor));
-        // ORT_RETURN_IF_ERROR(onnxruntime::utils::UnpackInitializerData(tensor, graph_viewer_.ModelPath(), unpacked_external_tensor));
-        console.call<void>("log", emscripten::val("unpacked_external_tensor done " + name));
-        // tensor_ptr = reinterpret_cast<std::byte*>(unpacked_external_tensor.data());
-        auto mutable_tensor = tensor.raw_data();
-        console.call<void>("log", emscripten::val("unpacked_external_tensor done " + mutable_tensor));
+        console.call<void>("log", emscripten::val("unpacked_external_tensor done "), operand);
       } else {
         // Store temporary unpacked_tensor.
         unpacked_tensors_.push_back({});
@@ -129,47 +182,49 @@ Status ModelBuilder::RegisterInitializers() {
         ORT_RETURN_IF_ERROR(onnxruntime::utils::UnpackInitializerData(tensor, unpacked_tensor));
         tensor_ptr = reinterpret_cast<std::byte*>(unpacked_tensor.data());
       }
-      switch (data_type) {
-        case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
-        case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
-          view = emscripten::val{emscripten::typed_memory_view(num_elements,
-                                                               reinterpret_cast<uint8_t*>(tensor_ptr))};
-          break;
-        case ONNX_NAMESPACE::TensorProto_DataType_INT8:
-          view = emscripten::val{emscripten::typed_memory_view(num_elements,
-                                                               reinterpret_cast<int8_t*>(tensor_ptr))};
-          break;
-        case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
-          view = emscripten::val{emscripten::typed_memory_view(num_elements,
-                                                               reinterpret_cast<uint16_t*>(tensor_ptr))};
-          break;
-        case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
-          view = emscripten::val{emscripten::typed_memory_view(num_elements,
-                                                               reinterpret_cast<float*>(tensor_ptr))};
-          break;
-        case ONNX_NAMESPACE::TensorProto_DataType_INT32:
-          view = emscripten::val{emscripten::typed_memory_view(num_elements,
-                                                               reinterpret_cast<int32_t*>(tensor_ptr))};
-          break;
-        case ONNX_NAMESPACE::TensorProto_DataType_INT64:
-          view = emscripten::val{emscripten::typed_memory_view(num_elements,
-                                                               reinterpret_cast<int64_t*>(tensor_ptr))};
-          break;
-        case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
-          view = emscripten::val{emscripten::typed_memory_view(num_elements,
-                                                               reinterpret_cast<uint32_t*>(tensor_ptr))};
-          break;
-        case ONNX_NAMESPACE::TensorProto_DataType_UINT64:
-          view = emscripten::val{emscripten::typed_memory_view(num_elements,
-                                                               reinterpret_cast<uint64_t*>(tensor_ptr))};
-          break;
-        default:
-          break;
-      }
+      if (!utils::HasExternalData(tensor)) {
+        switch (data_type) {
+          case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
+          case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
+            view = emscripten::val{emscripten::typed_memory_view(num_elements,
+                                                                 reinterpret_cast<uint8_t*>(tensor_ptr))};
+            break;
+          case ONNX_NAMESPACE::TensorProto_DataType_INT8:
+            view = emscripten::val{emscripten::typed_memory_view(num_elements,
+                                                                 reinterpret_cast<int8_t*>(tensor_ptr))};
+            break;
+          case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
+            view = emscripten::val{emscripten::typed_memory_view(num_elements,
+                                                                 reinterpret_cast<uint16_t*>(tensor_ptr))};
+            break;
+          case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
+            view = emscripten::val{emscripten::typed_memory_view(num_elements,
+                                                                 reinterpret_cast<float*>(tensor_ptr))};
+            break;
+          case ONNX_NAMESPACE::TensorProto_DataType_INT32:
+            view = emscripten::val{emscripten::typed_memory_view(num_elements,
+                                                                 reinterpret_cast<int32_t*>(tensor_ptr))};
+            break;
+          case ONNX_NAMESPACE::TensorProto_DataType_INT64:
+            view = emscripten::val{emscripten::typed_memory_view(num_elements,
+                                                                 reinterpret_cast<int64_t*>(tensor_ptr))};
+            break;
+          case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
+            view = emscripten::val{emscripten::typed_memory_view(num_elements,
+                                                                 reinterpret_cast<uint32_t*>(tensor_ptr))};
+            break;
+          case ONNX_NAMESPACE::TensorProto_DataType_UINT64:
+            view = emscripten::val{emscripten::typed_memory_view(num_elements,
+                                                                 reinterpret_cast<uint64_t*>(tensor_ptr))};
+            break;
+          default:
+            break;
+        }
 
-      // Wasm memory grow will cause all array buffers reallocation, which will be treated as detached
-      // buffers in JS side. Simply create a copy to fix it.
-      operand = wnn_builder_.call<emscripten::val>("constant", desc, view.call<emscripten::val>("slice"));
+        // Wasm memory grow will cause all array buffers reallocation, which will be treated as detached
+        // buffers in JS side. Simply create a copy to fix it.
+        operand = wnn_builder_.call<emscripten::val>("constant", desc, view.call<emscripten::val>("slice"));
+      }
     } else {
       // TODO: support other type.
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,

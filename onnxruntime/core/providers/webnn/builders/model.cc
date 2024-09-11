@@ -176,18 +176,26 @@ onnxruntime::common::Status Model::Dispatch(const InlinedHashMap<std::string, On
       shape.call<void>("push", dim_val);
     }
     console.call<void>("log", emscripten::val(name));
+    console.call<void>("log", emscripten::val(reinterpret_cast<int>(tensor.buffer)));
+    console.call<void>("log", emscripten::val(reinterpret_cast<int>(tensor.tensor_info.data_type)));
+    console.call<void>("log", shape);
     auto buffer = jsepEnsureTensor(reinterpret_cast<intptr_t>(tensor.buffer), tensor.tensor_info.data_type, shape, false);
+    console.call<void>("log", buffer);
     promises.call<void>("push", buffer);
+    console.call<void>("log", emscripten::val("output buffer pushed: " + name));
   }
+  console.call<void>("log", emscripten::val("await buffers..."));
   auto buffers = emscripten::val::global("Promise").call<emscripten::val>("all", promises).await();
+  console.call<void>("log", emscripten::val("await buffers... Done"));
   for (const auto& [name, _] : inputs) {
     wnn_inputs_.set(name, buffers.call<emscripten::val>("shift"));
   }
   for (const auto& [name, _] : outputs) {
     wnn_outputs_.set(name, buffers.call<emscripten::val>("shift"));
   }
+  console.call<void>("log", emscripten::val("before call dispatch..."));
   wnn_context_.call<void>("dispatch", wnn_graph_, wnn_inputs_, wnn_outputs_);
-
+  console.call<void>("log", emscripten::val("call dispatch...Done"));
   return Status::OK();
 }
 

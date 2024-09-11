@@ -33,7 +33,6 @@ common::Status LoadWebAssemblyExternalData(const Env& env,
                                  return 1;  // "Module.MountedFiles" is not available.
                                }
                                let fileName = UTF8ToString($0 >>> 0);
-                               console.log("file name: ", fileName);
                                if (fileName.startsWith('./')) {
                                  fileName = fileName.substring(2);
                                }
@@ -52,8 +51,8 @@ common::Status LoadWebAssemblyExternalData(const Env& env,
 
                                try {
                                  const data = fileData.subarray(offset, offset + length);
-                                 console.log("data: ", data);
-                                 console.log("dataIdOrBuffer: ", dataIdOrBuffer);
+                                 console.log("core frame: dataIdOrBuffer: ", dataIdOrBuffer);
+                                 console.log("core frame: loadType: ", loadType);
                                  switch (loadType) {
                                    case 0:
                                      // Load external data to CPU memory.
@@ -62,6 +61,7 @@ common::Status LoadWebAssemblyExternalData(const Env& env,
                                      HEAPU8.set(data, dataIdOrBuffer);
                                      break;
                                    case 1:
+                                   case 2:
                                      // Load external data to GPU.
                                      Module.jsepUploadExternalBuffer(dataIdOrBuffer, data);
                                      break;

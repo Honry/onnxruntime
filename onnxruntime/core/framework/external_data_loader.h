@@ -44,6 +44,7 @@ enum class ExternalDataLoadType {
   CPU = 0,
 #if defined(USE_JSEP)
   WEBGPU_BUFFER = 1,
+  WEBNN_BUFFER = 2,
 #endif
 };
 

@@ -104,6 +104,8 @@ static common::Status DeserializeTensorProto(const Env& env, const std::basic_st
                                              const ExternalDataLoaderManager& external_data_loader_mgr,
                                              bool use_device_allocator_for_initializers = false,
                                              Tensor* buffered_tensor = nullptr) {
+  emscripten::val console = emscripten::val::global("console");
+  console.call<void>("log", emscripten::val("session_state_utils.cc: DeserializeTensorProto..."));
   if (bool(alloc) == (m != nullptr)) {
     return Status(common::ONNXRUNTIME, common::INVALID_ARGUMENT,
                   "DeserializeTensorProto() takes either pre-allocated buffer or an allocator!");
@@ -119,8 +121,7 @@ static common::Status DeserializeTensorProto(const Env& env, const std::basic_st
 
   auto& memory_info = (alloc != nullptr) ? alloc->Info() : m->GetAllocInfo();
   auto device_type = memory_info.device.Type();
-  emscripten::val console = emscripten::val::global("console");
-    console.call<void>("log", emscripten::val("before has external data..."));
+  console.call<void>("log", emscripten::val("before has external data..."));
   if (utils::HasExternalData(tensor_proto)) {
     console.call<void>("log", emscripten::val("has external data..."));
     auto external_data_loader = external_data_loader_mgr.GetExternalDataLoader(memory_info);
@@ -279,6 +280,8 @@ common::Status SaveInitializedTensors(
     const SessionOptions& session_options,
     const MemoryProfileFunction& memory_profile_func,
     std::unordered_map<std::string, std::unique_ptr<Tensor>>& buffered_tensors) {
+  emscripten::val console = emscripten::val::global("console");
+  console.call<void>("log", emscripten::val("session_state_utils.cc: SaveInitializedTensors..."));
   LOGS(logger, INFO) << "Saving initialized tensors.";
   ORT_ENFORCE(ort_value_name_idx_map.MaxIdx() > -1, "OrtValue indexes should have been populated.");
 

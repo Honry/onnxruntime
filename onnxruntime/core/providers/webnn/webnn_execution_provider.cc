@@ -17,6 +17,7 @@
 #include "builders/model.h"
 #include "builders/helper.h"
 #include "builders/model_builder.h"
+#include "external_data_loader.h"
 
 namespace onnxruntime {
 
@@ -56,6 +57,9 @@ WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_view
   // method defined in the model_builder.h file.
   InitializedTensorSet all_initializers;
   const bool is_subgraph = graph_viewer.IsSubgraph();
+  auto path_str = graph_viewer.ModelPath();
+  console.call<void>("log", emscripten::val("graph_viewer.ModelPath(): "));
+  console.call<void>("log", emscripten::val(path_str.string()));
   if (is_subgraph) {
     all_initializers = webnn::CollectAllInitializedTensors(graph_viewer);
   }
@@ -395,6 +399,10 @@ WebNNExecutionProvider::GetKernelRegistry() const {
   static std::shared_ptr<KernelRegistry> kernel_registry =
       onnxruntime::GetWebNNKernelRegistry();
   return kernel_registry;
+}
+
+std::unique_ptr<onnxruntime::IExternalDataLoader> WebNNExecutionProvider::GetExternalDataLoader() const {
+  return std::make_unique<webnn::ExternalDataLoader>();
 }
 
 std::unique_ptr<onnxruntime::IDataTransfer> WebNNExecutionProvider::GetDataTransfer() const {

@@ -235,5 +235,21 @@ Module['jsepInit'] = (name, params) => {
     Module['jsepRegisterMLTensor'] = (tensor, dataType, dimensions) => {
       return backend['registerMLTensor'](tensor, dataType, dimensions);
     }
+    Module.jsepUploadExternalBuffer = (dataId, buffer) => {
+      backend['uploadExternalBuffer'](dataId, buffer);
+    }
+    Module.jsepSetCurrentBuilder = () => {
+      return backend['setCurrentBuilder']();
+    }
+    Module.jsepGetCurrentBuilder = () => {
+      return backend['getCurrentBuilder']();
+    }
+    // Module.jsepRegisterMLConstant = (constantId, builder, desc) => {
+    //   return backend['registerMLConstant'](constantId, builder, desc);
+    // }
+    Module.jsepRegisterMLConstant = (externalFilePath, dataOffset, dataLength, builder, desc) => {
+      console.log('pre-jsep.js, mountedfiles: ', Module.MountedFiles);
+      return backend['registerMLConstant'](externalFilePath, dataOffset, dataLength, builder, desc, Module.MountedFiles);
+    }
   }
 };

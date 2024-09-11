@@ -12,7 +12,7 @@ import { LOG_DEBUG } from './log';
 import { TensorView } from './tensor-view';
 import { ShapeUtil } from './util';
 import { AdapterInfo, ComputeContext, ComputeContextInputsOutputsMapping, ProgramInfo } from './webgpu/types';
-import { WebNNBackend } from './backend-webnn';
+import { TensorType, WebNNBackend } from './backend-webnn';
 
 /* eslint-disable no-bitwise */
 
@@ -271,7 +271,7 @@ export const init = async (
     jsepInit('webnn', [
       backend,
       // jsepReserveBufferId
-      () => backend.reserveTensorId(),
+      (tensorType: TensorType) => backend.reserveTensorId(tensorType),
       // jsepReleaseBufferId,
       (bufferId: number) => backend.releaseTensorId(bufferId),
       // jsepEnsureBuffer

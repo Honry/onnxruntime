@@ -75,7 +75,6 @@ class ModelBuilder {
 
   InlinedHashSet<std::string> skipped_initializers_;
   InlinedHashSet<std::string> skipped_inputs_;
-
   uint32_t name_token_{0};
   InlinedHashSet<std::string> unique_names_;
 

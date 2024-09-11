@@ -8,6 +8,7 @@
 
 import type { Tensor } from 'onnxruntime-common';
 import { DataType } from './wasm-common';
+import { TensorType } from './jsep/backend-webnn';
 
 /* eslint-disable @typescript-eslint/naming-convention */
 
@@ -28,7 +29,7 @@ export declare namespace JSEP {
   type CaptureBeginFunction = () => void;
   type CaptureEndFunction = () => void;
   type ReplayFunction = () => void;
-  type ReserveTensorIdFunction = () => number;
+  type ReserveTensorIdFunction = (tensorType: TensorType) => number;
   type ReleaseTensorIdFunction = (tensorId: number) => void;
   type EnsureTensorFunction = (
     tensorId: number,
@@ -156,6 +157,7 @@ export declare namespace JSEP {
      */
     currentContext: MLContext;
 
+    currentBuilder: MLGraphBuilder;
     /**
      * Disables creating MLTensors. This is used to avoid creating MLTensors for graph initializers.
      */
@@ -172,7 +174,7 @@ export declare namespace JSEP {
      * [exported from pre-jsep.js] Reserve a MLTensor ID attached to the current session.
      * @returns the MLTensor ID.
      */
-    jsepReserveTensorId: () => number;
+    jsepReserveTensorId: (tensorType: TensorType) => number;
     /**
      * [exported from pre-jsep.js] Release a MLTensor ID from use and destroy buffer if no longer in use.
      * @param tensorId - specify the MLTensor ID.

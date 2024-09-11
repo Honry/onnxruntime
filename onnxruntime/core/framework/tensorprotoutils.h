@@ -23,6 +23,11 @@
 
 namespace onnxruntime {
 namespace utils {
+Status GetExternalDataInfo(const ONNX_NAMESPACE::TensorProto& tensor_proto,
+                                  const std::filesystem::path& tensor_proto_dir,
+                                  std::basic_string<ORTCHAR_T>& external_file_path,
+                                  onnxruntime::FileOffsetType& file_offset,
+                                  SafeInt<size_t>& tensor_byte_size);
 /**
  * This function is used to convert the endianess of Tensor data.
  * Mostly, will be used in big endian system to support the model file

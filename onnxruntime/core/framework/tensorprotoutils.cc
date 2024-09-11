@@ -29,6 +29,8 @@
 #include "core/session/ort_apis.h"
 #include "onnx/defs/tensor_proto_util.h"
 
+#include <emscripten.h>
+#include <emscripten/val.h>
 using namespace ONNX_NAMESPACE;
 using namespace ::onnxruntime::common;
 using namespace ::onnxruntime::utils;
@@ -165,37 +167,6 @@ Status UnpackTensorWithRawData(const void* raw_data, size_t raw_data_len, size_t
 DEFINE_INT4_UNPACK_TENSOR_WITH_RAW_DATA_IMPL(Int4x2)
 DEFINE_INT4_UNPACK_TENSOR_WITH_RAW_DATA_IMPL(UInt4x2)
 
-static Status GetExternalDataInfo(const ONNX_NAMESPACE::TensorProto& tensor_proto,
-                                  const std::filesystem::path& tensor_proto_dir,
-                                  std::basic_string<ORTCHAR_T>& external_file_path,
-                                  onnxruntime::FileOffsetType& file_offset,
-                                  SafeInt<size_t>& tensor_byte_size) {
-  ORT_RETURN_IF_NOT(onnxruntime::utils::HasExternalData(tensor_proto),
-                    "Tensor does not have external data to read from.");
-
-  ORT_RETURN_IF(!onnxruntime::utils::HasDataType(tensor_proto) || onnxruntime::utils::HasString(tensor_proto),
-                "External data type cannot be UNDEFINED or STRING.");
-
-  std::unique_ptr<onnxruntime::ExternalDataInfo> external_data_info;
-  ORT_RETURN_IF_ERROR(onnxruntime::ExternalDataInfo::Create(tensor_proto.external_data(), external_data_info));
-
-  const auto& location = external_data_info->GetRelPath();
-
-  external_file_path = location == onnxruntime::utils::kTensorProtoMemoryAddressTag ? std::filesystem::path(location)
-                                                                                    : (tensor_proto_dir / location);
-
-  ORT_RETURN_IF_ERROR(onnxruntime::utils::GetSizeInBytesFromTensorProto<0>(tensor_proto, &tensor_byte_size));
-  const size_t external_data_length = external_data_info->GetLength();
-  ORT_RETURN_IF_NOT(external_data_length == 0 || external_data_length == tensor_byte_size,
-                    "TensorProto: ", tensor_proto.name(),
-                    " external data size mismatch. Computed size: ", *&tensor_byte_size,
-                    ", external_data.length: ", external_data_length);
-
-  file_offset = external_data_info->GetOffset();
-
-  return Status::OK();
-}
-
 // Read external data for tensor in unint8_t* form and return Status::OK() if the data is read successfully.
 // Uses the tensor_proto_dir to construct the full path for external data. If tensor_proto_dir == nullptr
 // then uses the current directory instead.
@@ -260,6 +231,42 @@ Status TensorProtoToOrtValueImpl(const Env& env, const std::filesystem::path& mo
 }  // namespace
 
 namespace utils {
+
+Status GetExternalDataInfo(const ONNX_NAMESPACE::TensorProto& tensor_proto,
+                                  const std::filesystem::path& tensor_proto_dir,
+                                  std::basic_string<ORTCHAR_T>& external_file_path,
+                                  onnxruntime::FileOffsetType& file_offset,
+                                  SafeInt<size_t>& tensor_byte_size) {
+  ORT_RETURN_IF_NOT(onnxruntime::utils::HasExternalData(tensor_proto),
+                    "Tensor does not have external data to read from.");
+
+  ORT_RETURN_IF(!onnxruntime::utils::HasDataType(tensor_proto) || onnxruntime::utils::HasString(tensor_proto),
+                "External data type cannot be UNDEFINED or STRING.");
+
+  std::unique_ptr<onnxruntime::ExternalDataInfo> external_data_info;
+  ORT_RETURN_IF_ERROR(onnxruntime::ExternalDataInfo::Create(tensor_proto.external_data(), external_data_info));
+
+  const auto& location = external_data_info->GetRelPath();
+  emscripten::val console = emscripten::val::global("console");
+  console.call<void>("log", emscripten::val("GetExternalDataInfo..."));
+  console.call<void>("log", emscripten::val(location.c_str()));
+  console.call<void>("log", emscripten::val(std::filesystem::path(location).c_str()));
+  console.call<void>("log", emscripten::val(tensor_proto_dir.c_str()));
+  console.call<void>("log", emscripten::val(location == onnxruntime::utils::kTensorProtoMemoryAddressTag));
+  external_file_path = location == onnxruntime::utils::kTensorProtoMemoryAddressTag ? std::filesystem::path(location)
+                                                                                    : (tensor_proto_dir / location);
+
+  ORT_RETURN_IF_ERROR(onnxruntime::utils::GetSizeInBytesFromTensorProto<0>(tensor_proto, &tensor_byte_size));
+  const size_t external_data_length = external_data_info->GetLength();
+  ORT_RETURN_IF_NOT(external_data_length == 0 || external_data_length == tensor_byte_size,
+                    "TensorProto: ", tensor_proto.name(),
+                    " external data size mismatch. Computed size: ", *&tensor_byte_size,
+                    ", external_data.length: ", external_data_length);
+
+  file_offset = external_data_info->GetOffset();
+
+  return Status::OK();
+}
 
 void SetRawDataInTensorProto(ONNX_NAMESPACE::TensorProto& tensor_proto, std::string&& param) {
   tensor_proto.set_raw_data(std::move(param));
@@ -991,6 +998,10 @@ Status GetExtDataFromTensorProto(const Env& env, const std::filesystem::path& mo
                                  Tensor* buffered_tensor) {
   ORT_ENFORCE(utils::HasExternalData(tensor_proto));
   std::basic_string<ORTCHAR_T> tensor_proto_dir;
+  emscripten::val console = emscripten::val::global("console");
+  console.call<void>("log", emscripten::val("GetExtDataFromTensorProto..."));
+  console.call<void>("log", emscripten::val(model_path.c_str()));
+  console.call<void>("log", emscripten::val(model_path.string()));
   if (!model_path.empty()) {
     ORT_RETURN_IF_ERROR(GetDirNameFromFilePath(model_path, tensor_proto_dir));
   }

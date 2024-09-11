@@ -18,7 +18,7 @@ export interface TensorManager {
   /**
    * Reserve a new TensorId.
    */
-  reserveTensorId(): TensorId;
+  reserveTensorId(tensorId: TensorId): void;
   /**
    * Release a TensorId.
    */
@@ -48,11 +48,8 @@ export interface TensorManager {
   /**
    * Register an externally created MLTensor with a given MLContext and return a TensorId.
    */
-  registerTensor(mlContext: MLContext, mlTensor: MLTensor, dataType: MLOperandDataType, dimensions: number[]): TensorId;
+  registerTensor(mlContext: MLContext, mlTensor: MLTensor, dataType: MLOperandDataType, dimensions: number[], newTensorId: TensorId): TensorId;
 }
-
-let tensorGuid = 1;
-const createNewTensorId = (): TensorId => tensorGuid++;
 
 export type MLTensorEntry = [MLTensor, MLOperandDataType, readonly number[]];
 
@@ -198,10 +195,8 @@ class TensorManagerImpl implements TensorManager {
 
   constructor(private backend: WebNNBackend) {}
 
-  public reserveTensorId(): TensorId {
-    const tensorId = createNewTensorId();
+  public reserveTensorId(tensorId: TensorId): void {
     this.tensorsById.set(tensorId, new TensorTracker());
-    return tensorId;
   }
 
   public releaseTensorId(tensorId: TensorId): void {
@@ -279,21 +274,22 @@ class TensorManagerImpl implements TensorManager {
     mlTensor: MLTensor,
     dataType: MLOperandDataType,
     dimensions: readonly number[],
+    newTensorId: TensorId
   ): TensorId {
     for (const [tensorId, tensorTracker] of this.tensorsById) {
       if (tensorTracker.trySelectTensor(mlContext, mlTensor)) {
         return tensorId;
       }
     }
-    const tensorId = createNewTensorId();
-    this.tensorsById.set(tensorId, new TensorTracker(mlContext, [mlTensor, dataType, dimensions]));
+
+    this.tensorsById.set(newTensorId, new TensorTracker(mlContext, [mlTensor, dataType, dimensions]));
     let tensors = this.tensorIdsByContext.get(mlContext);
     if (!tensors) {
       tensors = new Set();
       this.tensorIdsByContext.set(mlContext, tensors);
     }
-    tensors.add(tensorId);
-    return tensorId;
+    tensors.add(newTensorId);
+    return newTensorId;
   }
 }
 

@@ -7,12 +7,12 @@
 /// <reference path="webnn/webnn.d.ts" />
 
 import { Env, Tensor } from 'onnxruntime-common';
-
 import { DataType } from '../wasm-common';
 import { getInstance } from '../wasm-factory';
 
 import { createView } from './tensor-view';
 import { TensorId, createTensorManager } from './webnn/tensor-manager';
+import { ConstantId, createConstantManager } from './webnn/constant-manager';
 import { configureLogger, LOG_DEBUG } from './log';
 
 /*
@@ -30,6 +30,14 @@ const onnxDataTypeToWebnnDataType = new Map<DataType, MLOperandDataType>([
   [DataType.bool, 'uint8'],
 ]);
 
+let tensorGuid = 1;
+const createNewTensorId = (): TensorId => tensorGuid++;
+
+export enum TensorType {
+  MLTensor = 0,
+  MLConstant = 1,
+}
+declare var MLGraphBuilder: any;
 /**
  * WebNN backend implementation. This class is used to keep track of the MLTensors created by the backend and keep track
  * of the current MLContext being used by the sessions.
@@ -39,6 +47,10 @@ export class WebNNBackend {
    * Tensor managers for each session.
    */
   private tensorManager = createTensorManager(this);
+  /**
+   * Tensor managers for each session.
+   */
+  private constantManager = createConstantManager();
   /**
    * Maps from session id to MLContexts.
    */
@@ -51,7 +63,10 @@ export class WebNNBackend {
    * Current session id.
    */
   private activeSessionId?: number;
-
+  /**
+   * Data of model with external data.
+   */
+  //private externalFileData?: ArrayBuffer;
   constructor(env: Env) {
     configureLogger(env.logLevel!, !!env.debug);
   }
@@ -104,13 +119,25 @@ export class WebNNBackend {
     return this.mlContextBySessionId.get(sessionId);
   }
 
-  public reserveTensorId(): TensorId {
-    return this.tensorManager.reserveTensorId();
+  public reserveTensorId(tensorType: TensorType): TensorId {
+    const tensorId = createNewTensorId();
+    if (tensorType == TensorType.MLTensor) {
+      this.tensorManager.reserveTensorId(tensorId);
+    } else {
+      this.constantManager.reserveConstantId(tensorId);
+    }
+
+    return tensorId;
   }
 
   public releaseTensorId(tensorId: TensorId): void {
     LOG_DEBUG('verbose', () => `[WebNN] releaseTensorId {tensorId: ${tensorId}}`);
     this.tensorManager.releaseTensorId(tensorId);
+  }
+
+  public releaseConstantId(constantId: ConstantId): void {
+    LOG_DEBUG('verbose', () => `[WebNN] releaseConstantId {constantId: ${constantId}}`);
+    this.constantManager.releaseConstantId(constantId);
   }
 
   public async ensureTensor(
@@ -151,8 +178,8 @@ export class WebNNBackend {
     if (!webnnDataType) {
       throw new Error(`Unsupported ONNX data type: ${onnxDataType}`);
     }
-
-    const id = this.tensorManager.registerTensor(this.currentContext, tensor, webnnDataType, dimensions);
+    const newTensorId = createNewTensorId();
+    const id = this.tensorManager.registerTensor(this.currentContext, tensor, webnnDataType, dimensions, newTensorId);
     LOG_DEBUG(
       'verbose',
       () =>
@@ -161,6 +188,136 @@ export class WebNNBackend {
         }} -> {bufferId: ${id}}`,
     );
     return id;
+  }
+
+  public uploadExternalBuffer(tensorId: TensorId, data: Uint8Array): void {
+    console.log('upload external buffer id: ', tensorId);
+    this.constantManager.upload(tensorId, data);
+  }
+
+  public setCurrentBuilder(): void {
+    console.log('set current builder: ');
+    const wasm = getInstance();
+    console.log('current Context: ', wasm.currentContext);
+    wasm.currentBuilder = new MLGraphBuilder(wasm.currentContext);
+  }
+  /**
+  public registerMLConstant(constantId: ConstantId, builder: MLGraphBuilder, desc: MLOperandDescriptor): MLOperand {
+    const buffer = this.constantManager.download(constantId) as ArrayBuffer;
+    LOG_DEBUG(
+      'verbose',
+      () =>
+        `[WebNN] registerMLConstant {dataType: ${desc.dataType}, dimensions: ${desc.dimensions}} -> {constantId: ${constantId}}`,
+    );
+    let bufferView: any;
+    switch (desc.dataType) {
+      case 'float32':
+        bufferView = new Float32Array(buffer);
+        break;
+      case 'float16':
+        bufferView = new Uint16Array(buffer);
+        break;
+      case 'int32':
+        bufferView = new Int32Array(buffer);
+        break;
+      case 'uint32':
+        bufferView = new Uint32Array(buffer);
+        break;
+      case 'int64':
+        bufferView = new BigInt64Array(buffer);
+        break;
+      case 'uint64':
+        bufferView = new BigUint64Array(buffer);
+        break;
+      case 'int8':
+        bufferView = new Int8Array(buffer);
+        break;
+      case 'uint8':
+        bufferView = new Uint8Array(buffer);
+        break;
+      default:
+        throw new Error(`Unsupported data type: ${desc.dataType} in creating WebNN Constant from external data`);
+    }
+    return builder.constant(desc, bufferView);
+  }
+*/
+  public async registerMLConstant(
+    externalFilePath: string,
+    dataOffset: number,
+    dataLength: number,
+    builder: MLGraphBuilder,
+    desc: MLOperandDescriptor,
+    mountedFiles: Map<string, Uint8Array> | undefined,
+  ): Promise<MLOperand> {
+    console.log("backend-webnn.ts: file name: ", externalFilePath);
+
+    // If available, "Module.MountedFiles" is a Map for all preloaded files.
+    if (!mountedFiles) {
+      throw new Error('External mounted files are not available.');
+    }
+
+                                      if (externalFilePath.startsWith('./')) {
+                                       externalFilePath = externalFilePath.substring(2);
+        }
+        const fileData = mountedFiles.get(externalFilePath);
+           if (!fileData) {
+        throw new Error(`File with name ${externalFilePath} not found in preloaded files.`)
+        }
+    //if (this.externalFileData === undefined) {
+    //  externalFilePath = 'models/' + externalFilePath;
+    //  this.externalFileData = await (await fetch(externalFilePath)).arrayBuffer();
+    //  console.log('backend-webnn.ts: reading external file data: ', this.externalFileData);
+    //}
+
+    if (dataOffset + dataLength > fileData.byteLength) {
+      throw new Error(`Out of bounds: data offset and length exceed the external file data size`);
+    }
+
+    // const data = new Uint8Array(this.externalFileData);
+    // const buffer = data.slice(dataOffset, dataOffset + dataLength).buffer;
+    const buffer = fileData.slice(dataOffset, dataOffset + dataLength).buffer;
+    // const buffer = data.buffer;
+    let bufferView: any;
+    switch (desc.dataType) {
+      case 'float32':
+        bufferView = new Float32Array(buffer);
+        break;
+      case 'float16':
+        bufferView = new Uint16Array(buffer);
+        break;
+      case 'int32':
+        bufferView = new Int32Array(buffer);
+        break;
+      case 'uint32':
+        bufferView = new Uint32Array(buffer);
+        break;
+      case 'int64':
+        bufferView = new BigInt64Array(buffer);
+        break;
+      case 'uint64':
+        bufferView = new BigUint64Array(buffer);
+        break;
+      case 'int8':
+        bufferView = new Int8Array(buffer);
+        break;
+      case 'uint8':
+        bufferView = new Uint8Array(buffer);
+        break;
+      default:
+        throw new Error(`Unsupported data type: ${desc.dataType} in creating WebNN Constant from external data`);
+    }
+
+    LOG_DEBUG(
+      'verbose',
+      () =>
+        `[WebNN] registerMLConstant {dataType: ${desc.dataType}, dimensions: ${desc.dimensions}}}`,
+    );
+    return builder.constant(desc, bufferView);
+  }
+
+  public downloadExternalBuffer(tensorId: TensorId): ArrayBuffer | null | undefined {
+    console.log('upload external buffer id: ', tensorId);
+    return this.constantManager.download(tensorId);
   }
 
   public flush(): void {
