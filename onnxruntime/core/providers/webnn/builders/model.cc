@@ -42,10 +42,12 @@ onnxruntime::common::Status Model::Compute(const InlinedHashMap<std::string, Onn
     emscripten::val view = emscripten::val::undefined();
     switch (tensor.tensor_info.data_type) {
       case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
+      case ONNX_NAMESPACE::TensorProto_DataType_UINT4:
       case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
         view = emscripten::val{emscripten::typed_memory_view(num_elements,
                                                              static_cast<const uint8_t*>(tensor.buffer))};
         break;
+      case ONNX_NAMESPACE::TensorProto_DataType_INT4:
       case ONNX_NAMESPACE::TensorProto_DataType_INT8:
         view = emscripten::val{emscripten::typed_memory_view(num_elements,
                                                              static_cast<const int8_t*>(tensor.buffer))};
@@ -93,10 +95,12 @@ onnxruntime::common::Status Model::Compute(const InlinedHashMap<std::string, Onn
     emscripten::val view = emscripten::val::undefined();
     switch (tensor.tensor_info.data_type) {
       case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
+      case ONNX_NAMESPACE::TensorProto_DataType_UINT4:
       case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
         view = emscripten::val{emscripten::typed_memory_view(num_elements,
                                                              static_cast<const uint8_t*>(tensor.buffer))};
         break;
+      case ONNX_NAMESPACE::TensorProto_DataType_INT4:
       case ONNX_NAMESPACE::TensorProto_DataType_INT8:
         view = emscripten::val{emscripten::typed_memory_view(num_elements,
                                                              static_cast<const int8_t*>(tensor.buffer))};
@@ -210,9 +214,11 @@ void Model::AllocateInputOutputBuffers() {
     const auto data_type = input_info.data_type;
     switch (data_type) {
       case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
+      case ONNX_NAMESPACE::TensorProto_DataType_UINT4:
       case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
         wnn_inputs_.set(input, emscripten::val::global("Uint8Array").new_(num_elements));
         break;
+      case ONNX_NAMESPACE::TensorProto_DataType_INT4:
       case ONNX_NAMESPACE::TensorProto_DataType_INT8:
         wnn_inputs_.set(input, emscripten::val::global("Int8Array").new_(num_elements));
         break;
@@ -245,9 +251,11 @@ void Model::AllocateInputOutputBuffers() {
     const auto data_type = output_info.data_type;
     switch (data_type) {
       case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
+      case ONNX_NAMESPACE::TensorProto_DataType_UINT4:
       case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
         wnn_outputs_.set(output, emscripten::val::global("Uint8Array").new_(num_elements));
         break;
+      case ONNX_NAMESPACE::TensorProto_DataType_INT4:
       case ONNX_NAMESPACE::TensorProto_DataType_INT8:
         wnn_outputs_.set(output, emscripten::val::global("Int8Array").new_(num_elements));
         break;

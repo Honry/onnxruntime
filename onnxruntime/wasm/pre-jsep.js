@@ -235,5 +235,8 @@ Module['jsepInit'] = (name, params) => {
     Module['jsepRegisterMLTensor'] = (tensor, dataType, shape) => {
       return backend['registerMLTensor'](tensor, dataType, shape);
     }
+    Module.jsepRegisterMLConstant = (externalFilePath, dataOffset, dataLength, builder, desc) => {
+      return backend['registerMLConstant'](externalFilePath, dataOffset, dataLength, builder, desc, Module.MountedFiles);
+    }
   }
 };

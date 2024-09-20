@@ -25,6 +25,8 @@ const onnxDataTypeToWebnnDataType = new Map<DataType, MLOperandDataType>([
   [DataType.uint32, 'uint32'],
   [DataType.int64, 'int64'],
   [DataType.uint64, 'uint64'],
+  [DataType.int4, 'int4'],
+  [DataType.uint4, 'uint4'],
   [DataType.int8, 'int8'],
   [DataType.uint8, 'uint8'],
   [DataType.bool, 'uint8'],
@@ -51,6 +53,10 @@ export class WebNNBackend {
    * Current session id.
    */
   private activeSessionId?: number;
+  /**
+   * Map for recording external data from Module.MountedFiles.
+   */
+  private mountedFiles?: Map<string, Uint8Array>;
 
   constructor(env: Env) {
     configureLogger(env.logLevel!, !!env.debug);
@@ -161,6 +167,82 @@ export class WebNNBackend {
         }} -> {tensorId: ${id}}`,
     );
     return id;
+  }
+
+  public registerMLConstant(
+    externalFilePath: string,
+    dataOffset: number,
+    dataLength: number,
+    builder: MLGraphBuilder,
+    desc: MLOperandDescriptor,
+    mountedFiles: Map<string, Uint8Array> | undefined,
+  ): MLOperand {
+    // If available, "Module.MountedFiles" is a Map for all preloaded files.
+    if (!mountedFiles) {
+      throw new Error('External mounted files are not available.');
+    }
+
+    if (!this.mountedFiles) {
+      console.log('backend-webnn.ts: this.mountedFiles is undefined');
+      this.mountedFiles = mountedFiles;
+    }
+
+    if (externalFilePath.startsWith('./')) {
+      externalFilePath = externalFilePath.substring(2);
+    }
+    const fileData = this.mountedFiles.get(externalFilePath);
+    if (!fileData) {
+      throw new Error(
+        `File with name ${externalFilePath} not found in preloaded files.`,
+      );
+    }
+
+    if (dataOffset + dataLength > fileData.byteLength) {
+      throw new Error(`Out of bounds: data offset and length exceed the external file data size`);
+    }
+
+    const buffer = fileData.slice(dataOffset, dataOffset + dataLength).buffer;
+    let bufferView: any;
+    switch (desc.dataType) {
+      case 'float32':
+        bufferView = new Float32Array(buffer);
+        break;
+      case 'float16':
+        bufferView = new Uint16Array(buffer);
+        break;
+      case 'int32':
+        bufferView = new Int32Array(buffer);
+        break;
+      case 'uint32':
+        bufferView = new Uint32Array(buffer);
+        break;
+      case 'int64':
+        bufferView = new BigInt64Array(buffer);
+        break;
+      case 'uint64':
+        bufferView = new BigUint64Array(buffer);
+        break;
+      case 'int4':
+      case 'int8':
+        bufferView = new Int8Array(buffer);
+        break;
+      case 'uint4':
+      case 'uint8':
+        bufferView = new Uint8Array(buffer);
+        break;
+      default:
+        throw new Error(`Unsupported data type: ${desc.dataType} in creating WebNN Constant from external data`);
+    }
+
+    LOG_DEBUG(
+      'verbose',
+      () =>
+        `[WebNN] registerMLConstant {dataType: ${desc.dataType}, shape: ${desc.shape}}}`,
+    );
+    if (desc.dataType == 'int4') {
+      console.log(desc, bufferView);
+    }
+    return builder.constant(desc, bufferView);
   }
 
   public flush(): void {

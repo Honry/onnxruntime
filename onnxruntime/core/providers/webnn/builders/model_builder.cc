@@ -135,10 +135,12 @@ Status ModelBuilder::RegisterInitializers() {
         }
         switch (data_type) {
           case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
+          case ONNX_NAMESPACE::TensorProto_DataType_UINT4:
           case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
             view = emscripten::val{emscripten::typed_memory_view(num_elements,
                                                                  reinterpret_cast<uint8_t*>(tensor_ptr))};
             break;
+          case ONNX_NAMESPACE::TensorProto_DataType_INT4:
           case ONNX_NAMESPACE::TensorProto_DataType_INT8:
             view = emscripten::val{emscripten::typed_memory_view(num_elements,
                                                                  reinterpret_cast<int8_t*>(tensor_ptr))};
@@ -385,9 +387,11 @@ const emscripten::val& ModelBuilder::GetZeroConstant(const int32_t& data_type) {
 
     switch (data_type) {
       case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
+      case ONNX_NAMESPACE::TensorProto_DataType_UINT4:
       case ONNX_NAMESPACE::TensorProto_DataType_UINT8:
         zero_buffer = emscripten::val::global("Uint8Array").new_(1);
         break;
+      case ONNX_NAMESPACE::TensorProto_DataType_INT4:
       case ONNX_NAMESPACE::TensorProto_DataType_INT8:
         zero_buffer = emscripten::val::global("Int8Array").new_(1);
         break;
