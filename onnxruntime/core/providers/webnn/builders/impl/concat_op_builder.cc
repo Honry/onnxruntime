@@ -42,7 +42,7 @@ Status ConcatOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   std::vector<emscripten::val> inputs;
   for (const auto* input : input_defs) {
-    LOGS(logger, VERBOSE) << "input name " << input->Name();
+    // LOGS(logger, VERBOSE) << "input name " << input->Name();
     inputs.push_back(model_builder.GetOperand(input->Name()));
   }
 

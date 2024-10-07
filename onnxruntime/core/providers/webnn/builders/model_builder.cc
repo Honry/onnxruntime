@@ -88,6 +88,8 @@ Status ModelBuilder::RegisterInitializers() {
   for (const auto& pair : GetInitializerTensors()) {
     const auto& tensor = *pair.second;
     const auto& name = tensor.name();
+    emscripten::val console = emscripten::val::global("console");
+    console.call<void>("log", emscripten::val("initializer name: " + name));
     // Optional tensors can be indicated by an empty name, just ignore it.
     if (name.empty() || Contains(skipped_initializers_, name))
       continue;
@@ -162,6 +164,7 @@ Status ModelBuilder::RegisterInitializers() {
           case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
             view = emscripten::val{emscripten::typed_memory_view(num_elements,
                                                                  reinterpret_cast<float*>(tensor_ptr))};
+            console.call<void>("log", view.call<emscripten::val>("slice"));
             break;
           case ONNX_NAMESPACE::TensorProto_DataType_INT32:
             view = emscripten::val{emscripten::typed_memory_view(num_elements,

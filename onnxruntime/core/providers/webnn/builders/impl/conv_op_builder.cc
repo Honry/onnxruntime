@@ -133,7 +133,7 @@ Status AddInitializerInNewLayout(ModelBuilder& model_builder,
   const auto out_t = dims[0], in_t = dims[1],
              h_t = dims[2], w_t = dims[3];
   std::vector<uint32_t> dest_shape;
-  if (is_conv == 1)
+  if (is_conv)
     dest_shape = {out_t, h_t, w_t, in_t};  // L_0231
   else
     dest_shape = {in_t, h_t, w_t, out_t};  // L_1230 for depthwise conv and convTranspose weight
@@ -199,7 +199,7 @@ Status AddInitializerInNewLayout(ModelBuilder& model_builder,
 Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                             const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
-
+  emscripten::val console = emscripten::val::global("console");
   const auto& op_type = node.OpType();
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
   emscripten::val output = emscripten::val::object();
@@ -265,7 +265,7 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
       options.set("inputLayout", emscripten::val("nhwc"));
       options.set("filterLayout", emscripten::val("ohwi"));
       if (is_constant_weight) {
-        ORT_RETURN_IF_ERROR(AddInitializerInNewLayout(model_builder, weight_name, true, is_conv1d));
+        ORT_RETURN_IF_ERROR(AddInitializerInNewLayout(model_builder, weight_name, false, is_conv1d));
       }
     }
   }
@@ -321,6 +321,12 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
     output = model_builder.GetBuilder().call<emscripten::val>("conv2dInteger",
                                                               input, x_zero_point, filter, w_zero_point, options);
   } else {
+    console.call<void>("log", emscripten::val("Input shape: "));
+    console.call<void>("log", input.call<emscripten::val>("shape"));
+    console.call<void>("log", emscripten::val("Filter shape: "));
+    console.call<void>("log", filter.call<emscripten::val>("shape"));
+    console.call<void>("log", emscripten::val("Options: "));
+    console.call<void>("log", options);
     output = model_builder.GetBuilder().call<emscripten::val>("convTranspose2d", input, filter, options);
   }
 
