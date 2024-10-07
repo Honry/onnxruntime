@@ -37,7 +37,7 @@ Status BinaryOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const
   emscripten::val output = emscripten::val::object();
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
-
+  emscripten::val console = emscripten::val::global("console");
   if (op_type == "Add") {
     output = model_builder.GetBuilder().call<emscripten::val>("add", input0, input1, options);
   } else if (op_type == "Sub") {
@@ -47,6 +47,9 @@ Status BinaryOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const
   } else if (op_type == "Div") {
     output = model_builder.GetBuilder().call<emscripten::val>("div", input0, input1, options);
   } else if (op_type == "Pow") {
+    console.call<void>("log", emscripten::val("add Pow op: " + node.Name()));
+    console.call<void>("log", emscripten::val(node.InputDefs()[0]->Name()));
+    console.call<void>("log", emscripten::val(node.InputDefs()[1]->Name()));
     output = model_builder.GetBuilder().call<emscripten::val>("pow", input0, input1, options);
   } else if (op_type == "PRelu") {
     output = model_builder.GetBuilder().call<emscripten::val>("prelu", input0, input1, options);
