@@ -60,7 +60,7 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   emscripten::val output;
   NodeAttrHelper helper(node);
   int32_t axis = helper.Get("axis", 1);
-  // int32_t block_size = helper.Get("block_size", 0);
+  int32_t block_size = helper.Get("block_size", 0);
   // axis is valid for input shape greater than 1D.
   if (input_shape.size() > 1) {
     axis = static_cast<int32_t>(HandleNegativeAxis(axis, input_shape.size()));
@@ -90,28 +90,30 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   }
 
   // If block_size is specified, we need to expand the non-scalar scale and zero_point tensors.
-  // if (block_size > 1 && !scale_shape.empty()) {
-  //   emscripten::val concat_scale_inputs = emscripten::val::array();
-  //   emscripten::val concat_zero_point_inputs = emscripten::val::array();
-  //   for (int i = 0; i < block_size; i++) {
-  //     concat_scale_inputs.call<void>("push", scale);
-  //     if (has_zero_point)
-  //       concat_zero_point_inputs.call<void>("push", zero_point);
-  //   }
+  if (block_size > 1 && !scale_shape.empty()) {
+    //scale0 = slice(scale, [ 0, 0 ], [ 1, 9216 ]);
+    //scaleForBlock0 = expand(scale0, [ 128, 9126 ]);
+    //... scale23 = slice(scale, [ 22, 0 ], [ 1, 9126 ]);
+    //scaleForBlock23 = expand(scale23, [ 128, 9126 ]);
+    //expandedScale = concat(scaleForBlock0, ..., scaleForBlock23);
+    emscripten::val concat_scale_inputs = emscripten::val::array();
+    for (int i = 0; i < static_cast<int32_t>(input_shape[axis]) / block_size; i++) {
+      emscripten::val slice = model_builder.GetBuilder().call<emscripten::val>(
+          "slice",
+          scale,
+          emscripten::val::array(std::vector<int32_t>{i, 0}),
+          emscripten::val::array(std::vector<int32_t>{1, static_cast<int32_t>(scale_shape[1])}));
+      emscripten::val expand = model_builder.GetBuilder().call<emscripten::val>(
+          "expand",
+          slice,
+          emscripten::val::array(std::vector<int32_t>{block_size, static_cast<int32_t>(scale_shape[1])}));
+      concat_scale_inputs.call<void>("push", expand);
+    }
 
-  //   emscripten::val concat_scale_options = emscripten::val::object();
-  //   concat_scale_options.set("label", node.Name() + "_concat_scale");
-  //   scale = model_builder.GetBuilder().call<emscripten::val>("concat", concat_scale_inputs, axis, concat_scale_options);
-
-  //   if (has_zero_point) {
-  //     // Concatenate the zero_point tensor along the axis dimension.
-  //     // If zero_point is not provided, leave WebNN to handle the broadcast.
-  //     emscripten::val concat_zero_point_options = emscripten::val::object();
-  //     concat_zero_point_options.set("label", node.Name() + "_concat_zero_point");
-  //     zero_point = model_builder.GetBuilder().call<emscripten::val>(
-  //         "concat", concat_zero_point_inputs, axis, concat_zero_point_options);
-  //   }
-  // }
+    emscripten::val concat_scale_options = emscripten::val::object();
+    concat_scale_options.set("label", node.Name() + "_concat_scale");
+    scale = model_builder.GetBuilder().call<emscripten::val>("concat", concat_scale_inputs, axis, concat_scale_options);
+  }
 
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
