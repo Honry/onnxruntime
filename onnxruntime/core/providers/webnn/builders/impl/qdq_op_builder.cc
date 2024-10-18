@@ -39,7 +39,7 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   ORT_RETURN_IF_NOT(GetShape(*input_defs[1], scale_shape, logger), "Cannot get scale shape");
   int32_t input_type = 0;
   int32_t output_type = 0;
-  int32_t zero_point_type = 0;
+  // int32_t zero_point_type = 0;
   bool has_zero_point = false;
   ORT_RETURN_IF_NOT(GetType(*input_defs[0], input_type, logger), "Cannot get input data type");
   ORT_RETURN_IF_NOT(GetType(*output_defs[0], output_type, logger), "Cannot get output data type");
@@ -47,20 +47,36 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   emscripten::val scale = model_builder.GetOperand(input_defs[1]->Name());
 
   emscripten::val zero_point = emscripten::val::null();
+  // emscripten::val console = emscripten::val::global("console");
   if (input_defs.size() == 3 && input_defs[2]->Exists()) {
     zero_point = model_builder.GetOperand(node.InputDefs()[2]->Name());
     has_zero_point = true;
   } else {
+    // console.call<void>("log", emscripten::val("QDQOpBuilder::AddToModelBuilderImpl, zero_point is not provided"));
     // DequantizeLinear: x_zero_point's data type equals to input data type
     // QuantizeLinear: x_zero_point's data type equals to output data type
-    zero_point_type = op_type == "DequantizeLinear" ? input_type : output_type;
-    zero_point = model_builder.GetZeroConstant(zero_point_type);
+    emscripten::val desc = emscripten::val::object();
+    emscripten::val dims = emscripten::val::array(GetVecUint32FromVecInt64(scale_shape));
+    desc.set("dimensions", dims);
+    desc.set("shape", dims);
+    desc.set("dataType", emscripten::val("int4"));
+    // console.call<void>("log", desc);
+    auto num_elements = static_cast<int32_t>(Product(scale_shape));
+    // console.call<void>("log", emscripten::val("QDQOpBuilder::AddToModelBuilderImpl, zero_point is not provided 11"));
+    num_elements = static_cast<int32_t>(std::ceil(static_cast<double>(num_elements) / 2.0));
+    // console.call<void>("log", emscripten::val("QDQOpBuilder::AddToModelBuilderImpl, zero_point is not provided 22"));
+    // console.call<void>("log", num_elements);
+    emscripten::val zero_buffer = emscripten::val::global("Uint8Array").new_(num_elements);
+    // console.call<void>("log", zero_buffer);
+
+    zero_point = model_builder.GetBuilder().call<emscripten::val>("constant", desc, zero_buffer);
+    // console.call<void>("log", zero_point);
   }
 
   emscripten::val output;
   NodeAttrHelper helper(node);
   int32_t axis = helper.Get("axis", 1);
-  int32_t block_size = helper.Get("block_size", 0);
+  // int32_t block_size = helper.Get("block_size", 0);
   // axis is valid for input shape greater than 1D.
   if (input_shape.size() > 1) {
     axis = static_cast<int32_t>(HandleNegativeAxis(axis, input_shape.size()));
@@ -90,30 +106,31 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   }
 
   // If block_size is specified, we need to expand the non-scalar scale and zero_point tensors.
-  if (block_size > 1 && !scale_shape.empty()) {
+  //if (block_size > 1 && !scale_shape.empty()) {
     //scale0 = slice(scale, [ 0, 0 ], [ 1, 9216 ]);
     //scaleForBlock0 = expand(scale0, [ 128, 9126 ]);
     //... scale23 = slice(scale, [ 22, 0 ], [ 1, 9126 ]);
     //scaleForBlock23 = expand(scale23, [ 128, 9126 ]);
     //expandedScale = concat(scaleForBlock0, ..., scaleForBlock23);
-    emscripten::val concat_scale_inputs = emscripten::val::array();
-    for (int i = 0; i < static_cast<int32_t>(input_shape[axis]) / block_size; i++) {
-      emscripten::val slice = model_builder.GetBuilder().call<emscripten::val>(
-          "slice",
-          scale,
-          emscripten::val::array(std::vector<int32_t>{i, 0}),
-          emscripten::val::array(std::vector<int32_t>{1, static_cast<int32_t>(scale_shape[1])}));
-      emscripten::val expand = model_builder.GetBuilder().call<emscripten::val>(
-          "expand",
-          slice,
-          emscripten::val::array(std::vector<int32_t>{block_size, static_cast<int32_t>(scale_shape[1])}));
-      concat_scale_inputs.call<void>("push", expand);
-    }
 
-    emscripten::val concat_scale_options = emscripten::val::object();
-    concat_scale_options.set("label", node.Name() + "_concat_scale");
-    scale = model_builder.GetBuilder().call<emscripten::val>("concat", concat_scale_inputs, axis, concat_scale_options);
-  }
+  //  emscripten::val concat_scale_inputs = emscripten::val::array();
+  //  for (int i = 0; i < static_cast<int32_t>(input_shape[axis]) / block_size; i++) {
+  //    emscripten::val slice = model_builder.GetBuilder().call<emscripten::val>(
+  //        "slice",
+  //        scale,
+  //        emscripten::val::array(std::vector<int32_t>{i, 0}),
+  //        emscripten::val::array(std::vector<int32_t>{1, static_cast<int32_t>(scale_shape[1])}));
+  //    emscripten::val expand = model_builder.GetBuilder().call<emscripten::val>(
+  //        "expand",
+  //        slice,
+  //        emscripten::val::array(std::vector<int32_t>{block_size, static_cast<int32_t>(scale_shape[1])}));
+  //    concat_scale_inputs.call<void>("push", expand);
+    //}
+
+  //  emscripten::val concat_scale_options = emscripten::val::object();
+  //  concat_scale_options.set("label", node.Name() + "_concat_scale");
+  //  scale = model_builder.GetBuilder().call<emscripten::val>("concat", concat_scale_inputs, axis, concat_scale_options);
+ // }
 
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
