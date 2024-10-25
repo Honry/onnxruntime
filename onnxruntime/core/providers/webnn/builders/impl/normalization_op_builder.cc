@@ -139,6 +139,80 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
                                                                 emscripten::val::array(output_shape),
                                                                 reshape_output_options);
     }
+  } else if (op_type == "SimplifiedLayerNormalization") {
+    // if (input.dataType() == "float16") {
+    //   input = builder.cast(input, 'float32');
+    //   scale = builder.cast(scale, 'float32');
+    // }
+    // const reduceOptions = {axes : [ 1, 2, 3 ], keepDimensions : true};
+    // const pow = builder.pow(input, builder.constant(input.dataType(), 2));
+    // const reduceMean = builder.reduceMean(pow, reduceOptions);
+    // const add = builder.add(reduceMean, builder.constant(input.dataType(), options.epsilon));
+    // const sqrt = builder.sqrt(add);
+    // const div = builder.div(builder.constant(input.dataType(), 1), sqrt);
+    // const mul = builder.mul(div, input);
+    // output = builder.mul(mul, scale);
+    // if (input.dataType() == "float16") {
+    //   output = builder.cast(output, 'float16');
+    // }
+    // emscripten::val console = emscripten::val::global("console");
+    int32_t input_type;
+    ORT_RETURN_IF_NOT(GetType(*input_defs[0], input_type, logger), "cannot get input type");
+    if (input_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
+      input = model_builder.GetBuilder().call<emscripten::val>("cast", input, emscripten::val("float32"));
+      scale = model_builder.GetBuilder().call<emscripten::val>("cast", scale, emscripten::val("float32"));
+    }
+    int64_t axis = helper.Get("axis", -1);
+    axis = HandleNegativeAxis(axis, rank);
+    std::vector<uint32_t> axes(rank - SafeInt<uint32_t>(axis));
+    std::iota(axes.begin(), axes.end(), axis);
+    auto epsilon = helper.Get("epsilon", 1e-05f);
+
+    // Pow
+    emscripten::val pow_2_constant_desc = emscripten::val::object();
+    pow_2_constant_desc.set("dataType", "float32");
+    pow_2_constant_desc.set("shape", emscripten::val::array());
+    emscripten::val pow_2_buffer = emscripten::val::global("Float32Array").new_(1);
+    pow_2_buffer.set(0, 2);
+    // console.call<void>("log", pow_2_buffer);
+    emscripten::val pow = model_builder.GetBuilder().call<emscripten::val>("pow", input,
+        model_builder.GetBuilder().call<emscripten::val>("constant", pow_2_constant_desc, pow_2_buffer));
+
+    // ReduceMean
+    emscripten::val reduce_options = emscripten::val::object();
+    reduce_options.set("axes", emscripten::val::array(axes));
+    reduce_options.set("keepDimensions", true);
+    emscripten::val reduce_mean = model_builder.GetBuilder().call<emscripten::val>("reduceMean", pow, reduce_options);
+
+    // Add
+    emscripten::val add_constant_desc = emscripten::val::object();
+    add_constant_desc.set("dataType", "float32");
+    add_constant_desc.set("shape", emscripten::val::array());
+    emscripten::val add_buffer = emscripten::val::global("Float32Array").new_(1);
+    add_buffer.set(0, epsilon);
+    emscripten::val add = model_builder.GetBuilder().call<emscripten::val>("add", reduce_mean,
+        model_builder.GetBuilder().call<emscripten::val>("constant", add_constant_desc, add_buffer));
+
+    // Sqrt
+    emscripten::val sqrt = model_builder.GetBuilder().call<emscripten::val>("sqrt", add);
+
+    // Div
+    emscripten::val div_constant_desc = emscripten::val::object();
+    div_constant_desc.set("dataType", "float32");
+    div_constant_desc.set("shape", emscripten::val::array());
+    emscripten::val div_buffer = emscripten::val::global("Float32Array").new_(1);
+    div_buffer.set(0, 1);
+    emscripten::val div = model_builder.GetBuilder().call<emscripten::val>("div",
+        model_builder.GetBuilder().call<emscripten::val>("constant", div_constant_desc, div_buffer),
+        sqrt);
+
+    // Mul
+    emscripten::val mul1 = model_builder.GetBuilder().call<emscripten::val>("mul", input, div);
+    output = model_builder.GetBuilder().call<emscripten::val>("mul", scale, mul1);
+
+    if (input_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
+      output = model_builder.GetBuilder().call<emscripten::val>("cast", output, emscripten::val("float16"));
+    }
   } else {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported normalization op: ", op_type);
   }
@@ -229,6 +303,7 @@ void CreateNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrat
           "BatchNormalization",
           "InstanceNormalization",
           "LayerNormalization",
+          "SimplifiedLayerNormalization",
       };
 
   op_registrations.builders.push_back(std::make_unique<NormalizationOpBuilder>());
