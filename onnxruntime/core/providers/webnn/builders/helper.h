@@ -167,6 +167,7 @@ static const InlinedHashMap<std::string, std::string> op_map = {
     {"ConvInteger", "conv2dInteger"},
     {"ConvTranspose", "convTranspose2d"},
     {"Cos", "cos"},
+    {"CumSum", "cumulativeSum"},
     {"Div", "div"},
     {"DequantizeLinear", "dequantizeLinear"},
     {"Dropout", "identity"},
