@@ -111,11 +111,7 @@ std::vector<std::vector<NodeIndex>> GetSupportedNodes(const GraphViewer& graph_v
   for (size_t i = 0; i < node_indices.size(); i++) {
     auto node_idx = node_indices[i];
     const auto* node(graph_viewer.GetNode(node_idx));
-    bool supported = false;
-    // Firstly check if platform supports the WebNN op.
-    if (CheckSingleOp(node->OpType(), wnn_builder, device_type)) {
-      supported = IsNodeSupported(*node, graph_viewer, device_type, wnn_limits, logger);
-    }
+    const bool supported = IsNodeSupported(*node, graph_viewer, device_type, wnn_limits, logger);
 
     LOGS(logger, VERBOSE) << "Operator type: [" << node->OpType()
                           << "] index: [" << node_idx
@@ -154,7 +150,7 @@ bool AreInputDataTypesSame(const std::string& op_type,
   return true;
 }
 
-bool IsSupportedDataType(const int32_t onnx_data_type, const emscripten::val& webnn_supported_data_types) {
+bool IsSupportedDataType(const int32_t& onnx_data_type, const emscripten::val& webnn_supported_data_types) {
   auto it = onnx_to_webnn_data_type_map.find(static_cast<ONNX_NAMESPACE::TensorProto_DataType>(onnx_data_type));
   if (it == onnx_to_webnn_data_type_map.end())
     return false;
@@ -169,7 +165,7 @@ bool IsSupportedDataType(const int32_t onnx_data_type, const emscripten::val& we
 
 // Check if the input or output data type of ONNX node is supported by the WebNN operator.
 bool IsDataTypeSupportedByOp(const std::string& onnx_op_type,
-                             const int32_t onnx_data_type,
+                             const int32_t& onnx_data_type,
                              const emscripten::val& wnn_limits,
                              const std::string& webnn_input_output_name,
                              const std::string& onnx_input_output_name,
@@ -184,7 +180,7 @@ bool IsDataTypeSupportedByOp(const std::string& onnx_op_type,
 
 bool IsDataTypeSupportedByWebNNOp(const std::string& onnx_op_type,
                                   const std::string& webnn_op_type,
-                                  const int32_t onnx_data_type,
+                                  const int32_t& onnx_data_type,
                                   const emscripten::val& wnn_limits,
                                   const std::string& webnn_input_output_name,
                                   const std::string& onnx_input_output_name,
@@ -193,6 +189,7 @@ bool IsDataTypeSupportedByWebNNOp(const std::string& onnx_op_type,
     LOGS(logger, VERBOSE) << "[" << onnx_op_type << "] WebNN op [" << webnn_op_type << "] is not supported for now";
     return false;
   }
+
   if (wnn_limits[webnn_op_type][webnn_input_output_name].isUndefined()) {
     LOGS(logger, VERBOSE) << "[" << onnx_op_type << "] WebNN op [" << webnn_op_type << "] doesn't have parameter ["
                           << webnn_input_output_name << "]";
