@@ -299,7 +299,7 @@ const std::map<std::string_view, std::string_view> op_map = {
     {"Tanh", "tanh"},
     {"Tile", "tile"},
     {"Transpose", "transpose"},
-    {"Trilu", "triangular"},
+    {"Trilu", "triangular1"},
     {"Unsqueeze", "reshape"},
     {"Where", "where"},
     {"Xor", "logicalXor"},
