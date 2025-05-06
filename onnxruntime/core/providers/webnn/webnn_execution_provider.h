@@ -19,7 +19,7 @@ class Model;
 
 class WebNNExecutionProvider : public IExecutionProvider {
  public:
-  explicit WebNNExecutionProvider(const std::string& webnn_device_flags);
+  explicit WebNNExecutionProvider(const std::string& webnn_device_flags, const std::string& webnn_cached_graph_key);
   virtual ~WebNNExecutionProvider();
 
   std::vector<std::unique_ptr<ComputeCapability>>
@@ -51,6 +51,8 @@ class WebNNExecutionProvider : public IExecutionProvider {
 
   DataLayout preferred_layout_;
   webnn::WebnnDeviceType wnn_device_type_;
+  std::string wnn_cached_graph_key_;
+  mutable bool is_graph_partitioned_ = false;
   InlinedHashMap<std::string, std::unique_ptr<onnxruntime::webnn::Model>> models_;
   ModelMetadefIdGenerator metadef_id_generator_;
 };

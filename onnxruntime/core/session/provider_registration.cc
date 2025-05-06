@@ -236,6 +236,8 @@ ORT_API_STATUS_IMPL(OrtApis::SessionOptionsAppendExecutionProvider,
 #if defined(USE_WEBNN)
       std::string deviceType = options->value.config_options.GetConfigOrDefault("deviceType", "cpu");
       provider_options["deviceType"] = deviceType;
+      std::string cachedGraphKey = options->value.config_options.GetConfigOrDefault("cachedGraphKey", "");
+      provider_options["cachedGraphKey"] = cachedGraphKey;
       options->provider_factories.push_back(WebNNProviderFactoryCreator::Create(provider_options));
 #else
       status = create_not_supported_status();

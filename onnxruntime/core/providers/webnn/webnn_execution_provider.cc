@@ -24,7 +24,8 @@ namespace onnxruntime {
 
 constexpr const char* WEBNN = "WEBNN";
 
-WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_flags)
+WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_flags,
+                                               const std::string& webnn_cached_graph_key)
     : IExecutionProvider{
           onnxruntime::kWebNNExecutionProvider,
           // If MLTensor is supported, we force all the tensors to be allocated as MLTensor.
@@ -32,7 +33,8 @@ WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_f
               webnn::IsMLTensorSupported() ? OrtDevice::GPU : OrtDevice::CPU,
               OrtDevice::MemType::DEFAULT,
               0)},
-      wnn_device_type_(webnn::DeviceTypeFromString(webnn_device_flags)) {
+      wnn_device_type_(webnn::DeviceTypeFromString(webnn_device_flags)),
+      wnn_cached_graph_key_(webnn_cached_graph_key) {
   wnn_context_ = emscripten::val::module_property("currentContext");
   if (!wnn_context_.as<bool>()) {
     ORT_THROW("Failed to create WebNN context.");
@@ -163,6 +165,7 @@ WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_view
   // If the graph is partitioned in multiple subgraphs, and this may impact performance,
   // we want to give users a summary message at warning level.
   if (num_of_partitions > 1) {
+    is_graph_partitioned_ = true;
     LOGS(logger, WARNING) << summary_msg;
   } else {
     LOGS(logger, INFO) << summary_msg;
@@ -178,7 +181,8 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
     const onnxruntime::GraphViewer& graph_viewer(fused_node_and_graph.filtered_graph);
 
     webnn::ModelBuilder builder(graph_viewer, *GetLogger(), wnn_context_,
-                                preferred_layout_, wnn_device_type_, wnn_limits_);
+                                preferred_layout_, wnn_device_type_, wnn_limits_,
+                                is_graph_partitioned_, wnn_cached_graph_key_);
     std::unique_ptr<webnn::Model> model;
     ORT_RETURN_IF_ERROR(builder.Compile(model));
 

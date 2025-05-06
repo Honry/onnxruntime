@@ -10,22 +10,24 @@ using namespace onnxruntime;
 
 namespace onnxruntime {
 struct WebNNProviderFactory : IExecutionProviderFactory {
-  explicit WebNNProviderFactory(const std::string& webnn_device_flags)
-      : webnn_device_flags_(webnn_device_flags) {}
+  explicit WebNNProviderFactory(const std::string& webnn_device_flags, const std::string& webnn_cached_graph_key)
+      : webnn_device_flags_(webnn_device_flags), webnn_cached_graph_key_(webnn_cached_graph_key) {}
   ~WebNNProviderFactory() override {}
 
   std::unique_ptr<IExecutionProvider> CreateProvider() override;
 
   std::string webnn_device_flags_;
+  std::string webnn_cached_graph_key_;
 };
 
 std::unique_ptr<IExecutionProvider> WebNNProviderFactory::CreateProvider() {
-  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_);
+  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, webnn_cached_graph_key_);
 }
 
 std::shared_ptr<IExecutionProviderFactory> WebNNProviderFactoryCreator::Create(
     const ProviderOptions& provider_options) {
-  return std::make_shared<onnxruntime::WebNNProviderFactory>(provider_options.at("deviceType"));
+  return std::make_shared<onnxruntime::WebNNProviderFactory>(provider_options.at("deviceType"),
+                                                             provider_options.at("cachedGraphKey"));
 }
 
 }  // namespace onnxruntime

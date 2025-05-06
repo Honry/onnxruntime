@@ -85,8 +85,12 @@ const setExecutionProviders = async (
           const webnnOptions = ep as InferenceSession.WebNNExecutionProviderOption;
           // const context = (webnnOptions as InferenceSession.WebNNOptionsWithMLContext)?.context;
           const deviceType = (webnnOptions as InferenceSession.WebNNContextOptions)?.deviceType;
+          const cachedGraphKey = (webnnOptions as InferenceSession.WebNNOptionsWithCachedGraph)?.cachedGraphKey;
           if (deviceType) {
             appendSessionConfig(sessionOptionsHandle, 'deviceType', deviceType, allocs);
+          }
+          if (cachedGraphKey !== '') {
+            appendSessionConfig(sessionOptionsHandle, 'cachedGraphKey', cachedGraphKey, allocs);
           }
         }
         break;

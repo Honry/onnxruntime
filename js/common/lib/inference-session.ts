@@ -261,8 +261,14 @@ export declare namespace InferenceSession {
    */
   export interface WebNNContextOptions {
     deviceType?: 'cpu' | 'gpu' | 'npu';
-    numThreads?: number;
     powerPreference?: 'default' | 'low-power' | 'high-performance';
+  }
+
+  /**
+   * Represents a set of options for WebNN execution provider with cached graph.
+   */
+  export interface WebNNOptionsWithCachedGraph extends WebNNExecutionProviderName, WebNNContextOptions {
+    cachedGraphKey: '';
   }
 
   /**

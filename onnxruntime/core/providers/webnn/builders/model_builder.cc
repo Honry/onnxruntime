@@ -20,13 +20,27 @@ namespace webnn {
 
 ModelBuilder::ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger,
                            const emscripten::val& context, const DataLayout preferred_layout,
-                           const WebnnDeviceType wnn_device_type, const emscripten::val& wnn_limits)
+                           const WebnnDeviceType wnn_device_type, const emscripten::val& wnn_limits,
+                           const bool is_graph_partitioned, const std::string& wnn_cached_graph_key)
     : graph_viewer_(graph_viewer),
       logger_(logger),
       wnn_context_(context),
       preferred_layout_(preferred_layout),
       wnn_device_type_(wnn_device_type),
-      wnn_limits_(wnn_limits) {
+      wnn_limits_(wnn_limits),
+      wnn_cached_graph_key_(wnn_cached_graph_key) {
+  // If the graph is not partitioned, try to use WebNN cached graph
+  if (!is_graph_partitioned) {
+    emscripten::val graph_list = wnn_context_.call<emscripten::val>("listGraphs").await();
+    emscripten::val has_cached_graph = graph_list.call<emscripten::val>("includes", emscripten::val(wnn_cached_graph_key));
+    if (has_cached_graph.as<bool>()) {
+      // consider if we should release the cached graph
+      cached_graph_ = wnn_context_.call<emscripten::val>("loadGraph", emscripten::val(wnn_cached_graph_key)).await();
+    } else {
+      should_save_graph_ = true;
+    }
+  }
+
   // Create WebNN MLGraphBuilder for each ModelBuilder, because MLGraphBuilder.build()
   // is only allowed to be called once.
   wnn_builder_ = emscripten::val::global("MLGraphBuilder").new_(context);
@@ -324,15 +338,17 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
       desc.set("dataType", emscripten::val("int32"));
     }
 
-    emscripten::val wnn_input = wnn_builder_.call<emscripten::val>("input", name, desc);
+    if (cached_graph_.isUndefined()) {
+      emscripten::val wnn_input = wnn_builder_.call<emscripten::val>("input", name, desc);
 
-    if (cast_required) {
-      // Insert cast to convert the input data type to the original data type.
-      emscripten::val cast_options = emscripten::val::object();
-      cast_options.set("label", name + "_cast_input_to_original_data_type");
-      wnn_input = wnn_builder_.call<emscripten::val>("cast", wnn_input, wnn_data_type, cast_options);
+      if (cast_required) {
+        // Insert cast to convert the input data type to the original data type.
+        emscripten::val cast_options = emscripten::val::object();
+        cast_options.set("label", name + "_cast_input_to_original_data_type");
+        wnn_input = wnn_builder_.call<emscripten::val>("cast", wnn_input, wnn_data_type, cast_options);
+      }
+      wnn_operands_.insert(std::make_pair(name, wnn_input));
     }
-    wnn_operands_.insert(std::make_pair(name, wnn_input));
     emscripten::val::module_property("webnnRegisterGraphInput")(name);
     input_names_.push_back(name);
   } else {
@@ -444,26 +460,44 @@ Status ModelBuilder::RegisterModelOutputs() {
 }
 
 Status ModelBuilder::Compile(std::unique_ptr<Model>& model) {
-  ORT_RETURN_IF_ERROR(Initialize());
-  emscripten::val named_operands = emscripten::val::object();
-  for (auto& name : output_names_) {
-    emscripten::val wnn_output = wnn_operands_.at(name);
+  emscripten::val wnn_graph = emscripten::val::undefined();
+  emscripten::val console = emscripten::val::global("console");
+  console.call<void>("time", emscripten::val("WebNN Compile Time"));
+  if (cached_graph_.isUndefined()) {
+    ORT_RETURN_IF_ERROR(Initialize());
+    emscripten::val named_operands = emscripten::val::object();
+    for (auto& name : output_names_) {
+      emscripten::val wnn_output = wnn_operands_.at(name);
 
-    // If the output name is in cast_required_output_names_, cast it to int32.
-    if (std::find(cast_required_output_names_.cbegin(),
-                  cast_required_output_names_.cend(),
-                  name) != cast_required_output_names_.cend()) {
-      emscripten::val cast_options = emscripten::val::object();
-      cast_options.set("label", name + "_cast_output_to_int32");
-      wnn_output = wnn_builder_.call<emscripten::val>("cast", wnn_output, emscripten::val("int32"), cast_options);
+      // If the output name is in cast_required_output_names_, cast it to int32.
+      if (std::find(cast_required_output_names_.cbegin(),
+                    cast_required_output_names_.cend(),
+                    name) != cast_required_output_names_.cend()) {
+        emscripten::val cast_options = emscripten::val::object();
+        cast_options.set("label", name + "_cast_output_to_int32");
+        wnn_output = wnn_builder_.call<emscripten::val>("cast", wnn_output, emscripten::val("int32"), cast_options);
+      }
+      named_operands.set(name, wnn_output);
     }
-    named_operands.set(name, wnn_output);
-  }
 
-  emscripten::val wnn_graph = wnn_builder_.call<emscripten::val>("build", named_operands).await();
-  if (!wnn_graph.as<bool>()) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to build WebNN graph.");
+    wnn_graph = wnn_builder_.call<emscripten::val>("build", named_operands).await();
+
+    if (!wnn_graph.as<bool>()) {
+      return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Failed to build WebNN graph.");
+    }
+
+    if (should_save_graph_) {
+      wnn_context_.call<emscripten::val>("saveGraph", emscripten::val(wnn_cached_graph_key_), wnn_graph).await();
+    }
+
+  } else {
+    console.call<void>("log", emscripten::val("Using cached WebNN graph: "), emscripten::val(wnn_cached_graph_key_));
+    ORT_RETURN_IF_ERROR(RegisterModelInputs());
+    ORT_RETURN_IF_ERROR(RegisterModelOutputs());
+    // If the graph is cached, use it directly.
+    wnn_graph = cached_graph_;
   }
+  console.call<void>("timeEnd", emscripten::val("WebNN Compile Time"));
   // Explicitly release the WebNN builder to free memory.
   wnn_builder_ = emscripten::val::undefined();
   model.reset(new Model(std::move(wnn_context_), std::move(wnn_graph), logger_, IsMLTensorSupported()));

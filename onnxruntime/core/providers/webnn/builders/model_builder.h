@@ -24,7 +24,7 @@ class ModelBuilder {
  public:
   ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger, const emscripten::val& context,
                const DataLayout preferred_layout, const WebnnDeviceType wnn_device_type,
-               const emscripten::val& wnn_limits);
+               const emscripten::val& wnn_limits, const bool is_graph_partitioned, const std::string& wnn_cached_graph_key);
   ~ModelBuilder() = default;
 
   Status Compile(std::unique_ptr<Model>& model) ORT_MUST_USE_RESULT;
@@ -82,10 +82,13 @@ class ModelBuilder {
 
   emscripten::val wnn_context_ = emscripten::val::undefined();
   emscripten::val wnn_builder_ = emscripten::val::undefined();
+  emscripten::val cached_graph_ = emscripten::val::undefined();
   bool is_int64_supported_ = false;
   DataLayout preferred_layout_;
   WebnnDeviceType wnn_device_type_;
   emscripten::val wnn_limits_ = emscripten::val::undefined();
+  std::string wnn_cached_graph_key_;
+  bool should_save_graph_ = false;
   InlinedHashMap<std::string, emscripten::val> wnn_operands_;
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;
