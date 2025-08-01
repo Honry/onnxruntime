@@ -147,6 +147,8 @@ void WebGpuContext::Initialize(const WebGpuBufferCacheConfig& buffer_cache_confi
     Device().GetFeatures(&supported_features);
     for (size_t i = 0; i < supported_features.featureCount; i++) {
       device_features_.insert(supported_features.features[i]);
+      LOGS_DEFAULT(INFO) << "device_features_ [ " << i
+                         << "]: " << static_cast<int>(supported_features.features[i]);
     }
     // cache adapter info
 #if !defined(__wasm__)
@@ -500,7 +502,9 @@ std::vector<wgpu::FeatureName> WebGpuContext::GetAvailableRequiredFeatures(const
 #endif
   };
   for (auto feature : features) {
+    LOGS_DEFAULT(INFO) << "features: " << static_cast<int>(feature);
     if (adapter.HasFeature(feature)) {
+      LOGS_DEFAULT(INFO) << "adapter has feature: " << static_cast<int>(feature);
       required_features.push_back(feature);
     }
   }
