@@ -65,12 +65,14 @@ inline Status ApplyRotaryEmbedding(
     bool position_ids_is_offset,
     emscripten::val& output) {
   emscripten::val wnn_builder = model_builder.GetBuilder();
+  ORT_RETURN_IF_NOT(head_size >= rotary_embedding_dim,
+                    "Rotary embedding dimension must be less than or equal to head_size");
   const uint32_t half_rotary_embedding_dim = rotary_embedding_dim / 2;
 
   // Split the input to perform the rotary embedding only on a subregion of the tensor if needed.
   emscripten::val partial_input0 = input;
   emscripten::val partial_input1 = emscripten::val::undefined();
-  if (head_size != rotary_embedding_dim) {
+  if (head_size > rotary_embedding_dim) {
     const std::vector<uint32_t> splits{rotary_embedding_dim, head_size - rotary_embedding_dim};
     emscripten::val split_input_options = emscripten::val::object();
     split_input_options.set("label", node_name + "_rotary_split_input");
