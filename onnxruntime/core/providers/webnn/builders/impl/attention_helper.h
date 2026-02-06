@@ -50,10 +50,10 @@ namespace webnn {
 inline Status ApplyRotaryEmbedding(
     ModelBuilder& model_builder,
     const std::string& node_name,
-    emscripten::val input,                    // Shape: [batch_size, sequence_length, num_heads, head_size]
-    emscripten::val cos_cache,                // Shape: [max_sequence_length, head_size / 2]
-    emscripten::val sin_cache,                // Shape: [max_sequence_length, head_size / 2]
-    emscripten::val position_ids,             // Shape: [batch_size, sequence_length] or [1]
+    emscripten::val input,         // Shape: [batch_size, sequence_length, num_heads, head_size]
+    emscripten::val cos_cache,     // Shape: [max_sequence_length, head_size / 2]
+    emscripten::val sin_cache,     // Shape: [max_sequence_length, head_size / 2]
+    emscripten::val position_ids,  // Shape: [batch_size, sequence_length] or [1]
     int32_t input_data_type,
     uint32_t batch_size,
     uint32_t sequence_length,
