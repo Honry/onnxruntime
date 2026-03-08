@@ -137,7 +137,7 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
 
   const float scale_value = helper.Get("scale", 1 / sqrt(static_cast<float>(head_size)));
 
-  const std::vector<uint32_t> reshape_output_shape = {batch_size, sequence_length, hidden_size};
+  emscripten::val reshape_output_shape = emscripten::val::array();
   const std::vector<uint32_t> q_reshape_tensor_shape = {batch_size, sequence_length, num_heads, head_size};
   const std::vector<uint32_t> reshape_tensor_shape = {batch_size, kv_sequence_length, num_heads, head_size};
 
@@ -201,6 +201,10 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
 
   emscripten::val scale_constant =
       model_builder.CreateOrGetConstant<float>(input_query_type, scale_value, {1});
+
+  reshape_output_shape.call<void>("push", new_query["shape"][0]);
+  reshape_output_shape.call<void>("push", new_query["shape"][2]);
+  reshape_output_shape.call<void>("push", hidden_size);
 
   emscripten::val output = ScaledDotProductAttention(model_builder, node, logger, new_query, new_key, present_value,
                                                      scale_constant, attention_bias, reshape_output_shape);
