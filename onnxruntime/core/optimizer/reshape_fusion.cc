@@ -13,7 +13,7 @@ namespace onnxruntime {
 bool GetAxesFromUnsqueezeNode(const Graph& graph, const Node& unsqueeze, InlinedVector<int64_t>& axes) {
   if (graph_utils::MatchesOpSinceVersion(unsqueeze, {1, 11})) {
     return graph_utils::GetRepeatedNodeAttributeValues(unsqueeze, "axes", axes);
-  } else if (graph_utils::MatchesOpSinceVersion(unsqueeze, {13})) {
+  } else if (graph_utils::MatchesOpSinceVersion(unsqueeze, {13, 21, 23, 24, 25})) {
     const NodeArg* axes_node_arg = unsqueeze.InputDefs()[1];
     return optimizer_utils::AppendTensorFromInitializer(graph, *axes_node_arg, axes, true);
   }
@@ -212,7 +212,7 @@ bool ReshapeFusion::Match_One_Element_Output_Subgraph_1(Graph& graph, const Node
     const Node& gather = edges[1]->GetNode();
     const Node& shape = edges[2]->GetNode();
 
-    if (graph_utils::MatchesOpSinceVersion(shape, {15})) {
+    if (graph_utils::MatchesOpSinceVersion(shape, {15, 19, 21, 23, 24, 25})) {
       const ONNX_NAMESPACE::AttributeProto* start_attr = graph_utils::GetNodeAttribute(shape, "start");
       const ONNX_NAMESPACE::AttributeProto* end_attr = graph_utils::GetNodeAttribute(shape, "end");
       if (!((!start_attr || static_cast<int>(start_attr->i()) == 0) && (!end_attr))) {
