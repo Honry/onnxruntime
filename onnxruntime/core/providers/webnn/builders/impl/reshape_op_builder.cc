@@ -59,7 +59,7 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     ReshapeHelper helper(TensorShape(input_shape), target_shape);
 
     for (size_t axis = 0; axis < static_cast<size_t>(size); ++axis) {
-      if (raw_target_shape[axis] == 0) {
+      if (target_shape[axis] == 0) {
         // WebNN reshape does not accept literal 0 in new shape.
         // Follow ONNX allowzero=0 semantics by copying from input shape at the same axis.
         new_shape.call<void>("push", input["shape"][axis]);
@@ -72,7 +72,6 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
-
   emscripten::val console = emscripten::val::global("console");
   console.call<void>("log", emscripten::val("[WebNN][ReshapeOpBuilder] node=" + node.Name() + " input.shape="), input["shape"]);
   console.call<void>("log", emscripten::val("[WebNN][ReshapeOpBuilder] node=" + node.Name() + " new_shape="), new_shape);
