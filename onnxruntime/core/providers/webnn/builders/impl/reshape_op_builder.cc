@@ -72,10 +72,6 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
-  emscripten::val console = emscripten::val::global("console");
-  console.call<void>("log", emscripten::val("[WebNN][ReshapeOpBuilder] node=" + node.Name() + " input.shape="), input["shape"]);
-  console.call<void>("log", emscripten::val("[WebNN][ReshapeOpBuilder] node=" + node.Name() + " new_shape="), new_shape);
-
   emscripten::val output = model_builder.GetBuilder().call<emscripten::val>("reshape",
                                                                             input,
                                                                             new_shape,

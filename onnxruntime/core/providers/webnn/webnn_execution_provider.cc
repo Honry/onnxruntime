@@ -25,7 +25,7 @@ namespace onnxruntime {
 constexpr const char* WEBNN = "WEBNN";
 
 WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_flags,
-                         const webnn::FreeDimensionBounds& free_dimension_bounds)
+                                               const webnn::FreeDimensionBounds& free_dimension_bounds)
     : IExecutionProvider{
           onnxruntime::kWebNNExecutionProvider,
           // If MLTensor is supported, we force all the tensors to be allocated as MLTensor.
@@ -34,8 +34,8 @@ WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_f
               OrtDevice::MemType::DEFAULT,
               OrtDevice::VendorIds::NONE,
               0)},
-                  wnn_device_type_(webnn::DeviceTypeFromString(webnn_device_flags)),
-                  free_dimension_bounds_(free_dimension_bounds) {
+      wnn_device_type_(webnn::DeviceTypeFromString(webnn_device_flags)),
+      free_dimension_bounds_(free_dimension_bounds) {
   wnn_context_ = emscripten::val::module_property("currentContext");
   if (!wnn_context_.as<bool>()) {
     ORT_THROW("Failed to create WebNN context.");
@@ -92,6 +92,229 @@ WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_view
 
   // Release wnn_builder
   wnn_builder = emscripten::val::undefined();
+
+  // Iteratively remove boundary nodes from partitions whose inputs have dynamic dimensions
+  // that cannot be represented as valid WebNN descriptors. This includes:
+  // 1. Empty dim_params (e.g. from contrib op shape inference using bare add_dim()) —
+  //    WebNN requires a symbolic name for every dynamic dimension.
+  // 2. Non-empty dim_params missing from the user-provided FreeDimensionBounds —
+  //    WebNN's MLGraphBuilder.input() needs minSize/maxSize for every dynamic dimension.
+  {
+
+    for (const auto& [name, bound] : free_dimension_bounds_) {
+      LOGS(logger, VERBOSE) << "[WebNN] FreeDimensionBounds: '" << name
+                            << "' minSize=" << bound.min_size << " maxSize=" << bound.max_size;
+    }
+
+    // Collect graph output names for partition output recomputation.
+    InlinedHashSet<std::string> graph_output_names;
+    for (const auto* output : graph_viewer.GetOutputs()) {
+      if (output) graph_output_names.insert(output->Name());
+    }
+
+    // Build a graph-wide map: tensor_name -> set of consuming node indices.
+    InlinedHashMap<std::string, InlinedHashSet<NodeIndex>> tensor_consumers;
+    for (const auto& node_idx : graph_viewer.GetNodesInTopologicalOrder()) {
+      const auto* node = graph_viewer.GetNode(node_idx);
+      if (!node) continue;
+      for (const auto* input : node->InputDefs()) {
+        if (input && input->Exists()) {
+          tensor_consumers[input->Name()].insert(node_idx);
+        }
+      }
+    }
+
+    const auto& topo_order = graph_viewer.GetNodesInTopologicalOrder();
+
+    auto it = result.begin();
+    while (it != result.end()) {
+      auto& sub_graph = (*it)->sub_graph;
+      if (!sub_graph || sub_graph->nodes.empty()) {
+        ++it;
+        continue;
+      }
+
+      InlinedHashSet<NodeIndex> partition_nodes(sub_graph->nodes.begin(), sub_graph->nodes.end());
+      const size_t original_size = partition_nodes.size();
+
+      // Track tensors produced within the partition.
+      InlinedHashSet<std::string> produced_by_partition;
+      for (auto idx : partition_nodes) {
+        const auto* node = graph_viewer.GetNode(idx);
+        for (const auto* output : node->OutputDefs()) {
+          if (output && output->Exists()) produced_by_partition.insert(output->Name());
+        }
+      }
+
+      // Iteratively remove nodes that consume boundary inputs with non-empty dim_params
+      // not found in FreeDimensionBounds.
+      bool changed = true;
+      while (changed) {
+        changed = false;
+
+        InlinedHashSet<std::string> problematic_inputs;
+        for (auto idx : partition_nodes) {
+          const auto* node = graph_viewer.GetNode(idx);
+          for (const auto* input : node->InputDefs()) {
+            if (!input || !input->Exists()) continue;
+            const auto& input_name = input->Name();
+            // Skip constant initializers (matches MakeComputeCapability's drop_constant_initializers logic).
+            if (graph_viewer.IsConstantInitializer(input_name, true)) continue;
+            if (produced_by_partition.count(input_name)) continue;
+
+            const auto* shape = input->Shape();
+            if (!shape) continue;
+            for (const auto& dim : shape->dim()) {
+              if (dim.has_dim_value()) continue;
+              const auto& dp = dim.dim_param();
+              if (dp.empty()) {
+                // Empty dim_param: WebNN requires a symbolic name for every dynamic dimension.
+                // Shape inference from contrib ops (e.g. bare add_dim()) can produce these.
+                // We cannot create a valid WebNN descriptor, so the node must fall back.
+                LOGS(logger, VERBOSE) << "[WebNN] Boundary input [" << input_name
+                                      << "] has dynamic dim with empty dim_param.";
+                problematic_inputs.insert(input_name);
+                break;
+              }
+              if (free_dimension_bounds_.find(dp) == free_dimension_bounds_.end()) {
+                // Non-empty dim_param missing from FreeDimensionBounds: WebNN needs
+                // minSize/maxSize for graph inputs but the user hasn't provided bounds.
+                LOGS(logger, VERBOSE) << "[WebNN] Boundary input [" << input_name
+                                      << "] has dim_param '" << dp << "' not in FreeDimensionBounds.";
+                problematic_inputs.insert(input_name);
+                break;
+              }
+            }
+          }
+        }
+
+        if (problematic_inputs.empty()) break;
+
+        // Remove nodes that consume any problematic input.
+        std::vector<NodeIndex> to_remove;
+        InlinedHashMap<NodeIndex, std::string> removal_reasons;
+        for (auto idx : partition_nodes) {
+          const auto* node = graph_viewer.GetNode(idx);
+          for (const auto* input : node->InputDefs()) {
+            if (input && input->Exists() && problematic_inputs.count(input->Name())) {
+              to_remove.push_back(idx);
+              std::ostringstream reason;
+              reason << "input [" << input->Name() << "] has unsupported dynamic dim(s): ";
+              const auto* shape = input->Shape();
+              bool first = true;
+              if (shape) {
+                for (const auto& dim : shape->dim()) {
+                  if (dim.has_dim_value()) continue;
+                  const auto& dp = dim.dim_param();
+                  if (dp.empty()) {
+                    if (!first) reason << ", ";
+                    reason << "<empty dim_param>";
+                    first = false;
+                  } else if (free_dimension_bounds_.find(dp) == free_dimension_bounds_.end()) {
+                    if (!first) reason << ", ";
+                    reason << "'" << dp << "' (missing from FreeDimensionBounds)";
+                    first = false;
+                  }
+                }
+              }
+              removal_reasons[idx] = reason.str();
+              break;
+            }
+          }
+        }
+
+        for (auto idx : to_remove) {
+          const auto* node = graph_viewer.GetNode(idx);
+          LOGS(logger, WARNING) << "Removing node [" << node->Name() << "] type [" << node->OpType()
+                                << "] from WebNN partition: " << removal_reasons[idx]
+                                << ". Node will fall back to CPU EP.";
+          partition_nodes.erase(idx);
+          for (const auto* output : node->OutputDefs()) {
+            if (output && output->Exists()) produced_by_partition.erase(output->Name());
+          }
+          changed = true;
+        }
+      }
+
+      // If partition is now empty, remove it entirely.
+      if (partition_nodes.empty()) {
+        it = result.erase(it);
+        continue;
+      }
+
+      // If partition is unchanged, no rebuild needed.
+      if (partition_nodes.size() == original_size) {
+        ++it;
+        continue;
+      }
+
+      // Rebuild the partition with remaining nodes in topological order.
+      sub_graph->nodes.clear();
+      sub_graph->nodes.reserve(partition_nodes.size());
+      for (auto idx : topo_order) {
+        if (partition_nodes.count(idx)) {
+          sub_graph->nodes.push_back(idx);
+        }
+      }
+
+      // Recompute partition inputs (matching MakeComputeCapability's drop_constant_initializers logic).
+      std::vector<std::string> new_inputs;
+      InlinedHashSet<std::string> seen_inputs;
+      for (auto idx : sub_graph->nodes) {
+        const auto* node = graph_viewer.GetNode(idx);
+        for (const auto* input : node->InputDefs()) {
+          if (!input || !input->Exists()) continue;
+          const auto& name = input->Name();
+          if (produced_by_partition.count(name)) continue;
+          if (graph_viewer.IsConstantInitializer(name, true)) continue;
+          if (seen_inputs.count(name)) continue;
+          seen_inputs.insert(name);
+          new_inputs.push_back(name);
+        }
+      }
+
+      // Recompute partition outputs.
+      std::vector<std::string> new_outputs;
+      InlinedHashSet<std::string> seen_outputs;
+      for (auto idx : sub_graph->nodes) {
+        const auto* node = graph_viewer.GetNode(idx);
+        for (const auto* output : node->OutputDefs()) {
+          if (!output || !output->Exists()) continue;
+          const auto& name = output->Name();
+          if (seen_outputs.count(name)) continue;
+
+          bool is_external = graph_output_names.count(name) > 0;
+          if (!is_external) {
+            auto consumers_it = tensor_consumers.find(name);
+            if (consumers_it != tensor_consumers.end()) {
+              for (auto consumer_idx : consumers_it->second) {
+                if (partition_nodes.find(consumer_idx) == partition_nodes.end()) {
+                  is_external = true;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (is_external) {
+            seen_outputs.insert(name);
+            new_outputs.push_back(name);
+          }
+        }
+      }
+
+      auto* meta_def = sub_graph->GetMutableMetaDef();
+      meta_def->inputs = std::move(new_inputs);
+      meta_def->outputs = std::move(new_outputs);
+      meta_def->constant_initializers.clear();
+
+      LOGS(logger, WARNING) << "[WebNN] Partition modified: " << original_size << " -> " << partition_nodes.size()
+                            << " nodes, " << meta_def->inputs.size() << " inputs, "
+                            << meta_def->outputs.size() << " outputs.";
+
+      ++it;
+    }
+  }
 
   const auto& graph_output_list = graph_viewer.GetOutputs();
   InlinedHashSet<const NodeArg*> graph_outputs(graph_output_list.cbegin(), graph_output_list.cend());
@@ -175,7 +398,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
     const onnxruntime::GraphViewer& graph_viewer(fused_node_and_graph.filtered_graph);
 
     webnn::ModelBuilder builder(graph_viewer, *GetLogger(), wnn_context_, wnn_device_type_, wnn_limits_,
-                  free_dimension_bounds_);
+                                free_dimension_bounds_);
     std::unique_ptr<webnn::Model> model;
     ORT_RETURN_IF_ERROR(builder.Compile(model));
 
