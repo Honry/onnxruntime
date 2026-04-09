@@ -113,7 +113,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Sin | ai.onnx(7+) | sin | |
 | Slice | ai.onnx(7-9, 10, 11-12, 13+) | slice, reverse | Input 'starts', 'ends', 'axes', and 'steps' if present must be a constant |
 | Softmax | ai.onnx(7-10, 11-12, 13+) | softmax | |
-| Split | ai.onnx(7-10, 11-12, 13-17, 18+) | split | Input 'split' if present should be a constant |
+| Split | ai.onnx(7-10, 11-12, 13-17, 18+) | split, dynamicSplit | |
 | Sqrt | ai.onnx(7-12, 13+) | sqrt | |
 | Squeeze | ai.onnx(7-10, 11-12, 13-20, 21+) | reshape | Input 'axes' if present should be a constant |
 | Sub | ai.onnx(7-12, 13, 14+) | sub | |

@@ -27,6 +27,9 @@ class SplitOpBuilder : public BaseOpBuilder {
  private:
   bool IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node& node,
                          const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+  bool HasSupportedInputsImpl(const GraphViewer& graph_viewer, const Node& node,
+                              const emscripten::val& wnn_limits,
+                              const logging::Logger& logger) const override;
   bool HasSupportedOutputsImpl(const Node& node, const emscripten::val& wnn_limits,
                                const logging::Logger& logger) const override;
 };
@@ -34,9 +37,13 @@ class SplitOpBuilder : public BaseOpBuilder {
 // Add operator related.
 
 void SplitOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
-  // Skip split initializer if present.
+  // Skip split initializer if present and is a constant initializer.
+  // When it is an operand, we need it as the splits input for dynamicSplit.
   if (node.InputDefs().size() > 1) {
-    model_builder.AddInitializerToSkip(node.InputDefs()[1]->Name());
+    const auto& split_name = node.InputDefs()[1]->Name();
+    if (model_builder.GetGraphViewer().GetConstantInitializer(split_name)) {
+      model_builder.AddInitializerToSkip(split_name);
+    }
   }
 }
 
@@ -45,7 +52,6 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                              const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
-  emscripten::val output_array;
   std::vector<int64_t> input_shape;
   ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get shape");
   const size_t rank = input_shape.size();
@@ -57,34 +63,45 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   axis = SafeInt<int32_t>(HandleNegativeAxis(axis, rank));
   options.set("axis", axis);
 
-  uint32_t split_count = 0;
-  std::vector<uint32_t> splits = helper.Get("split", std::vector<uint32_t>{});
+  // Check if the split input is an operand (not a constant initializer).
+  const auto& initializers(model_builder.GetInitializerTensors());
+  const std::string split_name = GetTensorName(input_defs, 1);
+  const bool is_operand_split = !split_name.empty() && initializers.count(split_name) == 0;
 
-  // Read either the split count or explicit split lengths from the various attributes over opset versions.
-  if (helper.HasAttr("num_outputs")) {
-    split_count = helper.Get("num_outputs", 0);
-  } else if (GetTensorName(input_defs, 1).size()) {
-    const auto& initializers(model_builder.GetInitializerTensors());
-    const auto& split_tensor = *initializers.at(input_defs[1]->Name());
-    ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(split_tensor, splits, model_builder.GetGraphViewer(), logger),
-                      "Cannot get input for split.");
-  } else if (!helper.HasAttr("split")) {
-    split_count = node.OutputDefs().size();
-  }
-
-  // Check that the splits evenly divide.
-  if (split_count > 0 && splits.empty() && input_shape[axis] % split_count != 0) {
-    // Divide inputs into variable size outputs:
-    splits.insert(splits.end(), split_count - 1, SafeInt<uint32_t>(input_shape[axis]) / split_count);
-    splits.insert(splits.end(), SafeInt<uint32_t>(input_shape[axis]) % split_count);
-  }
-
-  if (splits.empty()) {
-    output_array = model_builder.GetBuilder().call<emscripten::val>(
-        "split", input, split_count, options);
+  emscripten::val output_array = emscripten::val::undefined();
+  if (is_operand_split) {
+    // Operand split path: use dynamicSplit with the splits operand.
+    emscripten::val splits_operand = model_builder.GetOperand(split_name);
+    output_array = model_builder.GetBuilder().call<emscripten::val>("dynamicSplit", input, splits_operand, options);
   } else {
-    output_array = model_builder.GetBuilder().call<emscripten::val>(
-        "split", input, emscripten::val::array(splits), options);
+    // Constant split path: read split count or explicit split lengths.
+    uint32_t split_count = 0;
+    std::vector<uint32_t> splits = helper.Get("split", std::vector<uint32_t>{});
+
+    if (helper.HasAttr("num_outputs")) {
+      split_count = helper.Get("num_outputs", 0);
+    } else if (!split_name.empty()) {
+      const auto& split_tensor = *initializers.at(split_name);
+      ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(split_tensor, splits, model_builder.GetGraphViewer(), logger),
+                        "Cannot get input for split.");
+    } else if (!helper.HasAttr("split")) {
+      split_count = node.OutputDefs().size();
+    }
+
+    // Check that the splits evenly divide.
+    if (split_count > 0 && splits.empty() && input_shape[axis] % split_count != 0) {
+      // Divide inputs into variable size outputs:
+      splits.insert(splits.end(), split_count - 1, SafeInt<uint32_t>(input_shape[axis]) / split_count);
+      splits.insert(splits.end(), SafeInt<uint32_t>(input_shape[axis]) % split_count);
+    }
+
+    if (splits.empty()) {
+      output_array = model_builder.GetBuilder().call<emscripten::val>(
+          "split", input, split_count, options);
+    } else {
+      output_array = model_builder.GetBuilder().call<emscripten::val>(
+          "split", input, emscripten::val::array(splits), options);
+    }
   }
 
   for (size_t i = 0, count = output_array["length"].as<size_t>(); i < count; i++) {
@@ -116,19 +133,19 @@ bool SplitOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
   // Inputs contain optional 'split' input.
   if (!split_name.empty()) {
     const auto* split_init = graph_viewer.GetConstantInitializer(split_name);
-    if (!split_init) {
-      LOGS(logger, VERBOSE) << "The split must be a constant initializer.";
-      return false;
+    if (split_init) {
+      // When split is a constant initializer, validate its contents.
+      const auto& split_tensor = *split_init;
+      if (split_tensor.data_type() != ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
+        LOGS(logger, VERBOSE) << "The type of tensor's element data must be INT64.";
+        return false;
+      }
+      if (!ReadIntArrayFrom1DTensor(split_tensor, split, graph_viewer, logger)) {
+        return false;
+      }
     }
-    // Values should be >= 0. Sum of the values must be equal to the dim value at 'axis' specified.
-    const auto& split_tensor = *split_init;
-    if (split_tensor.data_type() != ONNXTensorElementDataType::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) {
-      LOGS(logger, VERBOSE) << "The type of tensor's element data must be INT64.";
-      return false;
-    }
-    if (!ReadIntArrayFrom1DTensor(split_tensor, split, graph_viewer, logger)) {
-      return false;
-    }
+    // When split is an operand (not a constant initializer), dynamicSplit handles
+    // the splits at runtime so no static validation is needed.
   } else {
     if (helper.HasAttr("num_outputs")) {
       // Split has 'num_outputs' attribute when opset is 18.
@@ -165,6 +182,51 @@ bool SplitOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
   return true;
 }
 
+bool SplitOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
+                                            const Node& node,
+                                            const emscripten::val& wnn_limits,
+                                            const logging::Logger& logger) const {
+  const auto& input_defs = node.InputDefs();
+  const std::string split_name = GetTensorName(input_defs, 1);
+
+  // When split input is absent or is a constant initializer, use the constant path.
+  // Delegate to the base class which checks input 0 against WebNN split's limits.
+  if (split_name.empty() || graph_viewer.GetConstantInitializer(split_name)) {
+    return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
+  }
+
+  // When split is an operand, check inputs against dynamicSplit's limits.
+  const std::string_view webnn_op_type = "dynamicSplit";
+
+  // Check input 0 (data tensor) against dynamicSplit's "input" parameter.
+  int32_t input_type;
+  if (!GetType(*input_defs[0], input_type, logger)) {
+    return false;
+  }
+  if (!IsDataTypeSupportedByWebNNOp("Split", webnn_op_type, input_type, wnn_limits,
+                                    "input", "input", logger)) {
+    return false;
+  }
+  std::vector<int64_t> input_shape;
+  if (!GetShape(*input_defs[0], input_shape, logger) ||
+      !IsInputRankSupported(wnn_limits, webnn_op_type, "input",
+                            input_shape.size(), node.Name(), logger)) {
+    return false;
+  }
+
+  // Check input 1 (splits operand) against dynamicSplit's "splits" parameter.
+  int32_t splits_type;
+  if (!GetType(*input_defs[1], splits_type, logger)) {
+    return false;
+  }
+  if (!IsDataTypeSupportedByWebNNOp("Split", webnn_op_type, splits_type, wnn_limits,
+                                    "splits", "split", logger)) {
+    return false;
+  }
+
+  return true;
+}
+
 bool SplitOpBuilder::HasSupportedOutputsImpl(const Node& node,
                                              const emscripten::val& wnn_limits,
                                              const logging::Logger& logger) const {
@@ -172,14 +234,14 @@ bool SplitOpBuilder::HasSupportedOutputsImpl(const Node& node,
   const std::string_view op_type = node.OpType();
   int32_t output_type = 0;
 
-  if (GetType(*output_defs[0], output_type, logger)) {
-    // Chromium has changed the output name of split from 'output' to 'outputs',
-    // to avoid breaking the existing API, we need to check both names.
-    const std::string_view wnn_output_name = wnn_limits["split"]["output"].isUndefined() ? "outputs" : "output";
-    return IsDataTypeSupportedByOp(op_type, output_type, wnn_limits, wnn_output_name, "outputs", logger);
+  if (!GetType(*output_defs[0], output_type, logger)) {
+    return false;
   }
 
-  return false;
+  // Chromium has changed the output name of split from 'output' to 'outputs',
+  // to avoid breaking the existing API, we need to check both names.
+  const std::string_view wnn_output_name = wnn_limits["split"]["output"].isUndefined() ? "outputs" : "output";
+  return IsDataTypeSupportedByOp(op_type, output_type, wnn_limits, wnn_output_name, "outputs", logger);
 }
 
 void CreateSplitOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {
