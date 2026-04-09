@@ -39,7 +39,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Equal | ai.onnx(7-10, 11-12, 13-18, 19+) | equal | |
 | Erf | ai.onnx(7-9, 10-12, 13+) | erf | |
 | Exp | ai.onnx(7-12, 13+) | exp | |
-| Expand | ai.onnx(8-12, 13+) | expand | 'shape' input should be a constant |
+| Expand | ai.onnx(8-12, 13+) | expand, dynamicExpand | |
 | Flatten | ai.onnx(7-8, 9-10, 11-12, 13-20, 21+) | reshape | |
 | Floor | ai.onnx(7-12, 13+) | floor | |
 | Gather | ai.onnx(7-10, 11-12, 13+) | gather | |
