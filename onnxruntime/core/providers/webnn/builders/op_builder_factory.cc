@@ -82,6 +82,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateConcatOpBuilder("Concat", op_registrations);
   }
 
+  {  // ConstantOfShape
+    CreateConstantOfShapeOpBuilder("ConstantOfShape", op_registrations);
+  }
+
   {  // CumSum
     CreateCumSumOpBuilder("CumSum", op_registrations);
   }
