@@ -75,6 +75,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Max | ai.onnx(7, 8-11, 12, 13+) | max | |
 | MaxPool | ai.onnx(7, 8-9, 10, 11, 12+) | maxPool2d | Only supports 4-D input, 2-D 'kernel_shape', 'storage_order' != 1, one output |
 | Min | ai.onnx(7, 8-11, 12, 13+) | min | |
+| Mod | ai.onnx(10-12, 13+) | mod | Only supports fmod=0 |
 | Mul | ai.onnx(7-12, 13, 14+) | mul | |
 | MultiHeadAttention | com.microsoft(1+) | add, cast, concat, constant, div, matmul, reshape, softmax, transpose | Does not support inputs bias, key_padding_mask, past_sequence_length, or cache_indirection. Does not support output qk |
 | Neg | ai.onnx(7-12, 13+) | neg | |

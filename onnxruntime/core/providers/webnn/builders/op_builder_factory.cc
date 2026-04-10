@@ -40,6 +40,7 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateBinaryOpBuilder("Div", op_registrations);
     CreateBinaryOpBuilder("Pow", op_registrations);
     CreateBinaryOpBuilder("PRelu", op_registrations);
+    CreateBinaryOpBuilder("Mod", op_registrations);
   }
 
   {  // Ternary

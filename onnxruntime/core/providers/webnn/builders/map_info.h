@@ -143,6 +143,7 @@ const std::unordered_map<std::string_view, WebnnOpInfo> op_inputs_map = {
     {"Expand", {"expand", {{0, "input"}}}},
     {"Max", {"max", {{0, "a"}, {1, "b"}}}},
     {"Min", {"min", {{0, "a"}, {1, "b"}}}},
+    {"Mod", {"mod", {{0, "a"}, {1, "b"}}}},
     {"Mul", {"mul", {{0, "a"}, {1, "b"}}}},
     {"Pow", {"pow", {{0, "a"}, {1, "b"}}}},
     {"Concat", {"concat", {{0, "inputs"}}}},
