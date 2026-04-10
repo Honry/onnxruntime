@@ -80,7 +80,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Neg | ai.onnx(7-12, 13+) | neg | |
 | Not | ai.onnx(7+) | logicalNot | |
 | Or | ai.onnx(7+) | logicalOr | |
-| Pad | ai.onnx(7-10, 11-12, 13-17, 18, 19-20, 21+) | pad | modes == 'wrap' is not supported |
+| Pad | ai.onnx(7-10, 11-12, 13-17, 18, 19-20, 21+) | pad, dynamicPad | Input 'constant_value' and 'axes' if present must be a constant. modes == 'wrap' is not supported |
 | Pow | ai.onnx(7-11, 12, 13-14, 15+) | pow | |
 | PRelu | ai.onnx(7-8, 9-15, 16+) | prelu | |
 | QuantizeLinear | ai.onnx(10-12, 13-18, 19-20, 21-22, 23+) | quantizeLinear, reshape | |
