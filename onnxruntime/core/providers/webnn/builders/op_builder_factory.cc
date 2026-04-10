@@ -47,6 +47,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateTernaryOpBuilder("Where", op_registrations);
   }
 
+  {  // Range
+    CreateRangeOpBuilder("Range", op_registrations);
+  }
+
   {  // Activations
     CreateActivationOpBuilder("Elu", op_registrations);
     CreateActivationOpBuilder("Gelu", op_registrations);

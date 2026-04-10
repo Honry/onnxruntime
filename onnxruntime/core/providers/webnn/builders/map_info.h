@@ -200,6 +200,7 @@ const std::unordered_map<std::string_view, WebnnOpInfo> op_inputs_map = {
     {"GatherElements", {"gatherElements", {{0, "input"}, {1, "indices"}}}},
     {"ScatterND", {"scatterND", {{0, "input"}, {1, "indices"}, {2, "updates"}}}},
     {"Where", {"where", {{0, "condition"}, {1, "trueValue"}, {2, "falseValue"}}}},
+    {"Range", {"range", {{0, "start"}, {1, "limit"}, {2, "delta"}}}},
     {"ConvTranspose", {"convTranspose2d", {{0, "input"}, {1, "filter"}, {2, "bias"}}}},
     {"QuantizeLinear", {"quantizeLinear", {{0, "input"}, {1, "scale"}, {2, "zeroPoint"}}}},
     {"ScatterElements", {"scatterElements", {{0, "input"}, {1, "indices"}, {2, "updates"}}}},

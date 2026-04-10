@@ -50,6 +50,7 @@ void CreateNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrat
 void CreatePadOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreatePoolOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateQDQOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateRangeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateReductionOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateReshapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateResizeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
