@@ -282,21 +282,19 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
         dim_obj.set("name", emscripten::val(dim_name));
 
         if (is_input) {
-          // Model inputs require FreeDimensionBounds because WebNN's
-          // MLGraphBuilder.input() needs the minSize/maxSize descriptor.
+          // If FreeDimensionBounds are provided for this dynamic dimension,
+          // use them for WebNN's MLGraphBuilder.input() minSize/maxSize descriptor.
           const auto it = free_dimension_bounds_.find(dim_name);
-          ORT_RETURN_IF(it == free_dimension_bounds_.end(),
-                        "Missing FreeDimensionBounds for dynamic dimension: ", dim_name,
-                        ". Provide WebNN EP option FreeDimensionBounds entry with maxSize.");
+          if (it != free_dimension_bounds_.end()) {
+            const int32_t min_size = it->second.min_size;
+            const int32_t max_size = it->second.max_size;
+            ORT_RETURN_IF(min_size <= 0 || max_size <= 0 || max_size < min_size,
+                          "Invalid FreeDimensionBounds for dynamic dimension: ", dim_name,
+                          ". Require 1 <= minSize <= maxSize.");
 
-          const int32_t min_size = it->second.min_size;
-          const int32_t max_size = it->second.max_size;
-          ORT_RETURN_IF(min_size <= 0 || max_size <= 0 || max_size < min_size,
-                        "Invalid FreeDimensionBounds for dynamic dimension: ", dim_name,
-                        ". Require 1 <= minSize <= maxSize.");
-
-          dim_obj.set("minSize", min_size);
-          dim_obj.set("maxSize", max_size);
+            dim_obj.set("minSize", min_size);
+            dim_obj.set("maxSize", max_size);
+          }
         }
 
         shape_array.call<void>("push", dim_obj);
