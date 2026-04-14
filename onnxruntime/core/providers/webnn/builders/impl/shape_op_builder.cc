@@ -18,75 +18,49 @@ class ShapeOpBuilder : public BaseOpBuilder {
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
-
-  // Operator support related.
- private:
-  bool IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node& node,
-                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 Status ShapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                              const Node& node,
                                              const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
-  ORT_RETURN_IF_NOT(!HasDynamicShape(*input_defs[0], logger), "Dynamic shape is not supported");
-  std::vector<int64_t> input_shape;
-  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get shape");
-  const auto rank = static_cast<int32_t>(input_shape.size());
+  const auto rank = static_cast<int32_t>(input_defs[0]->Shape()->dim_size());
 
-  emscripten::val desc = emscripten::val::object();
-  emscripten::val dims = emscripten::val::array();
-  dims.call<void>("push", rank);
-  desc.set("dimensions", dims);
-  desc.set("shape", dims);
-  int data_type = ONNX_NAMESPACE::TensorProto_DataType_INT64;
-  std::string typed_array_name = "BigInt64Array";
-  if (!model_builder.IsInt64Supported()) {
-    // Int64 is not supported by current context, use int32 instead.
-    data_type = ONNX_NAMESPACE::TensorProto_DataType_INT32;
-    typed_array_name = "Int32Array";
-  }
-  ORT_RETURN_IF_NOT(SetWebnnDataType(desc, data_type), "WebNN backend does not support data type: ", data_type);
-  emscripten::val shape_buffer =
-      emscripten::val::global(typed_array_name.c_str()).new_(emscripten::val::array(input_shape));
-  emscripten::val shape_constant = model_builder.GetBuilder().call<emscripten::val>("constant", desc, shape_buffer);
+  emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
 
+  // Use WebNN shape() to get the shape of the input tensor as a 1-D tensor.
+  emscripten::val options = emscripten::val::object();
+  options.set("label", node.Name());
+  emscripten::val shape_output = model_builder.GetBuilder().call<emscripten::val>("shape", input, options);
+
+  // Handle start/end attributes (opset 15+).
   NodeAttrHelper helper(node);
   auto true_start = helper.Get("start", 0);
   auto true_end = helper.Get("end", rank);
 
-  // Deal with negative(s) and clamp.
+  // Normalize negative values and clamp.
   true_start = std::clamp(true_start + (true_start < 0 ? rank : 0), 0, rank);
   true_end = std::clamp(true_end + (true_end < 0 ? rank : 0), true_start, rank);
-  auto slice_length = true_end - true_start;
 
-  emscripten::val starts = emscripten::val::array();
-  starts.call<void>("push", true_start);
-  emscripten::val sizes = emscripten::val::array();
-  sizes.call<void>("push", slice_length);
+  emscripten::val output;
+  if (true_start == 0 && true_end == rank) {
+    // No slicing needed, return the full shape.
+    output = std::move(shape_output);
+  } else {
+    // Use slice to extract the subset [start, end).
+    auto slice_length = true_end - true_start;
+    emscripten::val starts = emscripten::val::array();
+    starts.call<void>("push", true_start);
+    emscripten::val sizes = emscripten::val::array();
+    sizes.call<void>("push", slice_length);
 
-  emscripten::val options = emscripten::val::object();
-  options.set("label", node.Name());
-
-  // Since WebNN doesn't support Shape op, we use constant + slice ops as workaround.
-  emscripten::val output = model_builder.GetBuilder().call<emscripten::val>("slice",
-                                                                            shape_constant,
-                                                                            starts,
-                                                                            sizes,
-                                                                            options);
+    emscripten::val slice_options = emscripten::val::object();
+    slice_options.set("label", node.Name() + "_slice");
+    output = model_builder.GetBuilder().call<emscripten::val>("slice", shape_output, starts, sizes, slice_options);
+  }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   return Status::OK();
-}
-
-bool ShapeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node& node,
-                                       const WebnnDeviceType /* device_type */, const logging::Logger& logger) const {
-  const auto& input_defs = node.InputDefs();
-  if (HasDynamicShape(*input_defs[0], logger)) {
-    LOGS(logger, VERBOSE) << "Dynamic shape is not supported for Shape op.";
-    return false;
-  }
-  return true;
 }
 
 void CreateShapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {

@@ -132,7 +132,7 @@ const std::unordered_map<std::string_view, WebnnOpInfo> op_inputs_map = {
     {"Clip", {"clamp", {{0, "input"}}}},
     {"Not", {"logicalNot", {{0, "a"}}}},
     {"Floor", {"floor", {{0, "input"}}}},
-    {"Shape", {"slice", {{0, "input"}}}},
+    {"Shape", {"shape", {{0, "input"}}}},
     {"Slice", {"slice", {{0, "input"}}}},
     {"Split", {"split", {{0, "input"}}}},
     {"IsInf", {"isInfinite", {{0, "a"}}}},
