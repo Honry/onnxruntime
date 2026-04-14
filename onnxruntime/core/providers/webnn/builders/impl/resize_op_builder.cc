@@ -32,6 +32,9 @@ class ResizeOpBuilder : public BaseOpBuilder {
  private:
   bool IsOpSupportedImpl(const GraphViewer&, const Node& node,
                          const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+  bool HasSupportedInputsImpl(const GraphViewer& graph_viewer, const Node& node,
+                              const emscripten::val& wnn_limits,
+                              const logging::Logger& logger) const override;
 
   // Resize opset 10- is very different than Resize opset 11+, with many key attributes missing.
   // We only support Resize opset 11+ here.
@@ -166,8 +169,13 @@ void ResizeOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const N
   model_builder.AddInputToSkip(node.InputDefs()[2]->Name());        // scales
 
   if (node.InputDefs().size() > 3) {
-    model_builder.AddInitializerToSkip(node.InputDefs()[3]->Name());  // sizes
-    model_builder.AddInputToSkip(node.InputDefs()[3]->Name());        // sizes
+    const auto& sizes_name = node.InputDefs()[3]->Name();
+    // Only skip sizes when it is a constant initializer (consumed at build time).
+    // When it is an operand, we need it as the sizes input for dynamicResample2d.
+    if (model_builder.GetGraphViewer().GetConstantInitializer(sizes_name)) {
+      model_builder.AddInitializerToSkip(sizes_name);  // sizes
+      model_builder.AddInputToSkip(sizes_name);        // sizes
+    }
   }
 }
 
@@ -190,32 +198,41 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     options.set("mode", emscripten::val("nearest-neighbor"));
   }
 
-  std::vector<float> scales;
-  std::vector<int64_t> sizes;
-  std::vector<uint32_t> webnn_sizes;
   std::vector<int64_t> axes = GetResolvedAxes(helper, 4);  // We already checked input shape is 4D in IsOpSupportedImpl.
   std::string sizes_name = GetTensorName(input_defs, 3);
-
-  // We know we have either a 'scales' or 'sizes' input so this is safe.
-  // Check for 'sizes' first.
-  // This handles Resize-11 where 'scales' was a required input but 'sizes' were used if provided.
-  bool using_sizes = !sizes_name.empty() && Contains(initializers, sizes_name);
-  if (using_sizes) {
-    ORT_RETURN_IF_NOT(GetResizeSizesAndAxes(model_builder.GetGraphViewer(), node, sizes, axes, input_shape, logger),
-                      "Error getting Resize sizes");
-    webnn_sizes = GetNarrowedIntFromInt64<uint32_t>(sizes);
-    options.set("sizes", emscripten::val::array(webnn_sizes));
-  } else {
-    ORT_RETURN_IF_NOT(GetResizeScalesAndAxes(model_builder.GetGraphViewer(), node, scales, axes, logger),
-                      "Error getting Resize scales");
-    options.set("scales", emscripten::val::array(scales));
-  }
-
-  std::vector<uint32_t> webnn_axes = GetNarrowedIntFromInt64<uint32_t>(axes);
-  options.set("axes", emscripten::val::array(webnn_axes));
+  const bool is_constant_sizes = !sizes_name.empty() && Contains(initializers, sizes_name);
 
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
-  emscripten::val output = model_builder.GetBuilder().call<emscripten::val>("resample2d", input, options);
+  emscripten::val output = emscripten::val::undefined();
+
+  if (!sizes_name.empty() && !is_constant_sizes) {
+    // Dynamic sizes path: use dynamicResample2d with the sizes operand.
+    std::vector<uint32_t> webnn_axes = GetNarrowedIntFromInt64<uint32_t>(axes);
+    options.set("axes", emscripten::val::array(webnn_axes));
+
+    emscripten::val sizes_operand = model_builder.GetOperand(input_defs[3]->Name());
+    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, sizes_operand, options);
+  } else {
+    // Constant path: resolve scales/sizes at build time and use WebNN resample2d.
+    if (is_constant_sizes) {
+      std::vector<int64_t> sizes;
+      ORT_RETURN_IF_NOT(GetResizeSizesAndAxes(model_builder.GetGraphViewer(), node, sizes, axes, input_shape, logger),
+                        "Error getting Resize sizes");
+      std::vector<uint32_t> webnn_sizes = GetNarrowedIntFromInt64<uint32_t>(sizes);
+      options.set("sizes", emscripten::val::array(webnn_sizes));
+    } else {
+      std::vector<float> scales;
+      ORT_RETURN_IF_NOT(GetResizeScalesAndAxes(model_builder.GetGraphViewer(), node, scales, axes, logger),
+                        "Error getting Resize scales");
+      options.set("scales", emscripten::val::array(scales));
+    }
+
+    std::vector<uint32_t> webnn_axes = GetNarrowedIntFromInt64<uint32_t>(axes);
+    options.set("axes", emscripten::val::array(webnn_axes));
+
+    output = model_builder.GetBuilder().call<emscripten::val>("resample2d", input, options);
+  }
+
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   return Status::OK();
 }
@@ -276,7 +293,7 @@ bool ResizeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
     }
   }
 
-  {  // 'scales' and 'sizes' (if present) must be non-empty initializers.
+  {  // 'scales' and 'sizes' (if present) must be non-empty initializers, or sizes can be a dynamic operand.
     const std::string scales_name = GetTensorName(input_defs, 2);
     const std::string sizes_name = GetTensorName(input_defs, 3);
 
@@ -301,17 +318,70 @@ bool ResizeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
       }
     }
 
-    if (using_sizes) {  // We are using 'sizes'.
-      std::vector<int64_t> sizes;
-      if (!GetResizeSizesAndAxes(graph_viewer, node, sizes, axes, input_shape, logger)) {
-        return false;
+    if (using_sizes) {
+      // sizes can be either a constant initializer or a dynamic operand.
+      const auto* sizes_init = graph_viewer.GetConstantInitializer(sizes_name);
+      if (sizes_init) {
+        // Constant sizes path: validate the initializer contents.
+        std::vector<int64_t> sizes;
+        if (!GetResizeSizesAndAxes(graph_viewer, node, sizes, axes, input_shape, logger)) {
+          return false;
+        }
       }
+      // Dynamic sizes: accepted, will use dynamicResample2d at build time.
     } else {  // We are using 'scales'.
+      // 'scales' must be a constant initializer.
       std::vector<float> scales;
       if (!GetResizeScalesAndAxes(graph_viewer, node, scales, axes, logger)) {
         return false;
       }
     }
+  }
+
+  return true;
+}
+
+bool ResizeOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
+                                             const Node& node,
+                                             const emscripten::val& wnn_limits,
+                                             const logging::Logger& logger) const {
+  const auto& input_defs = node.InputDefs();
+  const std::string sizes_name = GetTensorName(input_defs, 3);
+
+  // When sizes is a constant initializer (or absent/empty), the op maps to resample2d.
+  // Delegate to the base class which checks input 0 against WebNN resample2d's limits.
+  // When sizes is a non-constant operand, it's the dynamic path using dynamicResample2d.
+  if (sizes_name.empty() || graph_viewer.GetConstantInitializer(sizes_name)) {
+    return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
+  }
+
+  // When sizes is a dynamic operand, check inputs against dynamicResample2d's limits.
+  const std::string_view webnn_op_type = "dynamicResample2d";
+
+  // Check input 0 (data tensor) against dynamicResample2d's "input" parameter.
+  int32_t input_type;
+  if (!GetType(*input_defs[0], input_type, logger)) {
+    return false;
+  }
+  if (!IsDataTypeSupportedByWebNNOp("Resize", webnn_op_type, input_type, wnn_limits,
+                                    "input", "input", logger)) {
+    return false;
+  }
+  std::vector<int64_t> input_shape;
+  if (!GetShape(*input_defs[0], input_shape, logger) ||
+      !IsInputRankSupported(wnn_limits, webnn_op_type, "input",
+                            input_shape.size(), node.Name(), logger)) {
+    return false;
+  }
+
+  // Check input 3 (sizes operand) against dynamicResample2d's "sizes" parameter.
+  int32_t sizes_type;
+  if (!GetType(*input_defs[3], sizes_type, logger)) {
+    return false;
+  }
+  if (!IsDataTypeSupportedByWebNNOp("Resize", webnn_op_type, sizes_type, wnn_limits,
+                                    "sizes", "sizes", logger)) {
+    return false;
   }
 
   return true;
