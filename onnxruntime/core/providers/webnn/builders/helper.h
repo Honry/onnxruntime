@@ -60,6 +60,11 @@ inline std::vector<int64_t> GetResolvedAxes(const NodeAttrHelper& helper, size_t
 bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const logging::Logger& logger);
 bool HasDynamicShape(const NodeArg& node_arg, const logging::Logger& logger);
 
+// Check if a shape vector (from GetShape()) contains dynamic dimensions (0 placeholders).
+inline bool HasDynamicShape(const std::vector<int64_t>& shape) {
+  return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == 0; });
+}
+
 template <typename T>
 std::string GetShapeString(std::vector<T>& shape) {
   std::stringstream shape_info;

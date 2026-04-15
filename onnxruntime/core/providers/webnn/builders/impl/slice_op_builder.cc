@@ -2,6 +2,7 @@
 // Copyright (c) Intel Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <limits>
 #include <numeric>
 
 #include "core/framework/tensorprotoutils.h"
@@ -42,7 +43,16 @@ void SliceOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const No
   const bool is_constant_starts = initializers.count(input_defs[1]->Name()) > 0;
   const bool is_constant_ends = initializers.count(input_defs[2]->Name()) > 0;
 
-  if (is_constant_starts && is_constant_ends) {
+  // The constant path (WebNN slice) requires concrete dimension sizes at build time.
+  // When the input has dynamic dimensions, we must use the dynamic path (dynamicSlice)
+  // even when starts/ends are constant, because slice needs sizes which can't be computed
+  // from 0-placeholder dynamic dims.
+  const auto* shape_proto = input_defs[0]->Shape();
+  const bool has_dynamic_input = shape_proto &&
+      std::any_of(shape_proto->dim().begin(), shape_proto->dim().end(),
+                  [](const auto& dim) { return !dim.has_dim_value(); });
+
+  if (is_constant_starts && is_constant_ends && !has_dynamic_input) {
     // Constant path: skip all initializer inputs (consumed at build time).
     for (size_t i = 1; i < input_defs.size(); i++) {
       model_builder.AddInitializerToSkip(input_defs[i]->Name());
@@ -283,7 +293,7 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
                            model_builder.IsInt64Supported();
     const int32_t index_data_type = use_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
                                               : ONNX_NAMESPACE::TensorProto_DataType_INT32;
-    constexpr int32_t UINT32 = ONNX_NAMESPACE::TensorProto_DataType_UINT32;
+    constexpr int32_t INT32 = ONNX_NAMESPACE::TensorProto_DataType_INT32;
     const auto shape_1d = [](size_t n) { return std::vector<uint32_t>{static_cast<uint32_t>(n)}; };
     const auto CreateIndexConstant = [&](const std::string& name,
                                          const std::vector<int64_t>& values,
@@ -297,23 +307,25 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
     };
 
     // Use gather + where to expand partial-axis tensors to full-rank.
-    std::vector<uint32_t> gather_indices(rank, 0);
+    std::vector<int32_t> gather_indices(rank, 0);
     std::vector<uint8_t> mask(rank, 0);
     for (size_t i = 0; i < num_axes; ++i) {
       const size_t d = SafeInt<size_t>(axes[i]);
-      gather_indices[d] = static_cast<uint32_t>(i);
+      gather_indices[d] = static_cast<int32_t>(i);
       mask[d] = 1;
     }
     // Non-sliced axes: start=0, end=dim (full range).
+    // For dynamic dims (0 placeholder), use INT32_MAX so dynamicSlice clamps to actual size.
     std::vector<int64_t> starts_default(rank, 0);
     std::vector<int64_t> ends_default(rank);
     for (size_t d = 0; d < rank; ++d) {
-      ends_default[d] = input_shape[d];
+      ends_default[d] = input_shape[d] != 0 ? input_shape[d]
+                                             : static_cast<int64_t>(std::numeric_limits<int32_t>::max());
     }
 
-    const emscripten::val& gather_idx_const = model_builder.CreateOrGetConstant<uint32_t>(
-        UINT32, label + "_gather_idx",
-        std::vector<uint32_t>(gather_indices.begin(), gather_indices.end()),
+    const emscripten::val& gather_idx_const = model_builder.CreateOrGetConstant<int32_t>(
+        INT32, label + "_gather_idx",
+        std::vector<int32_t>(gather_indices.begin(), gather_indices.end()),
         {static_cast<uint32_t>(rank)});
     const emscripten::val& mask_const = model_builder.CreateOrGetConstant<uint8_t>(
         ONNX_NAMESPACE::TensorProto_DataType_UINT8, label + "_mask", mask,
@@ -366,9 +378,13 @@ Status SliceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const 
   const bool is_constant_starts = initializers.count(input_defs[1]->Name()) > 0;
   const bool is_constant_ends = initializers.count(input_defs[2]->Name()) > 0;
 
+  // The constant path requires fully static input shape. Dynamic dims (0 placeholders)
+  // break PrepareForComputeMetadata's size computation, so route to dynamicSlice instead.
+  const bool has_dynamic_input = HasDynamicShape(input_shape);
+
   emscripten::val output = emscripten::val::undefined();
 
-  if (is_constant_starts && is_constant_ends) {
+  if (is_constant_starts && is_constant_ends && !has_dynamic_input) {
     ORT_RETURN_IF_ERROR(BuildConstantSlice(model_builder, node, input, input_shape, output, logger));
   } else {
     ORT_RETURN_IF_ERROR(BuildDynamicSlice(model_builder, node, input, input_shape, output, logger));
@@ -394,8 +410,9 @@ bool SliceOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer, const No
   const std::string ends_name = input_defs[2]->Name();
   const bool is_constant_starts = graph_viewer.GetConstantInitializer(starts_name) != nullptr;
   const bool is_constant_ends = graph_viewer.GetConstantInitializer(ends_name) != nullptr;
+  const bool has_dynamic_input = HasDynamicShape(*input_defs[0], logger);
 
-  if (is_constant_starts && is_constant_ends) {
+  if (is_constant_starts && is_constant_ends && !has_dynamic_input) {
     // Constant path: axes and steps must also be constant initializers if present.
     for (size_t i = 3; i < input_defs.size(); i++) {
       const std::string input_name = GetTensorName(input_defs, i);
@@ -443,9 +460,11 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
   const std::string starts_name = input_defs[1]->Name();
   const std::string ends_name = input_defs[2]->Name();
 
-  // When both starts and ends are constant, use the static slice path.
-  // When at least one is dynamic, use the dynamicSlice path.
-  if (graph_viewer.GetConstantInitializer(starts_name) && graph_viewer.GetConstantInitializer(ends_name)) {
+  // Use the static slice path only when starts/ends are constant AND input has no dynamic dims.
+  // When input has dynamic dims, we must use dynamicSlice because static slice requires concrete
+  // sizes at build time (which can't be computed from 0-placeholder dynamic dims).
+  const bool has_dynamic_input = HasDynamicShape(*input_defs[0], logger);
+  if (!has_dynamic_input && graph_viewer.GetConstantInitializer(starts_name) && graph_viewer.GetConstantInitializer(ends_name)) {
     const auto& input = *input_defs[0];
     std::vector<int64_t> input_shape;
     if (!GetShape(*input_defs[0], input_shape, logger)) {
