@@ -194,12 +194,12 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
 
       // ONNX pads layout: [begin_ax0, ..., begin_axN, end_ax0, ..., end_axN]
       // Full pads layout: [begin_dim0, ..., begin_dimR, end_dim0, ..., end_dimR]
-      std::vector<uint32_t> gather_indices(2 * rank, 0);
+      std::vector<int32_t> gather_indices(2 * rank, 0);
       std::vector<uint8_t> mask(2 * rank, 0);
       for (size_t i = 0; i < num_axes; ++i) {
         const size_t d = static_cast<size_t>(axes[i]);
-        gather_indices[d] = static_cast<uint32_t>(i);
-        gather_indices[rank + d] = static_cast<uint32_t>(num_axes + i);
+        gather_indices[d] = static_cast<int32_t>(i);
+        gather_indices[rank + d] = static_cast<int32_t>(num_axes + i);
         mask[d] = 1;
         mask[rank + d] = 1;
       }
@@ -210,14 +210,14 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
                              model_builder.IsInt64Supported();
       const int32_t pads_data_type = use_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
                                                : ONNX_NAMESPACE::TensorProto_DataType_INT32;
-      constexpr int32_t UINT32 = ONNX_NAMESPACE::TensorProto_DataType_UINT32;
+      constexpr int32_t INT32 = ONNX_NAMESPACE::TensorProto_DataType_INT32;
       const auto shape_1d = [](size_t n) { return std::vector<uint32_t>{static_cast<uint32_t>(n)}; };
 
       const emscripten::val& zeros_const = use_int64
           ? model_builder.CreateOrGetConstant<int64_t>(pads_data_type, int64_t{0}, shape_1d(2 * rank))
           : model_builder.CreateOrGetConstant<int32_t>(pads_data_type, int32_t{0}, shape_1d(2 * rank));
-      const emscripten::val& gather_idx_const = model_builder.CreateOrGetConstant<uint32_t>(
-          UINT32, label + "_gather_idx", gather_indices, shape_1d(2 * rank));
+      const emscripten::val& gather_idx_const = model_builder.CreateOrGetConstant<int32_t>(
+          INT32, label + "_gather_idx", gather_indices, shape_1d(2 * rank));
       const emscripten::val& mask_const = model_builder.CreateOrGetConstant<uint8_t>(
           ONNX_NAMESPACE::TensorProto_DataType_UINT8, label + "_mask", mask, shape_1d(2 * rank));
 
