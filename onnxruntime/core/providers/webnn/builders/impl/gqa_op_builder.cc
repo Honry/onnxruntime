@@ -109,20 +109,37 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   std::vector<int64_t> input_q_shape;
   ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_q_shape, logger), "Cannot get query shape");
 
-  // Calculate hidden_size and head_size based on whether key/value are provided
+  // Calculate hidden_size and head_size based on whether key/value are provided.
+  // GetShape returns 0 for dynamic dimensions. When query dim[2] is dynamic, fall back
+  // to key or past_key shape protos to derive head_size (same pattern as MHA fix).
   uint32_t qkv_hidden_size;
-  uint32_t head_size;
-  if (has_key) {
-    // query shape is (batch_size, sequence_length, num_heads * head_size)
-    qkv_hidden_size = SafeInt<uint32_t>(input_q_shape[2]);
-    head_size = SafeInt<uint32_t>(qkv_hidden_size / num_heads);
-  } else {
-    // query contains packed QKV: (batch_size, sequence_length, num_heads * head_size + 2 * kv_num_heads * head_size)
-    // hidden_size = num_heads * head_size, so we derive: head_size = d / (num_heads + 2 * kv_num_heads)
-    uint32_t d = SafeInt<uint32_t>(input_q_shape[2]);
-    head_size = d / (num_heads + 2 * kv_num_heads);
-    qkv_hidden_size = num_heads * head_size;
+  uint32_t head_size = 0;
+  if (input_q_shape[2] > 0) {
+    if (has_key) {
+      // query shape is (batch_size, sequence_length, num_heads * head_size)
+      head_size = SafeInt<uint32_t>(input_q_shape[2]) / num_heads;
+    } else {
+      // query contains packed QKV: (batch_size, sequence_length, num_heads * head_size + 2 * kv_num_heads * head_size)
+      head_size = SafeInt<uint32_t>(input_q_shape[2]) / (num_heads + 2 * kv_num_heads);
+    }
   }
+  // Fallback: try key shape proto dim[2] = kv_num_heads * head_size.
+  if (head_size == 0 && has_key) {
+    const auto* k_shape_proto = input_defs[1]->Shape();
+    if (k_shape_proto && k_shape_proto->dim_size() > 2 && k_shape_proto->dim(2).has_dim_value()) {
+      head_size = static_cast<uint32_t>(k_shape_proto->dim(2).dim_value() / kv_num_heads);
+    }
+  }
+  // Fallback: try past_key shape proto dim[3] = head_size (BNSH format).
+  if (head_size == 0 && has_past_key) {
+    const auto* pk_shape_proto = input_defs[3]->Shape();
+    if (pk_shape_proto && pk_shape_proto->dim_size() > 3 && pk_shape_proto->dim(3).has_dim_value()) {
+      head_size = static_cast<uint32_t>(pk_shape_proto->dim(3).dim_value());
+    }
+  }
+  ORT_RETURN_IF(head_size == 0,
+                "GroupQueryAttention: cannot determine head_size from query, key, or past_key shape protos.");
+  qkv_hidden_size = num_heads * head_size;
 
   emscripten::val position_ids = emscripten::val::undefined();
   bool use_position_ids_as_offset = false;
@@ -580,7 +597,9 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
 
   emscripten::val reshape_pre_neq_right = emscripten::val::array();
   reshape_pre_neq_right.call<void>("push", true_present_value["shape"][2]);
-  reshape_pre_neq_right.call<void>("push", new_query["shape"][2]);
+  // Use the same S dim source as range_s_plus_one (key_for_scatter) so that
+  // WebNN can verify broadcastability with matching dim descriptors.
+  reshape_pre_neq_right.call<void>("push", key_for_scatter["shape"][1]);
   emscripten::val pre_neq_right_data_range_constant = range_s_plus_one;
 
   // Use a scalar/1D offset for mask path to keep add() broadcastable with [S].
