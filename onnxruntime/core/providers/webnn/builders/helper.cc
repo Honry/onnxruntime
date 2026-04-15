@@ -91,15 +91,19 @@ bool IsNodeSupported(const GraphViewer& graph_viewer, const Node& node, const We
 }
 
 bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_name,
-                            const logging::Logger& logger, bool allow_empty_input) {
+                            const logging::Logger& logger, bool allow_empty_input,
+                            bool allow_no_shape) {
   const auto& node_arg_name = node_arg.Name();
   const auto* shape_proto = node_arg.Shape();
   // Optional tensors can be indicated by an empty name, just ignore it.
   if (node_arg_name.empty()) {
     return true;
   }
-  // We do not support input/output with no shape.
+  // We do not support input/output with no shape unless explicitly allowed.
   if (!shape_proto) {
+    if (allow_no_shape) {
+      return true;
+    }
     LOGS(logger, VERBOSE) << "Node arg [" << node_arg_name << "] of [" << parent_name << "] has not shape";
     return false;
   }

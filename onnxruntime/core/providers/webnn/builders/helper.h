@@ -207,7 +207,8 @@ inline bool TensorExists(const ConstPointerContainer<std::vector<NodeArg*>>& def
 }
 
 bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_name,
-                            const logging::Logger& logger, bool allow_empty_input = false);
+                            const logging::Logger& logger, bool allow_empty_input = false,
+                            bool allow_no_shape = false);
 
 bool IsInputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limits, const logging::Logger& logger);
 
