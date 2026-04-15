@@ -142,7 +142,9 @@ bool GetResizeSizesAndAxes(const GraphViewer& graph_viewer,
     // Before opset 18, 'sizes' should have 4 elements.
     // Make sure 'sizes' is not trying to resize on N/C channels here.
     std::vector<int64_t> onnx_sizes{sizes_data, sizes_data + 4};
-    if (onnx_sizes[0] != input_shape[0] || onnx_sizes[1] != input_shape[1]) {
+    // Skip comparison for dynamic dims (0 placeholder) — can't validate at build time.
+    if ((input_shape[0] != 0 && onnx_sizes[0] != input_shape[0]) ||
+        (input_shape[1] != 0 && onnx_sizes[1] != input_shape[1])) {
       LOGS(logger, VERBOSE) << "Output sizes of N/C chanel should match the input sizes, "
                             << "Resize of N/C channels are not supported"
                             << ", input_size_n, " << input_shape[0] << ", output_size_n, " << onnx_sizes[0]
