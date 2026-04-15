@@ -226,13 +226,36 @@ bool RotaryEmbeddingOpBuilder::IsOpSupportedImpl(const GraphViewer&, const Node&
   const int rotary_embedding_dim = helper.Get("rotary_embedding_dim", 0);
   const auto sequence_length = input_size == 4 ? input_shape[2] : input_shape[1];
 
+  // For the 4D case, num_heads (dim[1]) and head_size (dim[3]) must be static
+  // because they define the tensor decomposition structure.
+  if (input_size == 4) {
+    if (input_shape[1] == 0 || input_shape[3] == 0) {
+      LOGS(logger, VERBOSE) << "RotaryEmbedding: 4D input requires static num_heads (dim[1]) and head_size (dim[3])";
+      return false;
+    }
+  }
+
+  // For the 3D case, hidden_size (dim[2]) must be static.
+  if (input_size == 3 && input_shape[2] == 0) {
+    LOGS(logger, VERBOSE) << "RotaryEmbedding: 3D input requires static hidden_size (dim[2])";
+    return false;
+  }
+
+  // cos_cache's second dimension (half_rotary_embedding_dim) must be static.
+  if (cos_cache_shape[1] == 0) {
+    LOGS(logger, VERBOSE) << "RotaryEmbedding: cos_cache requires static second dimension";
+    return false;
+  }
+
   if (is_onnx_domain) {
     if (input_size == 3 && num_heads == 0) {
       LOGS(logger, VERBOSE) << "RotaryEmbedding: num_heads must be provided if input is 3D";
       return false;
     }
   } else {
-    if (is_packed_batching == 0 && sequence_length > cos_cache_shape[0]) {
+    // Skip sequence_length vs cos_cache comparison when either dimension is dynamic.
+    if (is_packed_batching == 0 && sequence_length != 0 && cos_cache_shape[0] != 0 &&
+        sequence_length > cos_cache_shape[0]) {
       LOGS(logger, VERBOSE) << "RotaryEmbedding: updating cos_cache and sin_cache is not currently supported";
       return false;
     }
@@ -243,7 +266,7 @@ bool RotaryEmbeddingOpBuilder::IsOpSupportedImpl(const GraphViewer&, const Node&
     }
   }
 
-  if (input_size == 4 && num_heads != 0 && num_heads != input_shape[1]) {
+  if (input_size == 4 && num_heads != 0 && input_shape[1] != 0 && num_heads != input_shape[1]) {
     LOGS(logger, VERBOSE) << "RotaryEmbedding: when input has 4 dimensions, num_heads must be 0 or have the same value "
                              "as the second dimension of the input";
     return false;
