@@ -65,7 +65,26 @@ class ModelBuilder {
 
   std::string GetUniqueName(const std::string& base_name);
 
+  // Dim provenance tracking for reshape-derived dim descriptors.
+  // When reshape creates a new dynamic dim (e.g., unk__7 = seq_len * 30),
+  // we record the relationship so a subsequent reshape that inverts it
+  // (e.g., unk__8 = unk__7 / 30 = seq_len) can reuse the original descriptor.
+  // This is required because WebNN ops like expand/gather only accept native
+  // dim descriptors from operand shapes, not freshly created JS objects.
+  struct DimProvenance {
+    std::string source_operand_name;  // operand holding the original dim
+    uint32_t source_dim_index;        // index of the dim in source operand's shape
+    int64_t factor_num;               // new_dim = source_dim * factor_num / factor_den
+    int64_t factor_den;
+  };
+
+  void RecordDimProvenance(const std::string& dim_name, const DimProvenance& prov);
+  const DimProvenance* GetDimProvenance(const std::string& dim_name) const;
+
  private:
+  // Maps dim descriptor name → its provenance (relationship to a source operand's dim).
+  std::unordered_map<std::string, DimProvenance> dim_provenance_;
+
   const GraphViewer& graph_viewer_;
   const logging::Logger& logger_;
   const bool is_float16array_available_ = !emscripten::val::global("Float16Array").isUndefined() &&

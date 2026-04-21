@@ -121,32 +121,92 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
             }
           }
 
-          if (unclaimed_dynamic_count == 1 && static_input_product == static_target_product) {
-            // Direct case: -1 equals the single unclaimed dynamic input dim. Reuse its descriptor.
-            new_shape.call<void>("push", input["shape"][static_cast<uint32_t>(unclaimed_dynamic_idx)]);
-            reused_dim = true;
+          if (unclaimed_dynamic_count == 1) {
+            if (static_input_product == static_target_product) {
+              // Direct case: -1 equals the single unclaimed dynamic input dim. Reuse its descriptor.
+              new_shape.call<void>("push", input["shape"][static_cast<uint32_t>(unclaimed_dynamic_idx)]);
+              reused_dim = true;
+            } else if (static_input_product > 0 && static_target_product > 0) {
+              // Check provenance: the input's dynamic dim may itself be a scaled version of an
+              // original dim. If this reshape inverts the scaling (merge-then-split pattern),
+              // we can reuse the original source descriptor.
+              emscripten::val input_dim_val = input["shape"][static_cast<uint32_t>(unclaimed_dynamic_idx)];
+              if (input_dim_val.typeOf().as<std::string>() == "object" &&
+                  !input_dim_val["name"].isUndefined()) {
+                std::string dim_name = input_dim_val["name"].as<std::string>();
+                const auto* prov = model_builder.GetDimProvenance(dim_name);
+                if (prov != nullptr) {
+                  int64_t new_factor_num = prov->factor_num * static_input_product;
+                  int64_t new_factor_den = prov->factor_den * static_target_product;
+                  if (new_factor_num == new_factor_den) {
+                    // Factor is 1: -1 equals the original source dim. Reuse its descriptor.
+                    const emscripten::val& source_operand =
+                        model_builder.GetOperand(prov->source_operand_name);
+                    new_shape.call<void>("push",
+                                         source_operand["shape"][prov->source_dim_index]);
+                    reused_dim = true;
+                  }
+                }
+              }
+            }
           }
 
           if (!reused_dim) {
             // Fall back: use the output shape proto's dim_param/dim_value if available so that all
             // Reshape nodes inferring the same symbolic dimension share the same dim descriptor name.
             const auto* output_shape_proto = node.OutputDefs()[0]->Shape();
+            std::string new_dim_name;
             if (output_shape_proto && static_cast<int>(i) < output_shape_proto->dim_size()) {
               const auto& dim = output_shape_proto->dim(static_cast<int>(i));
               if (dim.has_dim_value()) {
                 uint32_t dim_value = SafeInt<uint32_t>(dim.dim_value());
                 new_shape.call<void>("push", dim_value);
               } else {
-                std::string new_dim_name = dim.has_dim_param() ? dim.dim_param()
-                                                               : node.Name() + "_inferred";
+                new_dim_name = dim.has_dim_param() ? dim.dim_param()
+                                                   : node.Name() + "_inferred";
                 emscripten::val dim_desc = emscripten::val::object();
                 dim_desc.set("name", emscripten::val(new_dim_name));
                 new_shape.call<void>("push", dim_desc);
               }
             } else {
+              new_dim_name = node.Name() + "_inferred";
               emscripten::val dim_desc = emscripten::val::object();
-              dim_desc.set("name", emscripten::val(node.Name() + "_inferred"));
+              dim_desc.set("name", emscripten::val(new_dim_name));
               new_shape.call<void>("push", dim_desc);
+            }
+
+            // Record provenance for this new dim descriptor so future reshapes can trace back.
+            if (!new_dim_name.empty() && unclaimed_dynamic_count == 1 &&
+                static_input_product > 0 && static_target_product > 0) {
+              emscripten::val input_dim_val = input["shape"][static_cast<uint32_t>(unclaimed_dynamic_idx)];
+              if (input_dim_val.typeOf().as<std::string>() == "object" &&
+                  !input_dim_val["name"].isUndefined()) {
+                std::string input_dim_name = input_dim_val["name"].as<std::string>();
+                const auto* prov = model_builder.GetDimProvenance(input_dim_name);
+                if (prov != nullptr) {
+                  // Chain: new = source * (old_factor * P_in / P_out)
+                  model_builder.RecordDimProvenance(new_dim_name, {
+                      prov->source_operand_name,
+                      prov->source_dim_index,
+                      prov->factor_num * static_input_product,
+                      prov->factor_den * static_target_product,
+                  });
+                } else {
+                  model_builder.RecordDimProvenance(new_dim_name, {
+                      input_defs[0]->Name(),
+                      static_cast<uint32_t>(unclaimed_dynamic_idx),
+                      static_input_product,
+                      static_target_product,
+                  });
+                }
+              } else {
+                model_builder.RecordDimProvenance(new_dim_name, {
+                    input_defs[0]->Name(),
+                    static_cast<uint32_t>(unclaimed_dynamic_idx),
+                    static_input_product,
+                    static_target_product,
+                });
+              }
             }
           }
         } else {

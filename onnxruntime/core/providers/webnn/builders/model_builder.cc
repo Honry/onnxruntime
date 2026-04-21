@@ -489,5 +489,14 @@ std::string ModelBuilder::GetUniqueName(const std::string& base_name) {
   return unique_name;
 }
 
+void ModelBuilder::RecordDimProvenance(const std::string& dim_name, const DimProvenance& prov) {
+  dim_provenance_[dim_name] = prov;
+}
+
+const ModelBuilder::DimProvenance* ModelBuilder::GetDimProvenance(const std::string& dim_name) const {
+  auto it = dim_provenance_.find(dim_name);
+  return it != dim_provenance_.end() ? &it->second : nullptr;
+}
+
 }  // namespace webnn
 }  // namespace onnxruntime
