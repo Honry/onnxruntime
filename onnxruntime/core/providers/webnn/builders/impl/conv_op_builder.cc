@@ -47,13 +47,21 @@ common::Status SetConvBaseOptions(ModelBuilder& model_builder,
 
   // Add Padding.
   AutoPadType auto_pad_type = StringToAutoPadType(helper.Get("auto_pad", "NOTSET"));
+  const bool has_dynamic_spatial = HasDynamicShape(input_shape);
   std::vector<int64_t> pads_out;
   if (op_type == "Conv" || op_type == "ConvInteger") {
     // Calculate explicit padding for autoPad.
     if (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type) {
-      ORT_RETURN_IF_ERROR(HandleAutoPad(input_shape, weight_shape[2], weight_shape[3],
-                                        pads, strides, dilations, auto_pad_type, pads_out));
-      pads = pads_out;
+      if (has_dynamic_spatial) {
+        // When spatial dims are dynamic, use WebNN's native autoPad instead of computing explicit pads.
+        options.set("autoPad", emscripten::val(auto_pad_type == AutoPadType::SAME_UPPER
+                                                   ? "same-upper"
+                                                   : "same-lower"));
+      } else {
+        ORT_RETURN_IF_ERROR(HandleAutoPad(input_shape, weight_shape[2], weight_shape[3],
+                                          pads, strides, dilations, auto_pad_type, pads_out));
+        pads = pads_out;
+      }
     }
   } else if (op_type == "ConvTranspose") {
     std::vector<int64_t> output_shape = helper.Get("output_shape", std::vector<int64_t>{-1, -1});
@@ -69,16 +77,24 @@ common::Status SetConvBaseOptions(ModelBuilder& model_builder,
     }
     options.set("outputPadding", emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(output_padding)));
 
-    // If output shape is explicitly provided, compute the pads.
-    // Otherwise compute the output shape, as well as the pads if the auto_pad attribute is SAME_UPPER/SAME_LOWER.
-    ORT_RETURN_IF_ERROR(ComputeConvTransposePadsAndOutputShape(input_shape, weight_shape[2], weight_shape[3],
-                                                               pads, strides, dilations, output_padding,
-                                                               auto_pad_type, pads_out, output_shape));
+    if (has_dynamic_spatial &&
+        (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type)) {
+      // When spatial dims are dynamic, use WebNN's native autoPad.
+      options.set("autoPad", emscripten::val(auto_pad_type == AutoPadType::SAME_UPPER
+                                                 ? "same-upper"
+                                                 : "same-lower"));
+    } else {
+      // If output shape is explicitly provided, compute the pads.
+      // Otherwise compute the output shape, as well as the pads if the auto_pad attribute is SAME_UPPER/SAME_LOWER.
+      ORT_RETURN_IF_ERROR(ComputeConvTransposePadsAndOutputShape(input_shape, weight_shape[2], weight_shape[3],
+                                                                 pads, strides, dilations, output_padding,
+                                                                 auto_pad_type, pads_out, output_shape));
 
-    if (output_shape[0] != -1 && output_shape[1] != -1) {
-      options.set("outputSizes", emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(output_shape)));
+      if (output_shape[0] != -1 && output_shape[1] != -1) {
+        options.set("outputSizes", emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(output_shape)));
+      }
+      pads = pads_out;
     }
-    pads = pads_out;
   } else {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
                            "conv_op_builder only supports Op Conv, ConvInteger and ConvTranspose.");
@@ -126,17 +142,28 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
   auto pads = helper.Get("pads", std::vector<int64_t>{0, 0, 0, 0});
 
   const bool is_conv1d = input_shape.size() == 3 && weight_shape.size() == 3;
+  const bool has_dynamic_spatial = HasDynamicShape(input_shape);
 
   emscripten::val common_options = emscripten::val::object();
   // Support conv1d by prepending a 1 or 2 size dimensions.
   if (is_conv1d) {
-    // Reshape input.
-    input_shape.push_back(1);
-    std::vector<uint32_t> new_input_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
-    common_options.set("label", node.Name() + "_reshape_input");
-    input = model_builder.GetBuilder().call<emscripten::val>("reshape", input,
-                                                             emscripten::val::array(new_input_shape),
-                                                             common_options);
+    // Reshape input from 3D to 4D by appending a size-1 dimension.
+    if (has_dynamic_spatial) {
+      emscripten::val new_shape = emscripten::val::array();
+      for (size_t i = 0; i < input_shape.size(); ++i) {
+        new_shape.call<void>("push", input["shape"][i]);
+      }
+      new_shape.call<void>("push", 1u);
+      common_options.set("label", node.Name() + "_reshape_input");
+      input = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, common_options);
+    } else {
+      input_shape.push_back(1);
+      std::vector<uint32_t> new_input_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
+      common_options.set("label", node.Name() + "_reshape_input");
+      input = model_builder.GetBuilder().call<emscripten::val>("reshape", input,
+                                                               emscripten::val::array(new_input_shape),
+                                                               common_options);
+    }
 
     weight_shape.resize(4, 1);  // Ensure 4D by appending 1's if needed.
     strides.resize(2, 1);       // Ensure 2D by appending 1's if needed.
@@ -228,15 +255,25 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
 
   // If it's a conv1d, reshape it back.
   if (is_conv1d) {
-    const auto& output_defs = node.OutputDefs();
-    std::vector<int64_t> output_shape;
-    ORT_RETURN_IF_NOT(GetShape(*output_defs[0], output_shape, logger), "Cannot get output shape");
-    std::vector<uint32_t> new_shape = GetNarrowedIntFromInt64<uint32_t>(output_shape);
-    common_options.set("label", node.Name() + "_reshape_output");
-    output = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                              output,
-                                                              emscripten::val::array(new_shape),
-                                                              common_options);
+    if (has_dynamic_spatial) {
+      // Use the 4D output's shape, dropping the last dimension.
+      emscripten::val new_shape = emscripten::val::array();
+      for (size_t i = 0; i < 3; ++i) {
+        new_shape.call<void>("push", output["shape"][i]);
+      }
+      common_options.set("label", node.Name() + "_reshape_output");
+      output = model_builder.GetBuilder().call<emscripten::val>("reshape", output, new_shape, common_options);
+    } else {
+      const auto& output_defs = node.OutputDefs();
+      std::vector<int64_t> output_shape;
+      ORT_RETURN_IF_NOT(GetShape(*output_defs[0], output_shape, logger), "Cannot get output shape");
+      std::vector<uint32_t> new_shape = GetNarrowedIntFromInt64<uint32_t>(output_shape);
+      common_options.set("label", node.Name() + "_reshape_output");
+      output = model_builder.GetBuilder().call<emscripten::val>("reshape",
+                                                                output,
+                                                                emscripten::val::array(new_shape),
+                                                                common_options);
+    }
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));

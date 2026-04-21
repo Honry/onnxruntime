@@ -90,15 +90,26 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   if (scale_shape.size() == 1 && input_rank > 1 &&
       block_size == 0 && axis != static_cast<int32_t>(input_rank - 1)) {
     // Insert ones before and after the axis dimension for broadcasting of scale tensor.
-    std::vector<uint32_t> target_shape{SafeInt<uint32_t>(input_shape[axis])};
-    target_shape.insert(target_shape.begin(), axis, 1);
-    target_shape.insert(target_shape.end(), input_rank - axis - 1, 1);
+    // Use emscripten::val::array() to support dynamic axis dim via input["shape"][axis].
+    emscripten::val target_shape = emscripten::val::array();
+    for (size_t i = 0; i < input_rank; ++i) {
+      if (static_cast<int32_t>(i) == axis) {
+        target_shape.call<void>("push", input["shape"][axis]);
+      } else {
+        target_shape.call<void>("push", 1u);
+      }
+    }
     // zero_point has the same shape as the scale tensor.
-    zero_point_shape = target_shape;
+    // For zero_point_shape (used when creating default zero_point), we still need uint32_t values.
+    // If axis dim is dynamic, set it to 0 as placeholder (won't be used if has_zero_point is true).
+    zero_point_shape.resize(input_rank, 1);
+    if (input_shape[axis] > 0) {
+      zero_point_shape[axis] = SafeInt<uint32_t>(input_shape[axis]);
+    }
     common_options.set("label", node.Name() + "_reshape_scale");
     scale = model_builder.GetBuilder().call<emscripten::val>("reshape",
                                                              scale,
-                                                             emscripten::val::array(target_shape),
+                                                             target_shape,
                                                              common_options);
 
     if (has_zero_point) {
@@ -106,7 +117,7 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       common_options.set("label", node.Name() + "_reshape_zero_point");
       zero_point = model_builder.GetBuilder().call<emscripten::val>("reshape",
                                                                     zero_point,
-                                                                    emscripten::val::array(target_shape),
+                                                                    target_shape,
                                                                     common_options);
     }
   }
