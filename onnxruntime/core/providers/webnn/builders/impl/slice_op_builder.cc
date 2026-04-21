@@ -128,30 +128,96 @@ Status BuildConstantSlice(ModelBuilder& model_builder, const Node& node,
   }
 
   // Check if slice op is needed (identity if no actual slicing).
+  // For dynamic dims (input_shape[i] == 0) that are not being sliced, they appear as
+  // starts=0, ends=0, step=1 after clamping. We must still emit a slice for the sliced axes.
   bool is_slice_required = false;
+  bool has_dynamic_non_sliced = false;
   for (size_t i = 0; i < rank; ++i) {
+    if (input_shape[i] <= 0) {
+      has_dynamic_non_sliced = true;
+      continue;
+    }
     if (compute_metadata.steps_[i] != 1 || compute_metadata.starts_[i] != 0 ||
         compute_metadata.ends_[i] != input_shape[i]) {
       is_slice_required = true;
-      break;
     }
   }
 
   output = reverse_output;
   if (is_slice_required) {
-    std::vector<uint32_t> starts = GetNarrowedIntFromInt64<uint32_t>(compute_metadata.starts_);
-    std::vector<uint32_t> steps = GetNarrowedIntFromInt64<uint32_t>(compute_metadata.steps_);
-    std::vector<uint32_t> sizes(rank);
-    std::transform(compute_metadata.ends_.cbegin(), compute_metadata.ends_.cend(),
-                   compute_metadata.starts_.cbegin(),
-                   sizes.begin(), [](int64_t i, int64_t j) { return SafeInt<uint32_t>(i - j); });
+    if (has_dynamic_non_sliced) {
+      // WebNN slice requires all sizes as unsigned long (no dim descriptors).
+      // When there are dynamic non-sliced axes, decompose strided slicing using gather
+      // on each strided axis, and regular slice for non-strided axes.
+      emscripten::val current = reverse_output;
+      for (size_t i = 0; i < rank; ++i) {
+        if (input_shape[i] <= 0) continue;  // dynamic non-sliced, skip
+        int64_t start = compute_metadata.starts_[i];
+        int64_t end = compute_metadata.ends_[i];
+        int64_t step = compute_metadata.steps_[i];
+        if (start == 0 && end == input_shape[i] && step == 1) continue;  // no-op axis
 
-    emscripten::val options = emscripten::val::object();
-    options.set("strides", emscripten::val::array(steps));
-    options.set("label", node.Name());
-    output = model_builder.GetBuilder().call<emscripten::val>(
-        "slice", reverse_output, emscripten::val::array(starts),
-        emscripten::val::array(sizes), options);
+        if (step != 1) {
+          // Use gather with computed indices for strided axis.
+          uint32_t num_elements = static_cast<uint32_t>((end - start + step - 1) / step);
+          std::vector<int32_t> indices_data(num_elements);
+          for (uint32_t j = 0; j < num_elements; ++j) {
+            indices_data[j] = static_cast<int32_t>(start) + static_cast<int32_t>(j) * static_cast<int32_t>(step);
+          }
+          emscripten::val indices_buffer = emscripten::val::global("Int32Array")
+              .new_(emscripten::val::array(indices_data));
+          emscripten::val indices_desc = emscripten::val::object();
+          indices_desc.set("dataType", emscripten::val("int32"));
+          std::vector<uint32_t> indices_shape{num_elements};
+          indices_desc.set("shape", emscripten::val::array(indices_shape));
+          indices_desc.set("dimensions", emscripten::val::array(indices_shape));
+          emscripten::val indices_const = model_builder.GetBuilder().call<emscripten::val>(
+              "constant", indices_desc, indices_buffer);
+          emscripten::val gather_options = emscripten::val::object();
+          gather_options.set("axis", static_cast<uint32_t>(i));
+          gather_options.set("label", node.Name() + "_gather_stride_axis" + std::to_string(i));
+          current = model_builder.GetBuilder().call<emscripten::val>(
+              "gather", current, indices_const, gather_options);
+        } else {
+          // Non-strided slice on a static axis: use slice with just that axis.
+          // Build full-rank starts/sizes with 0/full for other axes.
+          emscripten::val s_starts = emscripten::val::array();
+          emscripten::val s_sizes = emscripten::val::array();
+          for (size_t j = 0; j < rank; ++j) {
+            if (j == i) {
+              s_starts.call<void>("push", static_cast<uint32_t>(start));
+              s_sizes.call<void>("push", static_cast<uint32_t>(end - start));
+            } else {
+              s_starts.call<void>("push", 0u);
+              s_sizes.call<void>("push", current["shape"][j]);
+            }
+          }
+          emscripten::val s_options = emscripten::val::object();
+          s_options.set("label", node.Name() + "_slice_axis" + std::to_string(i));
+          current = model_builder.GetBuilder().call<emscripten::val>(
+              "slice", current, s_starts, s_sizes, s_options);
+        }
+      }
+      output = current;
+    } else {
+      // All dims are static — use slice directly.
+      std::vector<uint32_t> starts(rank);
+      std::vector<uint32_t> sizes(rank);
+      std::vector<uint32_t> steps(rank);
+      for (size_t i = 0; i < rank; ++i) {
+        starts[i] = static_cast<uint32_t>(compute_metadata.starts_[i]);
+        steps[i] = static_cast<uint32_t>(compute_metadata.steps_[i]);
+        int64_t extent = compute_metadata.ends_[i] - compute_metadata.starts_[i];
+        int64_t step = compute_metadata.steps_[i];
+        sizes[i] = static_cast<uint32_t>((extent + step - 1) / step);
+      }
+      emscripten::val options = emscripten::val::object();
+      options.set("strides", emscripten::val::array(steps));
+      options.set("label", node.Name());
+      output = model_builder.GetBuilder().call<emscripten::val>(
+          "slice", reverse_output, emscripten::val::array(starts),
+          emscripten::val::array(sizes), options);
+    }
   }
 
   return Status::OK();
@@ -375,16 +441,43 @@ Status SliceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const 
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
 
   const auto& initializers(model_builder.GetInitializerTensors());
+  const auto& graph_viewer = model_builder.GetGraphViewer();
   const bool is_constant_starts = initializers.count(input_defs[1]->Name()) > 0;
   const bool is_constant_ends = initializers.count(input_defs[2]->Name()) > 0;
 
-  // The constant path requires fully static input shape. Dynamic dims (0 placeholders)
-  // break PrepareForComputeMetadata's size computation, so route to dynamicSlice instead.
-  const bool has_dynamic_input = HasDynamicShape(input_shape);
+  // The constant path requires that sliced axes have static dimensions.
+  // Dynamic dims (0 placeholders) break PrepareForComputeMetadata's clamping logic.
+  // However, if only non-sliced axes are dynamic, the constant path still works because
+  // PrepareForComputeMetadata only uses input_shape[axis] for the sliced axes.
+  bool can_use_constant_path = is_constant_starts && is_constant_ends;
+  if (can_use_constant_path && HasDynamicShape(input_shape)) {
+    // Check if all sliced axes have static dims.
+    std::vector<int64_t> axes;
+    const std::string axes_name = GetTensorName(input_defs, 3);
+    if (!axes_name.empty()) {
+      const auto* axes_init = graph_viewer.GetConstantInitializer(axes_name);
+      if (axes_init) {
+        ReadIntArrayFrom1DTensor(*axes_init, axes, graph_viewer, logger);
+      }
+    }
+    if (axes.empty()) {
+      // Default: all axes are sliced — need all dims static.
+      can_use_constant_path = false;
+    } else {
+      const int64_t rank = static_cast<int64_t>(input_shape.size());
+      for (auto axis : axes) {
+        if (axis < 0) axis += rank;
+        if (axis >= 0 && axis < rank && input_shape[static_cast<size_t>(axis)] <= 0) {
+          can_use_constant_path = false;
+          break;
+        }
+      }
+    }
+  }
 
   emscripten::val output = emscripten::val::undefined();
 
-  if (is_constant_starts && is_constant_ends && !has_dynamic_input) {
+  if (can_use_constant_path) {
     ORT_RETURN_IF_ERROR(BuildConstantSlice(model_builder, node, input, input_shape, output, logger));
   } else {
     ORT_RETURN_IF_ERROR(BuildDynamicSlice(model_builder, node, input, input_shape, output, logger));

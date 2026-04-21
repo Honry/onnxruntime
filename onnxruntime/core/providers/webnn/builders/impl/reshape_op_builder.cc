@@ -86,33 +86,68 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
           new_shape.call<void>("push", input["shape"][static_cast<uint32_t>(i)]);
         } else if (target_shape[i] == -1) {
           // Only reached when has_dynamic_input (ReshapeHelper resolves -1 otherwise).
-          // Use the output shape proto's dim_param/dim_value if available so that all Reshape
-          // nodes inferring the same symbolic dimension share the same dim descriptor name.
-          // This is critical for downstream ops (e.g., GQA) that broadcast between tensors
-          // from different Reshape outputs — mismatched dim descriptor names cause GPU crashes.
-          const auto* output_shape_proto = node.OutputDefs()[0]->Shape();
-          if (output_shape_proto && static_cast<int>(i) < output_shape_proto->dim_size()) {
-            const auto& dim = output_shape_proto->dim(static_cast<int>(i));
-            if (dim.has_dim_value()) {
-              // Output dim is statically known despite dynamic input.
-              uint32_t dim_value = SafeInt<uint32_t>(dim.dim_value());
-              new_shape.call<void>("push", dim_value);
-            } else if (dim.has_dim_param()) {
-              // Use the symbolic dim name from the model's shape annotations.
-              emscripten::val dim_desc = emscripten::val::object();
-              dim_desc.set("name", emscripten::val(dim.dim_param()));
-              new_shape.call<void>("push", dim_desc);
+          //
+          // Try to reuse an input dim descriptor instead of creating a new one.
+          // When reshape merely splits/merges static dimensions (e.g., [B, S, 3840] → [B, S, 30, 128]),
+          // the -1 dim is mathematically equal to an existing input dimension. Reusing that input's
+          // dim descriptor preserves static dim info.
+          bool reused_dim = false;
+
+          // Find the single unclaimed dynamic input dim and compute static products.
+          std::vector<bool> claimed(input_shape.size(), false);
+          for (size_t t = 0; t < static_cast<size_t>(size); ++t) {
+            if (target_shape[t] == 0 && t < input_shape.size()) {
+              claimed[t] = true;
+            }
+          }
+
+          int64_t static_target_product = 1;
+          for (size_t t = 0; t < static_cast<size_t>(size); ++t) {
+            if (target_shape[t] > 0) {
+              static_target_product *= target_shape[t];
+            }
+          }
+
+          int64_t static_input_product = 1;
+          int unclaimed_dynamic_count = 0;
+          int unclaimed_dynamic_idx = -1;
+          for (size_t j = 0; j < input_shape.size(); ++j) {
+            if (claimed[j]) continue;
+            if (input_shape[j] <= 0) {
+              unclaimed_dynamic_count++;
+              unclaimed_dynamic_idx = static_cast<int>(j);
             } else {
-              // No dim info available; fall back to a unique name.
+              static_input_product *= input_shape[j];
+            }
+          }
+
+          if (unclaimed_dynamic_count == 1 && static_input_product == static_target_product) {
+            // Direct case: -1 equals the single unclaimed dynamic input dim. Reuse its descriptor.
+            new_shape.call<void>("push", input["shape"][static_cast<uint32_t>(unclaimed_dynamic_idx)]);
+            reused_dim = true;
+          }
+
+          if (!reused_dim) {
+            // Fall back: use the output shape proto's dim_param/dim_value if available so that all
+            // Reshape nodes inferring the same symbolic dimension share the same dim descriptor name.
+            const auto* output_shape_proto = node.OutputDefs()[0]->Shape();
+            if (output_shape_proto && static_cast<int>(i) < output_shape_proto->dim_size()) {
+              const auto& dim = output_shape_proto->dim(static_cast<int>(i));
+              if (dim.has_dim_value()) {
+                uint32_t dim_value = SafeInt<uint32_t>(dim.dim_value());
+                new_shape.call<void>("push", dim_value);
+              } else {
+                std::string new_dim_name = dim.has_dim_param() ? dim.dim_param()
+                                                               : node.Name() + "_inferred";
+                emscripten::val dim_desc = emscripten::val::object();
+                dim_desc.set("name", emscripten::val(new_dim_name));
+                new_shape.call<void>("push", dim_desc);
+              }
+            } else {
               emscripten::val dim_desc = emscripten::val::object();
               dim_desc.set("name", emscripten::val(node.Name() + "_inferred"));
               new_shape.call<void>("push", dim_desc);
             }
-          } else {
-            // No output shape proto; fall back to a unique name.
-            emscripten::val dim_desc = emscripten::val::object();
-            dim_desc.set("name", emscripten::val(node.Name() + "_inferred"));
-            new_shape.call<void>("push", dim_desc);
           }
         } else {
           uint32_t dim_value = SafeInt<uint32_t>(target_shape[i]);

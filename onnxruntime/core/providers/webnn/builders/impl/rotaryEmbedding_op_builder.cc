@@ -125,7 +125,8 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
       head_size = hidden_size / num_heads;
     } else {
       if (num_heads == 0) {
-        head_size = static_cast<uint32_t>(cos_cache_shape[1]) * 2;
+        // Per MS RotaryEmbedding spec, cos_cache shape is [max_seq, head_size/2].
+        head_size = static_cast<uint32_t>(cos_cache_shape.back()) * 2;
         num_heads = hidden_size / head_size;
       } else {
         head_size = hidden_size / num_heads;
@@ -135,6 +136,43 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
 
   if (rotary_embedding_dim == 0) {
     rotary_embedding_dim = head_size;
+  }
+
+  // The cos/sin cache should have shape [max_seq, head_size/2] per the spec.
+  // However, some models provide [max_seq, head_size] (full width).
+  // Detect this by comparing cos_cache's last dim with head_size:
+  //   - If cos_cache_last == head_size (and head_size > 1): full-width cache, split to half.
+  //   - If cos_cache_last == head_size/2: already half-width, no action needed.
+  const uint32_t half_rotary_embedding_dim = rotary_embedding_dim / 2;
+  const uint32_t cos_cache_last_dim = static_cast<uint32_t>(cos_cache_shape.back());
+  if (cos_cache_last_dim == head_size && cos_cache_last_dim > half_rotary_embedding_dim) {
+    // Cache stores full head_size values (e.g., [max_seq, 128] when head_size=128).
+    // Split the last axis and take the first half to get [max_seq, 64].
+    const uint32_t last_axis = static_cast<uint32_t>(cos_cache_shape.size() - 1);
+    const std::vector<uint32_t> split_sizes{half_rotary_embedding_dim,
+                                            cos_cache_last_dim - half_rotary_embedding_dim};
+
+    emscripten::val split_cos_options = emscripten::val::object();
+    split_cos_options.set("label", node_name + "_split_cos_cache_half");
+    split_cos_options.set("axis", last_axis);
+    emscripten::val split_cos = wnn_builder.call<emscripten::val>(
+        "split", cos_cache, emscripten::val::array(split_sizes), split_cos_options);
+    cos_cache = split_cos[0];
+
+    emscripten::val split_sin_options = emscripten::val::object();
+    split_sin_options.set("label", node_name + "_split_sin_cache_half");
+    split_sin_options.set("axis", last_axis);
+    emscripten::val split_sin = wnn_builder.call<emscripten::val>(
+        "split", sin_cache, emscripten::val::array(split_sizes), split_sin_options);
+    sin_cache = split_sin[0];
+
+    // If head_size was derived from cos_cache (num_heads==0 case), it was computed as
+    // cos_cache_last*2 which is wrong for full-width cache. Correct it.
+    if (!input_is_4d && !is_onnx_domain && head_size == cos_cache_last_dim * 2) {
+      head_size = cos_cache_last_dim;
+      num_heads = hidden_size / head_size;
+      rotary_embedding_dim = head_size;
+    }
   }
 
   emscripten::val transpose_options = emscripten::val::object();
