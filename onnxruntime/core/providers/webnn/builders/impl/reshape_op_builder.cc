@@ -221,9 +221,10 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       output = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, options);
     }
   } else {
-    // Operand shape path: use dynamicReshape with the shape operand.
+    // Operand shape path: shape is a non-constant operand. Use dynamicReshape.
     emscripten::val shape_operand = model_builder.GetOperand(input_defs[1]->Name());
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicReshape", input, shape_operand, options);
+    output = model_builder.GetBuilder().call<emscripten::val>(
+        "dynamicReshape", input, shape_operand, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));

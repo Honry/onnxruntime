@@ -696,6 +696,15 @@ bool EinsumOpBuilder::IsOpSupportedImpl(const GraphViewer&,
                                         const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
 
+  // Einsum's decomposition uses shape arithmetic that doesn't support dynamic dims.
+  for (size_t i = 0; i < input_defs.size(); ++i) {
+    std::vector<int64_t> shape;
+    if (GetShape(*input_defs[i], shape, logger) && HasDynamicShape(shape)) {
+      LOGS(logger, VERBOSE) << "Einsum does not support dynamic shapes";
+      return false;
+    }
+  }
+
   NodeAttrHelper helper(node);
   const auto equation = helper.Get("equation", std::string(" "));
   std::vector<uint32_t> label_indices;

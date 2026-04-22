@@ -132,6 +132,10 @@ bool GruOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node
     LOGS(logger, ERROR) << "Cannot get input's shape";
     return false;
   }
+  if (input_shape[0] <= 0) {
+    LOGS(logger, VERBOSE) << "GRU: dynamic sequence length is not supported";
+    return false;
+  }
   int32_t steps = static_cast<int32_t>(input_shape[0]);
 
   if (TensorExists(input_defs, 4)) {

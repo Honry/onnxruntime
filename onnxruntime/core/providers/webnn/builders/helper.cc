@@ -110,10 +110,12 @@ bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_n
 
   for (const auto& dim : shape_proto->dim()) {
     // Dynamic dimensions are supported for graph inputs/outputs.
+    // Skip dims without a concrete value (dim_param-based dynamic dims) — dim.dim_value()
+    // returns proto default 0 for these, which would otherwise trigger the empty-tensor reject.
     if (!dim.has_dim_value()) {
-      LOGS(logger, VERBOSE) << "Dynamic shape is detected, dim_param: " << dim.dim_param()
-                            << " for node arg: " << node_arg_name;
-    } else if (dim.dim_value() == 0 && !allow_empty_input) {
+      continue;
+    }
+    if (dim.dim_value() == 0 && !allow_empty_input) {
       LOGS(logger, VERBOSE) << "The shape of [" << node_arg_name << "] has 0 dimension which is not supported by WebNN";
       return false;
     }

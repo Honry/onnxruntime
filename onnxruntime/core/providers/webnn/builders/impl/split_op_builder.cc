@@ -89,7 +89,9 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     }
 
     // Check that the splits evenly divide.
-    if (split_count > 0 && splits.empty() && input_shape[axis] % split_count != 0) {
+    // When axis dim is dynamic (0 from GetShape), skip uneven-split computation;
+    // WebNN split with split_count will handle even division at runtime.
+    if (split_count > 0 && splits.empty() && input_shape[axis] > 0 && input_shape[axis] % split_count != 0) {
       // Divide inputs into variable size outputs:
       splits.insert(splits.end(), split_count - 1, SafeInt<uint32_t>(input_shape[axis]) / split_count);
       splits.insert(splits.end(), SafeInt<uint32_t>(input_shape[axis]) % split_count);
@@ -174,7 +176,7 @@ bool SplitOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
       }
       sum += split_value;
     }
-    if (sum != input_shape[axis]) {
+    if (sum != input_shape[axis] && input_shape[axis] > 0) {
       LOGS(logger, VERBOSE) << "Sum of the split's values must be equal to the dim value at 'axis' specified.";
       return false;
     }

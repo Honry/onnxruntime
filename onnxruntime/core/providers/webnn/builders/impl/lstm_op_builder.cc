@@ -138,6 +138,10 @@ bool LstmOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer, const Nod
     LOGS(logger, ERROR) << "Cannot get input's shape";
     return false;
   }
+  if (input_shape[0] <= 0) {
+    LOGS(logger, VERBOSE) << "LSTM: dynamic sequence length is not supported";
+    return false;
+  }
   int32_t steps = static_cast<int32_t>(input_shape[0]);
 
   if (TensorExists(input_defs, 4)) {
