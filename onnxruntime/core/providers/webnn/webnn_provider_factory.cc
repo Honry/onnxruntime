@@ -88,6 +88,8 @@ struct WebNNProviderFactory : IExecutionProviderFactory {
   ~WebNNProviderFactory() override {}
 
   std::unique_ptr<IExecutionProvider> CreateProvider() override;
+  std::unique_ptr<IExecutionProvider> CreateProvider(const OrtSessionOptions& session_options,
+                                                     const OrtLogger& session_logger) override;
 
   std::string webnn_device_flags_;
   webnn::FreeDimensionBounds free_dimension_bounds_;
@@ -95,6 +97,31 @@ struct WebNNProviderFactory : IExecutionProviderFactory {
 
 std::unique_ptr<IExecutionProvider> WebNNProviderFactory::CreateProvider() {
   return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, free_dimension_bounds_);
+}
+
+std::unique_ptr<IExecutionProvider> WebNNProviderFactory::CreateProvider(
+    const OrtSessionOptions& session_options,
+    const OrtLogger& /*session_logger*/) {
+  // Merge session-level freeDimensionOverrides into FreeDimensionBounds so the EP can resolve
+  // output dimensions whose dim_param was replaced on inputs by FreeDimensionOverrideTransformer.
+  webnn::FreeDimensionBounds merged_bounds = free_dimension_bounds_;
+  for (const auto& dim_override : session_options.value.free_dimension_overrides) {
+    if (dim_override.dim_identifier_type != FreeDimensionOverrideType::Name) {
+      continue;
+    }
+    // Skip if explicit FreeDimensionBounds already provides a fixed value (min == max) for this dim.
+    // If bounds specify a range (min != max), the override takes precedence because
+    // FreeDimensionOverrideTransformer already replaced the input dim_param with a concrete value,
+    // so the EP needs a fixed value to resolve output dimensions.
+    auto it = merged_bounds.find(dim_override.dim_identifier);
+    if (it != merged_bounds.end() && it->second.min_size == it->second.max_size) {
+      continue;
+    }
+    int32_t value = static_cast<int32_t>(std::min<int64_t>(dim_override.dim_value,
+                                                            std::numeric_limits<int32_t>::max()));
+    merged_bounds[dim_override.dim_identifier] = webnn::FreeDimensionBound{value, value};
+  }
+  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, merged_bounds);
 }
 
 std::shared_ptr<IExecutionProviderFactory> WebNNProviderFactoryCreator::Create(

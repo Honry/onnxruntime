@@ -4,6 +4,10 @@
 
 #include "webnn_execution_provider.h"
 
+#include <cerrno>
+#include <cstdlib>
+
+#include "core/common/string_utils.h"
 #include "core/framework/compute_capability.h"
 #include "core/framework/data_transfer_manager.h"
 #include "core/framework/memcpy.h"
@@ -225,6 +229,21 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       }
     }
 
+    // Build fixed symbolic dimension values from FreeDimensionBounds where min == max.
+    // These can safely be used as runtime allocation dimensions when a dim_param cannot
+    // be traced back to any fused-node input.
+    InlinedHashMap<std::string, int64_t> fixed_dim_param_values;
+    {
+      fixed_dim_param_values.reserve(free_dimension_bounds_.size());
+      for (const auto& kvp : free_dimension_bounds_) {
+        const auto& dim_name = kvp.first;
+        const auto& bound = kvp.second;
+        if (bound.max_size > 0 && bound.min_size == bound.max_size) {
+          fixed_dim_param_values.emplace(dim_name, static_cast<int64_t>(bound.max_size));
+        }
+      }
+    }
+
     // Record output shapes and symbolic dimensions in fused-node output order.
     std::vector<std::vector<int64_t>> fused_output_shapes;
     std::vector<std::vector<std::string>> output_dim_params;
@@ -264,7 +283,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       ORT_UNUSED_PARAMETER(state);
     };
 
-    compute_info.compute_func = [dim_param_to_input_dim, fused_output_shapes, output_dim_params](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
+    compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
       Ort::KernelContext ctx(context);
 
       const size_t num_inputs = ctx.GetInputCount();
@@ -345,13 +364,32 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                 continue;
               }
 
+              // Fall back to fixed FreeDimensionBounds value if available.
+              auto fixed_it = fixed_dim_param_values.find(dim_param);
+              if (fixed_it != fixed_dim_param_values.end()) {
+                output_shape[dim_idx] = fixed_it->second;
+                continue;
+              }
+
               // Try to parse expressions like "N*dim_param" or "dim_param*N" (e.g., "8*latent_height").
               // These arise from symbolic shape inference simplification.
               {
                 auto star_pos = dim_param.find('*');
                 if (star_pos != std::string::npos) {
-                  std::string left = dim_param.substr(0, star_pos);
-                  std::string right = dim_param.substr(star_pos + 1);
+                  const std::string left = utils::TrimString(std::string_view(dim_param).substr(0, star_pos));
+                  const std::string right = utils::TrimString(std::string_view(dim_param).substr(star_pos + 1));
+
+                  // Non-throwing integer parse (std::stoll throws, but WASM builds may have
+                  // exception catching disabled outside the API layer).
+                  auto try_parse_int64 = [](const std::string& s, int64_t& out) -> bool {
+                    if (s.empty()) return false;
+                    char* end = nullptr;
+                    errno = 0;
+                    long long val = std::strtoll(s.c_str(), &end, 10);
+                    if (end == s.c_str() || *end != '\0' || errno == ERANGE) return false;
+                    out = static_cast<int64_t>(val);
+                    return true;
+                  };
 
                   // Determine which part is the factor and which is the base dim_param.
                   int64_t factor = 0;
@@ -359,21 +397,15 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                   bool parsed = false;
 
                   // Try left as factor, right as dim_param.
-                  try {
-                    factor = std::stoll(left);
+                  if (try_parse_int64(left, factor)) {
                     base_param = right;
                     parsed = true;
-                  } catch (...) {
                   }
 
                   // Try right as factor, left as dim_param.
-                  if (!parsed) {
-                    try {
-                      factor = std::stoll(right);
-                      base_param = left;
-                      parsed = true;
-                    } catch (...) {
-                    }
+                  if (!parsed && try_parse_int64(right, factor)) {
+                    base_param = left;
+                    parsed = true;
                   }
 
                   if (parsed && factor > 0) {
@@ -384,6 +416,11 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                       if (src_idx < runtime_input_shapes.size() &&
                           src_dim < runtime_input_shapes[src_idx].size()) {
                         output_shape[dim_idx] = factor * runtime_input_shapes[src_idx][src_dim];
+                      }
+                    } else {
+                      auto fixed_base_it = fixed_dim_param_values.find(base_param);
+                      if (fixed_base_it != fixed_dim_param_values.end()) {
+                        output_shape[dim_idx] = factor * fixed_base_it->second;
                       }
                     }
                   }
