@@ -331,27 +331,73 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                 continue;
               }
 
-              const auto it = dim_param_to_input_dim.find(dim_param);
-              if (it == dim_param_to_input_dim.end()) {
+              // First try exact match.
+              auto it = dim_param_to_input_dim.find(dim_param);
+              if (it != dim_param_to_input_dim.end()) {
+                const size_t source_input_idx = it->second.first;
+                const size_t source_dim_idx = it->second.second;
+                if (source_input_idx < runtime_input_shapes.size()) {
+                  const auto& source_shape = runtime_input_shapes[source_input_idx];
+                  if (source_dim_idx < source_shape.size()) {
+                    output_shape[dim_idx] = source_shape[source_dim_idx];
+                  }
+                }
                 continue;
               }
 
-              const size_t source_input_idx = it->second.first;
-              const size_t source_dim_idx = it->second.second;
-              if (source_input_idx >= runtime_input_shapes.size()) {
-                continue;
-              }
+              // Try to parse expressions like "N*dim_param" or "dim_param*N" (e.g., "8*latent_height").
+              // These arise from symbolic shape inference simplification.
+              {
+                auto star_pos = dim_param.find('*');
+                if (star_pos != std::string::npos) {
+                  std::string left = dim_param.substr(0, star_pos);
+                  std::string right = dim_param.substr(star_pos + 1);
 
-              const auto& source_shape = runtime_input_shapes[source_input_idx];
-              if (source_dim_idx >= source_shape.size()) {
-                continue;
-              }
+                  // Determine which part is the factor and which is the base dim_param.
+                  int64_t factor = 0;
+                  std::string base_param;
+                  bool parsed = false;
 
-              output_shape[dim_idx] = source_shape[source_dim_idx];
+                  // Try left as factor, right as dim_param.
+                  try {
+                    factor = std::stoll(left);
+                    base_param = right;
+                    parsed = true;
+                  } catch (...) {
+                  }
+
+                  // Try right as factor, left as dim_param.
+                  if (!parsed) {
+                    try {
+                      factor = std::stoll(right);
+                      base_param = left;
+                      parsed = true;
+                    } catch (...) {
+                    }
+                  }
+
+                  if (parsed && factor > 0) {
+                    auto base_it = dim_param_to_input_dim.find(base_param);
+                    if (base_it != dim_param_to_input_dim.end()) {
+                      const size_t src_idx = base_it->second.first;
+                      const size_t src_dim = base_it->second.second;
+                      if (src_idx < runtime_input_shapes.size() &&
+                          src_dim < runtime_input_shapes[src_idx].size()) {
+                        output_shape[dim_idx] = factor * runtime_input_shapes[src_idx][src_dim];
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
 
           // Hard fail if dynamic dimensions remain unresolved.
+          // TODO: When WebNN supports the dispatch() API that returns output MLTensors with
+          // shapes inferred from actual input tensors, we can query the real output shapes
+          // at runtime instead of relying on symbolic dim_param matching. This would eliminate
+          // the need for the simplify_dynamic_shapes.py preprocessing step and handle all
+          // dynamic shape cases natively (including data-dependent output shapes).
           for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
             if (output_shape[dim_idx] == 0) {
               std::string unresolved_dim_param;
