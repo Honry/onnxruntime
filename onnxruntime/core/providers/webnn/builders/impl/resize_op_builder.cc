@@ -209,10 +209,27 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   if (!sizes_name.empty() && !is_constant_sizes) {
     // Dynamic sizes path: use dynamicResample2d with the sizes operand.
+    // When axes is not specified (pre-opset 18), sizes has 4 elements [N, C, H, W].
+    // WebNN dynamicResample2d expects sizes length to match the number of axes (2 for spatial).
+    // Default to spatial axes and slice the sizes operand to extract spatial dims.
+    if (axes.empty()) {
+      axes = {2, 3};
+    }
     std::vector<uint32_t> webnn_axes = GetNarrowedIntFromInt64<uint32_t>(axes);
     options.set("axes", emscripten::val::array(webnn_axes));
 
     emscripten::val sizes_operand = model_builder.GetOperand(input_defs[3]->Name());
+
+    // Slice sizes operand to extract only the spatial dimensions when the original has 4 elements.
+    std::vector<int64_t> sizes_shape;
+    if (GetShape(*input_defs[3], sizes_shape, logger) && !sizes_shape.empty() && sizes_shape[0] == 4) {
+      emscripten::val wnn_builder = model_builder.GetBuilder();
+      sizes_operand = wnn_builder.call<emscripten::val>(
+          "slice", sizes_operand,
+          emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(axes[0])}),
+          emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(webnn_axes.size())}));
+    }
+
     output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, sizes_operand, options);
   } else {
     // Constant path: resolve scales/sizes at build time and use WebNN resample2d.

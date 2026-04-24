@@ -192,9 +192,14 @@ inline bool ReadScalarTensorData(const onnx::TensorProto& tensor, emscripten::va
 }
 
 inline bool IsEmptyTensor(const GraphViewer& graph_viewer, const std::string& name) {
-  const auto* tensor_init = graph_viewer.GetConstantInitializer(name);
-  if (name.empty() || !tensor_init) {
+  if (name.empty()) {
     return true;
+  }
+
+  const auto* tensor_init = graph_viewer.GetConstantInitializer(name);
+  if (!tensor_init) {
+    // Non-constant operand (dynamic input) is not empty — it has data at runtime.
+    return false;
   }
 
   const auto& tensor = *tensor_init;
