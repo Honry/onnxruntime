@@ -12,6 +12,7 @@
 #include "core/framework/data_transfer_manager.h"
 #include "core/framework/memcpy.h"
 #include "core/framework/kernel_registry.h"
+#include "core/framework/op_kernel_context_internal.h"
 #include "core/graph/graph_viewer.h"
 #include "core/session/onnxruntime_cxx_api.h"
 #include "core/providers/webnn/allocator.h"
@@ -429,6 +430,32 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
             }
           }
 
+          // Fallback: if any dynamic dimensions remain unresolved, try to read the shape from
+          // a pre-allocated output tensor (provided via session.run(feeds, fetches)).
+          {
+            bool has_unresolved = false;
+            for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
+              if (output_shape[dim_idx] == 0) {
+                has_unresolved = true;
+                break;
+              }
+            }
+            if (has_unresolved) {
+              auto* internal_ctx = reinterpret_cast<OpKernelContextInternal*>(context);
+              OrtValue* pre_alloc = internal_ctx->GetOutputMLValue(static_cast<int>(output_idx));
+              if (pre_alloc != nullptr && pre_alloc->IsAllocated() && pre_alloc->IsTensor()) {
+                const auto& pre_alloc_shape = pre_alloc->Get<Tensor>().Shape().GetDims();
+                if (pre_alloc_shape.size() == output_shape.size()) {
+                  for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
+                    if (output_shape[dim_idx] == 0 && pre_alloc_shape[dim_idx] > 0) {
+                      output_shape[dim_idx] = pre_alloc_shape[dim_idx];
+                    }
+                  }
+                }
+              }
+            }
+          }
+
           // Hard fail if dynamic dimensions remain unresolved.
           // TODO: When WebNN supports the dispatch() API that returns output MLTensors with
           // shapes inferred from actual input tensors, we can query the real output shapes
@@ -445,7 +472,8 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
               LOGS_DEFAULT(ERROR) << "[WebNN] Failed to resolve dynamic output dimension for output ["
                                   << output_name << "] at dim index [" << dim_idx
                                   << "], dim_param: [" << unresolved_dim_param
-                                  << "]. Please ensure this dim_param can be inferred from graph inputs.";
+                                  << "]. Please ensure this dim_param can be inferred from graph inputs"
+                                  << " or provide pre-allocated output tensors via session.run(feeds, fetches).";
               return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
                                      "[WebNN] Failed to resolve dynamic output dimension for output: ", output_name,
                                      " at dim index: ", dim_idx,
