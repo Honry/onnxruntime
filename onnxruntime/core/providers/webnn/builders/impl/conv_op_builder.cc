@@ -77,12 +77,14 @@ common::Status SetConvBaseOptions(ModelBuilder& model_builder,
     }
     options.set("outputPadding", emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(output_padding)));
 
-    if (has_dynamic_spatial &&
-        (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type)) {
-      // When spatial dims are dynamic, use WebNN's native autoPad.
-      options.set("autoPad", emscripten::val(auto_pad_type == AutoPadType::SAME_UPPER
-                                                 ? "same-upper"
-                                                 : "same-lower"));
+    if (has_dynamic_spatial) {
+      // When spatial dims are dynamic, WebNN doesn't support outputSizes.
+      // Use explicit pads directly and let WebNN infer the output shape.
+      if (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type) {
+        options.set("autoPad", emscripten::val(auto_pad_type == AutoPadType::SAME_UPPER
+                                                   ? "same-upper"
+                                                   : "same-lower"));
+      }
     } else {
       // If output shape is explicitly provided, compute the pads.
       // Otherwise compute the output shape, as well as the pads if the auto_pad attribute is SAME_UPPER/SAME_LOWER.
