@@ -56,15 +56,17 @@ Status ExpandOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   const auto& initializers(model_builder.GetInitializerTensors());
   const bool is_constant_shape = initializers.count(input_defs[1]->Name()) > 0;
 
+  std::vector<int64_t> input_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input's shape.");
+  const bool is_dynamic_input = HasDynamicShape(input_shape);
+
   emscripten::val output = emscripten::val::undefined();
-  if (is_constant_shape) {
+  if (is_constant_shape && !is_dynamic_input) {
     // Constant shape path: compute broadcast shape at build time and use WebNN expand.
     const auto& shape_tensor = *initializers.at(input_defs[1]->Name());
     std::vector<int64_t> new_shape;
     ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(shape_tensor, new_shape, model_builder.GetGraphViewer(), logger),
                       "Cannot get shape.");
-    std::vector<int64_t> input_shape;
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input's shape.");
 
     std::vector<int64_t> output_shape;
     ORT_RETURN_IF_NOT(GetBidirectionalBroadcastShape(input_shape, new_shape, output_shape),
