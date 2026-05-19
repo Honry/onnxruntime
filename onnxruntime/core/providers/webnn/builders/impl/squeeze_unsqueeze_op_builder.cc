@@ -2,6 +2,8 @@
 // Copyright (c) Intel Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <set>
+
 #include "core/providers/common.h"
 #include "core/providers/shared/utils/utils.h"
 #include "core/providers/webnn/builders/helper.h"
@@ -136,46 +138,18 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
     emscripten::val wnn_builder = model_builder.GetBuilder();
 
     if (op_type == "Squeeze") {
-      // Use shape() + slice/concat + dynamicReshape to remove the squeezed axes.
-      emscripten::val shape_operand = wnn_builder.call<emscripten::val>(
-          "shape", input, emscripten::val::object());
-
-      // Build segments of the shape tensor that skip the squeezed axis indices.
-      // E.g., input_rank=5, axes=[1,3] → segments: shape[0:1], shape[2:1], shape[4:1]
-      std::vector<emscripten::val> segments;
-      int32_t prev = 0;
-      for (int32_t axis : axes_data) {
-        if (axis > prev) {
-          emscripten::val starts = emscripten::val::array();
-          starts.call<void>("push", prev);
-          emscripten::val sizes = emscripten::val::array();
-          sizes.call<void>("push", axis - prev);
-          segments.push_back(wnn_builder.call<emscripten::val>("slice", shape_operand, starts, sizes));
+      // Use static reshape() to remove the squeezed axes.
+      // Read each kept dimension from input["shape"][i] which returns:
+      // - A uint32_t for static dims
+      // - A dim descriptor object for dynamic dims
+      emscripten::val new_shape = emscripten::val::array();
+      std::set<int32_t> axes_set(axes_data.begin(), axes_data.end());
+      for (size_t i = 0; i < input_rank; ++i) {
+        if (axes_set.count(static_cast<int32_t>(i)) == 0) {
+          new_shape.call<void>("push", input["shape"][i]);
         }
-        prev = axis + 1;
       }
-      if (prev < static_cast<int32_t>(input_rank)) {
-        emscripten::val starts = emscripten::val::array();
-        starts.call<void>("push", prev);
-        emscripten::val sizes = emscripten::val::array();
-        sizes.call<void>("push", static_cast<int32_t>(input_rank) - prev);
-        segments.push_back(wnn_builder.call<emscripten::val>("slice", shape_operand, starts, sizes));
-      }
-
-      // Concatenate segments into the new shape tensor and use dynamicReshape.
-      emscripten::val new_shape_operand;
-      if (segments.size() == 1) {
-        new_shape_operand = std::move(segments[0]);
-      } else {
-        emscripten::val inputs_array = emscripten::val::array();
-        for (auto& seg : segments) {
-          inputs_array.call<void>("push", seg);
-        }
-        emscripten::val concat_options = emscripten::val::object();
-        concat_options.set("label", node.Name() + std::string("_concat_shape"));
-        new_shape_operand = wnn_builder.call<emscripten::val>("concat", inputs_array, 0, concat_options);
-      }
-      output = wnn_builder.call<emscripten::val>("dynamicReshape", input, new_shape_operand, options);
+      output = wnn_builder.call<emscripten::val>("reshape", input, new_shape, options);
     } else {  // Unsqueeze
       // For Unsqueeze, build the new shape as a JS array by reading the input operand's
       // dimension values and inserting literal 1s at the specified axes.
