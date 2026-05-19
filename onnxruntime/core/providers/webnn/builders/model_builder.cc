@@ -273,10 +273,12 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
         shape_array.call<void>("push", dim_value);
       } else {
         // Dynamic dimension: create an object with symbolic name for WebNN.
-        const auto dim_name = dim.dim_param();
-        ORT_RETURN_IF(dim_name.empty(),
-                      "Dynamic dimension with empty dim_param for ", input_output_type, ": ", name,
-                      ". Cannot create WebNN descriptor without a symbolic dimension name.");
+        std::string dim_name = dim.dim_param();
+        if (dim_name.empty()) {
+          // ORT's shape inference may produce dynamic dims without a dim_param.
+          // Generate a synthetic name based on the tensor name and dimension index.
+          dim_name = name + "_dim_" + std::to_string(shape_array["length"].as<uint32_t>());
+        }
 
         emscripten::val dim_obj = emscripten::val::object();
         dim_obj.set("name", emscripten::val(dim_name));
