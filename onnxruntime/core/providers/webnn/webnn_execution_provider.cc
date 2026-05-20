@@ -262,7 +262,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
             shape.reserve(dims.size());
             params.reserve(dims.size());
             for (const auto& dim : dims) {
-              shape.push_back(dim.has_dim_value() ? dim.dim_value() : 0);
+              shape.push_back(dim.has_dim_value() ? dim.dim_value() : webnn::kDynamicDim);
               params.push_back((!dim.has_dim_value() && dim.has_dim_param()) ? dim.dim_param() : "");
             }
           }
@@ -342,7 +342,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
             const size_t dims_to_resolve = output_shape.size() < dim_params.size() ? output_shape.size() : dim_params.size();
 
             for (size_t dim_idx = 0; dim_idx < dims_to_resolve; ++dim_idx) {
-              if (output_shape[dim_idx] != 0) {
+              if (output_shape[dim_idx] != webnn::kDynamicDim) {
                 continue;
               }
 
@@ -435,7 +435,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
           {
             bool has_unresolved = false;
             for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
-              if (output_shape[dim_idx] == 0) {
+              if (output_shape[dim_idx] == webnn::kDynamicDim) {
                 has_unresolved = true;
                 break;
               }
@@ -447,7 +447,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                 const auto& pre_alloc_shape = pre_alloc->Get<Tensor>().Shape().GetDims();
                 if (pre_alloc_shape.size() == output_shape.size()) {
                   for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
-                    if (output_shape[dim_idx] == 0 && pre_alloc_shape[dim_idx] > 0) {
+                    if (output_shape[dim_idx] == webnn::kDynamicDim && pre_alloc_shape[dim_idx] > 0) {
                       output_shape[dim_idx] = pre_alloc_shape[dim_idx];
                     }
                   }
@@ -463,7 +463,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
           // the need for the simplify_dynamic_shapes.py preprocessing step and handle all
           // dynamic shape cases natively (including data-dependent output shapes).
           for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
-            if (output_shape[dim_idx] == 0) {
+            if (output_shape[dim_idx] == webnn::kDynamicDim) {
               std::string unresolved_dim_param;
               if (output_idx < output_dim_params.size() && dim_idx < output_dim_params[output_idx].size()) {
                 unresolved_dim_param = output_dim_params[output_idx][dim_idx];

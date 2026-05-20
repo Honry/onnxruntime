@@ -319,12 +319,12 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
       mask[d] = 1;
     }
     // Non-sliced axes: start=0, end=dim (full range).
-    // For dynamic dims (0 placeholder), use INT32_MAX so dynamicSlice clamps to actual size.
+    // For dynamic dims (-1 placeholder), use INT32_MAX so dynamicSlice clamps to actual size.
     std::vector<int64_t> starts_default(rank, 0);
     std::vector<int64_t> ends_default(rank);
     for (size_t d = 0; d < rank; ++d) {
-      ends_default[d] = input_shape[d] != 0 ? input_shape[d]
-                                             : static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+      ends_default[d] = input_shape[d] > 0 ? input_shape[d]
+                                           : static_cast<int64_t>(std::numeric_limits<int32_t>::max());
     }
 
     const emscripten::val& gather_idx_const = model_builder.CreateOrGetConstant<int32_t>(
@@ -415,7 +415,7 @@ bool SliceOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer, const No
   const std::string ends_name = input_defs[2]->Name();
   const bool is_constant_starts = graph_viewer.GetConstantInitializer(starts_name) != nullptr;
   const bool is_constant_ends = graph_viewer.GetConstantInitializer(ends_name) != nullptr;
-  const bool has_dynamic_input = HasDynamicShape(*input_defs[0], logger);
+  const bool has_dynamic_input = HasDynamicShape(*input_defs[0]);
 
   if (is_constant_starts && is_constant_ends && !has_dynamic_input) {
     // Constant path: axes and steps must also be constant initializers if present.
@@ -473,7 +473,7 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
   // Use the static slice path only when starts/ends are constant AND input has no dynamic dims.
   // When input has dynamic dims, we must use dynamicSlice because static slice requires concrete
   // sizes at build time (which can't be computed from 0-placeholder dynamic dims).
-  const bool has_dynamic_input = HasDynamicShape(*input_defs[0], logger);
+  const bool has_dynamic_input = HasDynamicShape(*input_defs[0]);
   if (!has_dynamic_input && graph_viewer.GetConstantInitializer(starts_name) && graph_viewer.GetConstantInitializer(ends_name)) {
     const auto& input = *input_defs[0];
     std::vector<int64_t> input_shape;

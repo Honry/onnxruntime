@@ -197,7 +197,7 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
     // For models with dimensions greater than 4, the trailing dims are folded into one.
     constexpr size_t webnn_shape_rank = 4;
     if (input_shape.size() != webnn_shape_rank) {
-      // Build the 4D reshape target as a JS array. For dynamic dims (input_shape[i] <= 0)
+      // Build the 4D reshape target as a JS array. For dynamic dims (input_shape[i] == kDynamicDim)
       // we copy the original dim descriptor object from the input operand's shape; for
       // static dims we push the concrete unsigned value. This preserves the native dim
       // descriptors required by WebNN for downstream ops like conv2d.
@@ -230,7 +230,7 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
         }
         uint32_t folded = 1;
         for (size_t i = 3; i < input_shape.size(); ++i) {
-          ORT_RETURN_IF(input_shape[i] <= 0,
+          ORT_RETURN_IF(input_shape[i] == kDynamicDim,
                         "InstanceNormalization with dynamic dim at index ", i,
                         " cannot be folded into 4D for WebNN.");
           folded *= SafeInt<uint32_t>(input_shape[i]);
@@ -322,7 +322,7 @@ bool NormalizationOpBuilder::IsOpSupportedImpl(const GraphViewer&,
     std::vector<int64_t> input_shape;
     if (GetShape(*input_defs[0], input_shape, logger) && input_shape.size() > 4) {
       for (size_t i = 3; i < input_shape.size(); ++i) {
-        if (input_shape[i] <= 0) {
+        if (input_shape[i] == kDynamicDim) {
           LOGS(logger, VERBOSE) << "InstanceNormalization with dynamic dim at index " << i
                                 << " (rank > 4) is not supported";
           return false;

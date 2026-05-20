@@ -50,34 +50,20 @@ bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const loggin
     return false;
   }
 
-  // For dynamic dimensions, use 0 as placeholder.
+  // For dynamic dimensions, use kDynamicDim as placeholder.
   for (const auto& dim : shape_proto->dim()) {
     if (dim.has_dim_value()) {
       shape.push_back(dim.dim_value());
     } else {
       LOGS(logger, VERBOSE) << "NodeArg [" << node_arg.Name() << "] has dynamic dimension: " << dim.dim_param();
-      shape.push_back(0);
+      shape.push_back(kDynamicDim);
     }
   }
 
   return true;
 }
 
-bool HasDynamicShape(const NodeArg& node_arg, const logging::Logger& logger) {
-  const auto* shape_proto = node_arg.Shape();
-  if (!shape_proto) {
-    LOGS(logger, WARNING) << "NodeArg [" << node_arg.Name() << "] has no shape info";
-    return false;
-  }
 
-  for (const auto& dim : shape_proto->dim()) {
-    if (!dim.has_dim_value()) {
-      return true;
-    }
-  }
-
-  return false;
-}
 
 bool IsNodeSupported(const GraphViewer& graph_viewer, const Node& node, const WebnnDeviceType device_type,
                      const emscripten::val& wnn_limits, const logging::Logger& logger) {

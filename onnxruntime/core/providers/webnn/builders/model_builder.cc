@@ -378,8 +378,8 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
   const auto* shape_proto = node_arg.Shape();
   if (shape_proto) {
     for (const auto& dim : shape_proto->dim()) {
-      // For dynamic dimensions, store 0 since actual shape is determined at runtime.
-      shape.push_back(dim.has_dim_value() ? dim.dim_value() : 0);
+      // For dynamic dimensions, store kDynamicDim since actual shape is determined at runtime.
+      shape.push_back(dim.has_dim_value() ? dim.dim_value() : kDynamicDim);
     }
   }
   input_output_info_.emplace(name, OnnxTensorInfo{data_type, shape});

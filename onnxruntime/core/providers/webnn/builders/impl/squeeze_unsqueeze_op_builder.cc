@@ -218,7 +218,7 @@ bool SqueezeUnsqueezeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewe
   // Squeeze without explicit axes removes all dims that equal 1.
   // With dynamic shapes, we don't know which dims are 1 at build time.
   if (op_type == "Squeeze" && !has_explicit_axes) {
-    if (HasDynamicShape(*input_defs[0], logger)) {
+    if (HasDynamicShape(*input_defs[0])) {
       LOGS(logger, VERBOSE) << "Squeeze without explicit axes requires static input shape";
       return false;
     }

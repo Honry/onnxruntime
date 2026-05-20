@@ -69,7 +69,7 @@ Status ReductionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     std::vector<int64_t> axes_shape;
     if (TensorExists(input_defs, 1)) {
       ORT_RETURN_IF_NOT(GetShape(*input_defs[1], axes_shape, logger), "Cannot get shape of input axes");
-      if (axes_shape[0] != 0) {
+      if (axes_shape[0] > 0) {
         // Optional input axes is provided and we already ensure it is an initializer.
         // Use that initializer data.
         const auto& initializers(model_builder.GetInitializerTensors());
@@ -125,7 +125,7 @@ bool ReductionOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
 
     const std::string axes_name = GetTensorName(input_defs, 1);
     // If the optional input 'axes' is provided and not empty, it must be an initializer.
-    if (axes_shape[0] != 0 && !graph_viewer.GetConstantInitializer(axes_name)) {
+    if (axes_shape[0] > 0 && !graph_viewer.GetConstantInitializer(axes_name)) {
       LOGS(logger, VERBOSE) << "Input axes of " << node.OpType() << " must be a constant";
       return false;
     }

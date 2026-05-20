@@ -132,7 +132,7 @@ bool GruOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node
     LOGS(logger, ERROR) << "Cannot get input's shape";
     return false;
   }
-  if (input_shape[0] <= 0) {
+  if (input_shape[0] == kDynamicDim) {
     LOGS(logger, VERBOSE) << "GRU: dynamic sequence length is not supported";
     return false;
   }

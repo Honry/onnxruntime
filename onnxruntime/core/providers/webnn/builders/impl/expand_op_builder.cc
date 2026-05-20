@@ -37,10 +37,12 @@ class ExpandOpBuilder : public BaseOpBuilder {
 // Add operator related.
 
 void ExpandOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
-  const auto& shape_name = node.InputDefs()[1]->Name();
-  // Only skip the shape input when it is a constant initializer (consumed at build time).
-  // When it is an operand, we need it as the newShape input for dynamicExpand.
-  if (model_builder.GetGraphViewer().GetConstantInitializer(shape_name)) {
+  const auto& input_defs = node.InputDefs();
+  const auto& shape_name = input_defs[1]->Name();
+  // Only skip the shape input when it is a constant initializer AND the input has static shape.
+  // When the input has dynamic shape, we need the shape operand for dynamicExpand even if it's constant.
+  if (model_builder.GetGraphViewer().GetConstantInitializer(shape_name) &&
+      !HasDynamicShape(*input_defs[0])) {
     model_builder.AddInitializerToSkip(shape_name);
   }
 }

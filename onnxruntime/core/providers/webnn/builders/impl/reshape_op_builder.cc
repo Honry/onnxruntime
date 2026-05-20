@@ -113,7 +113,7 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
           int unclaimed_dynamic_idx = -1;
           for (size_t j = 0; j < input_shape.size(); ++j) {
             if (claimed[j]) continue;
-            if (input_shape[j] <= 0) {
+            if (input_shape[j] == kDynamicDim) {
               unclaimed_dynamic_count++;
               unclaimed_dynamic_idx = static_cast<int>(j);
             } else {

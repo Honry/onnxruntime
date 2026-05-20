@@ -42,6 +42,9 @@ enum class WebnnDeviceType {
 
 WebnnDeviceType DeviceTypeFromString(const std::string_view& device_type);
 
+// Sentinel value used by GetShape() to represent dynamic (symbolic) dimensions.
+constexpr int64_t kDynamicDim = -1;
+
 // Collects all the initializer tensors in the subGraph and its ancestor graphs.
 InitializedTensorSet CollectAllInitializedTensors(const GraphViewer& graph_viewer);
 
@@ -58,11 +61,23 @@ inline std::vector<int64_t> GetResolvedAxes(const NodeAttrHelper& helper, size_t
 }
 
 bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const logging::Logger& logger);
-bool HasDynamicShape(const NodeArg& node_arg, const logging::Logger& logger);
 
-// Check if a shape vector (from GetShape()) contains dynamic dimensions (0 placeholders).
+// Check if a NodeArg has dynamic (symbolic) dimensions.
+// Callers must ensure the NodeArg has a shape proto (guaranteed after IsTensorShapeSupported).
+inline bool HasDynamicShape(const NodeArg& node_arg) {
+  const auto* shape_proto = node_arg.Shape();
+  assert(shape_proto != nullptr);
+  for (const auto& dim : shape_proto->dim()) {
+    if (!dim.has_dim_value()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Check if a shape vector (from GetShape()) contains dynamic dimensions (kDynamicDim placeholders).
 inline bool HasDynamicShape(const std::vector<int64_t>& shape) {
-  return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == 0; });
+  return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == kDynamicDim; });
 }
 
 template <typename T>
