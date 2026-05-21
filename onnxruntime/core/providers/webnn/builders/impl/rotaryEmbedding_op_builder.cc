@@ -12,40 +12,26 @@
 #include "attention_helper.h"
 
 // WebNN doesn't provide a dedicated op for RotaryEmbedding. Instead, we implement it by using a
-// combination of WebNN ops. The decomposed graph is referenced from DML EP at:
-// onnxruntime/core/providers/dml/DmlExecutionProvider/src/Operators/DmlOperatorRotaryEmbedding.cpp
+// combination of WebNN ops. The decomposition follows the OpenVINO RoPE fusion pattern
+// (split on last axis), implemented in attention_helper.h::ApplyRotaryEmbedding.
 /*
-                 Input                            CosCache   PositionIds     SinCache
-                   |                                 |           |              |
-                   |                                 |  +--------+-----------+  |
-                 Split                               |  |                    |  |
-                  |  |                              Gather                  Gather
-          +-------+  |                                |                        |
-          |          |                                |                        |
-          |     Identity----------+                   |                        |
-          |        |              |                   |                        |
-          |        |              |                   |                        |
-          |    --Split--          |                   |                        |
-          |    \       /          | +-----------------+                        |
-          |     \     /           | |                                          |
-          |      \   /            Mul                                          |
-          |       \ /              |                                           |
-          |        X               |                                           |
-          |       / \              |                                           |
-          |      /   \             |                                           |
-          |       Join             |                                           |
-          |        |               |                                           |
-          |        | +---------------------------------------------------------+
-          |        | |             |
-          |        Mul             |
-          |         |              |
-          |         +-----+ +------+
-          |               | |
-          |               Add
-          |                |
-          +-------------+  |
-                        |  |
-                        Join
+    Input [B, S, num_heads, head_size]     CosCache   PositionIds   SinCache
+          |                                    |           |             |
+      Split(axis=3)                           Gather      |           Gather
+      /           \                             |         |             |
+  first_half   second_half                  Unsqueeze(dim=2)       Unsqueeze(dim=2)
+      |    \     /    |                     → [B,S,1,half]        → [B,S,1,half]
+      |     \   /     |                         |                     |
+      |      \ /      |                     Expand(first_half.shape)  Expand(first_half.shape)
+    first*cos  second*sin                       |                     |
+        |         |                         second*cos            first*sin
+        +---sub---+                             |                     |
+             |                                  +--------add----------+
+           res_0                                          |
+             \                                          res_1
+              +----------Concat(axis=3)----------------+  /
+                              |
+                           Output [B, S, num_heads, head_size]
 */
 namespace onnxruntime {
 namespace webnn {
@@ -348,7 +334,7 @@ bool RotaryEmbeddingOpBuilder::HasSupportedInputsImpl(const GraphViewer&,
   }
 
   // Check if the input data type is supported by each decomposed WebNN op.
-  // Decomposed ops include: "Add", "Concat", "Gather", "Mul", "Reshape" and "Split".
+  // Decomposed ops include: "Add", "Concat", "Expand", "Gather", "Mul", "Reshape" and "Split".
   for (const std::string_view decomposed_op_type : decomposed_op_map.at(op_type)) {
     const std::string_view webnn_op_type = GetWebNNOpType(decomposed_op_type);
     const std::string_view webnn_input_name = GetWebNNOpFirstInputName(decomposed_op_type);

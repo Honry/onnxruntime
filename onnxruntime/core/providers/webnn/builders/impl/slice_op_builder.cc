@@ -5,6 +5,7 @@
 #include <limits>
 #include <numeric>
 
+#include "core/common/logging/logging.h"
 #include "core/framework/tensorprotoutils.h"
 #include "core/optimizer/initializer.h"
 #include "core/providers/common.h"
@@ -40,19 +41,47 @@ class SliceOpBuilder : public BaseOpBuilder {
 void SliceOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
   const auto& input_defs = node.InputDefs();
   const auto& initializers(model_builder.GetInitializerTensors());
+  const auto& graph_viewer = model_builder.GetGraphViewer();
+
   const bool is_constant_starts = initializers.count(input_defs[1]->Name()) > 0;
   const bool is_constant_ends = initializers.count(input_defs[2]->Name()) > 0;
 
-  // The constant path (WebNN slice) requires concrete dimension sizes at build time.
-  // When the input has dynamic dimensions, we must use the dynamic path (dynamicSlice)
-  // even when starts/ends are constant, because slice needs sizes which can't be computed
-  // from 0-placeholder dynamic dims.
-  const auto* shape_proto = input_defs[0]->Shape();
-  const bool has_dynamic_input = shape_proto &&
-      std::any_of(shape_proto->dim().begin(), shape_proto->dim().end(),
-                  [](const auto& dim) { return !dim.has_dim_value(); });
+  // The constant path can be used when starts/ends are constant AND all SLICED axes
+  // have static dimensions. Non-sliced axes may be dynamic.
+  bool can_use_constant_path = false;
+  if (is_constant_starts && is_constant_ends) {
+    const auto* shape_proto = input_defs[0]->Shape();
+    const bool has_dynamic_input = shape_proto &&
+        std::any_of(shape_proto->dim().begin(), shape_proto->dim().end(),
+                    [](const auto& dim) { return !dim.has_dim_value(); });
+    if (!has_dynamic_input) {
+      can_use_constant_path = true;
+    } else {
+      // Check if only non-sliced axes are dynamic.
+      std::vector<int64_t> axes;
+      const std::string axes_name = GetTensorName(input_defs, 3);
+      if (!axes_name.empty()) {
+        const auto* axes_init = graph_viewer.GetConstantInitializer(axes_name);
+        if (axes_init) {
+          const logging::Logger& logger = logging::LoggingManager::DefaultLogger();
+          ReadIntArrayFrom1DTensor(*axes_init, axes, graph_viewer, logger);
+        }
+      }
+      if (!axes.empty() && shape_proto) {
+        can_use_constant_path = true;
+        const size_t rank = shape_proto->dim_size();
+        for (int64_t axis : axes) {
+          const size_t dim_idx = SafeInt<size_t>(HandleNegativeAxis(axis, rank));
+          if (!shape_proto->dim(dim_idx).has_dim_value()) {
+            can_use_constant_path = false;
+            break;
+          }
+        }
+      }
+    }
+  }
 
-  if (is_constant_starts && is_constant_ends && !has_dynamic_input) {
+  if (can_use_constant_path) {
     // Constant path: skip all initializer inputs (consumed at build time).
     for (size_t i = 1; i < input_defs.size(); i++) {
       model_builder.AddInitializerToSkip(input_defs[i]->Name());
@@ -127,35 +156,66 @@ Status BuildConstantSlice(ModelBuilder& model_builder, const Node& node,
     reverse_output = model_builder.GetBuilder().call<emscripten::val>("reverse", input, reverse_options);
   }
 
-  // Check if slice op is needed (identity if no actual slicing).
-  bool is_slice_required = false;
+  // Identify which axes are actually sliced (not identity pass-through).
+  // For non-sliced axes: starts=0, ends=input_shape[i], steps=1 (set by PrepareForComputeHelper).
+  // For dynamic non-sliced axes: ends=-1 == input_shape[i]=-1, so the check still works.
+  std::vector<size_t> sliced_axes;
   for (size_t i = 0; i < rank; ++i) {
     if (compute_metadata.steps_[i] != 1 || compute_metadata.starts_[i] != 0 ||
         compute_metadata.ends_[i] != input_shape[i]) {
-      is_slice_required = true;
-      break;
+      sliced_axes.push_back(i);
     }
   }
 
   output = reverse_output;
-  if (is_slice_required) {
-    // All dims are static — use slice directly.
-    std::vector<uint32_t> starts(rank);
-    std::vector<uint32_t> sizes(rank);
-    std::vector<uint32_t> steps(rank);
-    for (size_t i = 0; i < rank; ++i) {
-      starts[i] = static_cast<uint32_t>(compute_metadata.starts_[i]);
-      steps[i] = static_cast<uint32_t>(compute_metadata.steps_[i]);
-      int64_t extent = compute_metadata.ends_[i] - compute_metadata.starts_[i];
-      int64_t step = compute_metadata.steps_[i];
-      sizes[i] = static_cast<uint32_t>((extent + step - 1) / step);
+  if (!sliced_axes.empty()) {
+    const bool has_dynamic_non_sliced = HasDynamicShape(input_shape);
+    if (has_dynamic_non_sliced) {
+      // Dynamic non-sliced axes: WebNN slice requires concrete sizes for ALL axes,
+      // but dynamic dims have no concrete size at build time.
+      // Use gather on each sliced axis instead — gather preserves dim descriptors
+      // on non-gathered axes, avoiding the cascading dim descriptor breakage.
+      for (size_t axis : sliced_axes) {
+        const int32_t start = static_cast<int32_t>(compute_metadata.starts_[axis]);
+        const int32_t step = static_cast<int32_t>(compute_metadata.steps_[axis]);
+        const int64_t extent = compute_metadata.ends_[axis] - compute_metadata.starts_[axis];
+        const uint32_t count = static_cast<uint32_t>((extent + step - 1) / step);
+
+        // Build indices: [start, start+step, start+2*step, ...].
+        std::vector<int32_t> indices_data(count);
+        for (uint32_t j = 0; j < count; ++j) {
+          indices_data[j] = start + static_cast<int32_t>(j) * step;
+        }
+
+        const std::string indices_name = node.Name() + "_gather_indices_axis" + std::to_string(axis);
+        const emscripten::val& indices_operand = model_builder.CreateOrGetConstant<int32_t>(
+            ONNX_NAMESPACE::TensorProto_DataType_INT32, indices_name, indices_data, {count});
+
+        emscripten::val gather_options = emscripten::val::object();
+        gather_options.set("axis", static_cast<uint32_t>(axis));
+        gather_options.set("label", node.Name() + "_gather_axis" + std::to_string(axis));
+        output = model_builder.GetBuilder().call<emscripten::val>(
+            "gather", output, indices_operand, gather_options);
+      }
+    } else {
+      // All dims are static — use slice directly.
+      std::vector<uint32_t> starts(rank);
+      std::vector<uint32_t> sizes(rank);
+      std::vector<uint32_t> steps(rank);
+      for (size_t i = 0; i < rank; ++i) {
+        starts[i] = static_cast<uint32_t>(compute_metadata.starts_[i]);
+        steps[i] = static_cast<uint32_t>(compute_metadata.steps_[i]);
+        int64_t extent = compute_metadata.ends_[i] - compute_metadata.starts_[i];
+        int64_t step = compute_metadata.steps_[i];
+        sizes[i] = static_cast<uint32_t>((extent + step - 1) / step);
+      }
+      emscripten::val options = emscripten::val::object();
+      options.set("strides", emscripten::val::array(steps));
+      options.set("label", node.Name());
+      output = model_builder.GetBuilder().call<emscripten::val>(
+          "slice", reverse_output, emscripten::val::array(starts),
+          emscripten::val::array(sizes), options);
     }
-    emscripten::val options = emscripten::val::object();
-    options.set("strides", emscripten::val::array(steps));
-    options.set("label", node.Name());
-    output = model_builder.GetBuilder().call<emscripten::val>(
-        "slice", reverse_output, emscripten::val::array(starts),
-        emscripten::val::array(sizes), options);
   }
 
   return Status::OK();
@@ -379,13 +439,46 @@ Status SliceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const 
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
 
   const auto& initializers(model_builder.GetInitializerTensors());
+  const auto& graph_viewer = model_builder.GetGraphViewer();
   const bool is_constant_starts = initializers.count(input_defs[1]->Name()) > 0;
   const bool is_constant_ends = initializers.count(input_defs[2]->Name()) > 0;
 
-  // The constant path (WebNN slice) requires concrete unsigned long sizes for ALL axes.
-  // When the input has any dynamic dimensions, we must use the dynamic path (dynamicSlice)
-  // even when starts/ends are constant, because slice sizes can't be computed for dynamic dims.
-  bool can_use_constant_path = is_constant_starts && is_constant_ends && !HasDynamicShape(input_shape);
+  // The constant path (WebNN slice) can be used when starts/ends are constant AND
+  // all SLICED axes have static dimensions. Non-sliced axes may be dynamic — their
+  // output dims pass through unchanged from the input operand (preserving dim descriptors).
+  bool can_use_constant_path = false;
+  if (is_constant_starts && is_constant_ends) {
+    if (!HasDynamicShape(input_shape)) {
+      // All dims are static — trivially safe for constant path.
+      can_use_constant_path = true;
+    } else {
+      // Check if only non-sliced axes are dynamic.
+      // Read axes to determine which dims are actually sliced.
+      std::vector<int64_t> axes;
+      const std::string axes_name = GetTensorName(input_defs, 3);
+      if (!axes_name.empty()) {
+        const auto* axes_init = graph_viewer.GetConstantInitializer(axes_name);
+        if (axes_init) {
+          ReadIntArrayFrom1DTensor(*axes_init, axes, graph_viewer, logger);
+        }
+      }
+      if (axes.empty()) {
+        // Default: all dims are sliced — need all static.
+        can_use_constant_path = !HasDynamicShape(input_shape);
+      } else {
+        // Only the specified axes are sliced — check only those are static.
+        const size_t rank = input_shape.size();
+        can_use_constant_path = true;
+        for (int64_t axis : axes) {
+          const size_t dim_idx = SafeInt<size_t>(HandleNegativeAxis(axis, rank));
+          if (input_shape[dim_idx] <= 0) {
+            can_use_constant_path = false;
+            break;
+          }
+        }
+      }
+    }
+  }
 
   emscripten::val output = emscripten::val::undefined();
 
@@ -417,7 +510,39 @@ bool SliceOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer, const No
   const bool is_constant_ends = graph_viewer.GetConstantInitializer(ends_name) != nullptr;
   const bool has_dynamic_input = HasDynamicShape(*input_defs[0]);
 
-  if (is_constant_starts && is_constant_ends && !has_dynamic_input) {
+  // Determine if the constant path can be used: starts/ends constant AND all sliced axes static.
+  bool use_constant_path = false;
+  if (is_constant_starts && is_constant_ends) {
+    if (!has_dynamic_input) {
+      use_constant_path = true;
+    } else {
+      // Check if only non-sliced axes are dynamic.
+      std::vector<int64_t> axes;
+      const std::string axes_name = GetTensorName(input_defs, 3);
+      if (!axes_name.empty()) {
+        const auto* axes_init = graph_viewer.GetConstantInitializer(axes_name);
+        if (axes_init) {
+          ReadIntArrayFrom1DTensor(*axes_init, axes, graph_viewer, logger);
+        }
+      }
+      if (!axes.empty()) {
+        const auto* shape_proto = input_defs[0]->Shape();
+        if (shape_proto) {
+          const size_t rank = shape_proto->dim_size();
+          use_constant_path = true;
+          for (int64_t axis : axes) {
+            const size_t dim_idx = SafeInt<size_t>(HandleNegativeAxis(axis, rank));
+            if (!shape_proto->dim(dim_idx).has_dim_value()) {
+              use_constant_path = false;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (use_constant_path) {
     // Constant path: axes and steps must also be constant initializers if present.
     for (size_t i = 3; i < input_defs.size(); i++) {
       const std::string input_name = GetTensorName(input_defs, i);
@@ -470,11 +595,41 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
   const std::string starts_name = input_defs[1]->Name();
   const std::string ends_name = input_defs[2]->Name();
 
-  // Use the static slice path only when starts/ends are constant AND input has no dynamic dims.
-  // When input has dynamic dims, we must use dynamicSlice because static slice requires concrete
-  // sizes at build time (which can't be computed from 0-placeholder dynamic dims).
+  // Determine if the constant path will be used (same logic as AddToModelBuilderImpl).
+  // Constant path requires starts/ends constant AND all sliced axes static.
   const bool has_dynamic_input = HasDynamicShape(*input_defs[0]);
-  if (!has_dynamic_input && graph_viewer.GetConstantInitializer(starts_name) && graph_viewer.GetConstantInitializer(ends_name)) {
+  bool use_constant_path = false;
+  if (graph_viewer.GetConstantInitializer(starts_name) && graph_viewer.GetConstantInitializer(ends_name)) {
+    if (!has_dynamic_input) {
+      use_constant_path = true;
+    } else {
+      // Check if only non-sliced axes are dynamic.
+      std::vector<int64_t> axes;
+      const std::string axes_name = GetTensorName(input_defs, 3);
+      if (!axes_name.empty()) {
+        const auto* axes_init = graph_viewer.GetConstantInitializer(axes_name);
+        if (axes_init) {
+          ReadIntArrayFrom1DTensor(*axes_init, axes, graph_viewer, logger);
+        }
+      }
+      if (!axes.empty()) {
+        const auto* shape_proto = input_defs[0]->Shape();
+        if (shape_proto) {
+          const size_t rank = shape_proto->dim_size();
+          use_constant_path = true;
+          for (int64_t axis : axes) {
+            const size_t dim_idx = SafeInt<size_t>(HandleNegativeAxis(axis, rank));
+            if (!shape_proto->dim(dim_idx).has_dim_value()) {
+              use_constant_path = false;
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (use_constant_path) {
     const auto& input = *input_defs[0];
     std::vector<int64_t> input_shape;
     if (!GetShape(*input_defs[0], input_shape, logger)) {
@@ -499,6 +654,15 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
             !IsInputRankSupported(wnn_limits, "reverse", "input", input_shape.size(), node.Name(), logger)) {
           return false;
         }
+      }
+    }
+
+    // When input has dynamic non-sliced axes, we use gather instead of slice.
+    // Check gather support in that case.
+    if (has_dynamic_input) {
+      if (!IsDataTypeSupportedByWebNNOp(op_type, "gather", input_type, wnn_limits, "input", "data", logger) ||
+          !IsInputRankSupported(wnn_limits, "gather", "input", input_shape.size(), node.Name(), logger)) {
+        return false;
       }
     }
 
