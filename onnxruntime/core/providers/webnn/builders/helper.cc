@@ -55,7 +55,6 @@ bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const loggin
     if (dim.has_dim_value()) {
       shape.push_back(dim.dim_value());
     } else {
-      LOGS(logger, VERBOSE) << "NodeArg [" << node_arg.Name() << "] has dynamic dimension: " << dim.dim_param();
       shape.push_back(kDynamicDim);
     }
   }
