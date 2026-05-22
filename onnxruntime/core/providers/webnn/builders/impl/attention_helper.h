@@ -5,6 +5,7 @@
 #pragma once
 
 #include "core/providers/webnn/builders/helper.h"
+#include "core/providers/webnn/builders/impl/shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -114,12 +115,7 @@ inline Status ApplyRotaryEmbedding(
 
   // Helper: generate a 1D range [0, 1, ..., sequence_length-1] with dynamic sequence_length.
   auto build_sequence_range = [&](const std::string& label_suffix) -> emscripten::val {
-    const bool is_int64_supported = model_builder.IsInt64Supported();
-    emscripten::val value_one_constant = is_int64_supported
-                         ? model_builder.CreateOrGetConstant<int64_t>(
-                             ONNX_NAMESPACE::TensorProto_DataType_INT64, static_cast<int64_t>(1), {1})
-                         : model_builder.CreateOrGetConstant<int32_t>(
-                             ONNX_NAMESPACE::TensorProto_DataType_INT32, static_cast<int32_t>(1), {1});
+    emscripten::val value_one_constant = shape_utils::GetShapeConstantOne(model_builder);
 
     emscripten::val range_shape = emscripten::val::array();
     range_shape.call<void>("push", input["shape"][1]);

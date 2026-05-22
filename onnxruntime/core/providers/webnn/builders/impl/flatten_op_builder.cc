@@ -9,6 +9,7 @@
 #include "core/providers/webnn/builders/op_builder_factory.h"
 
 #include "base_op_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -18,6 +19,7 @@ class FlattenOpBuilder : public BaseOpBuilder {
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
+
 };
 
 // Add operator related.
@@ -28,111 +30,125 @@ Status FlattenOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   const auto& input_defs = node.InputDefs();
   ORT_RETURN_IF(input_defs.size() < 1, "Flatten has no input tensor");
 
-  // Get rank from shape proto (always available, validated by base class).
-  const auto* shape_proto = input_defs[0]->Shape();
-  ORT_RETURN_IF(!shape_proto, "Flatten input has no shape proto");
-  const int64_t rank = shape_proto->dim_size();
+  std::vector<int64_t> input_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
+  const int64_t rank = input_shape.size();
 
   NodeAttrHelper helper(node);
-  int64_t axis = helper.Get("axis", 1);
-  ORT_ENFORCE(axis >= -rank && axis <= rank, "axis ", axis,
-              " is not in valid range [-", rank, ",", rank, "]");
-  if (axis < 0) {
-    axis += rank;
-  }
+  const int32_t axis = SafeInt<int32_t>(HandleNegativeAxis(helper.Get("axis", 1), rank));
 
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
 
-  // Check if input has any dynamic dimensions.
-  bool has_dynamic_shape = false;
-  for (const auto& dim : shape_proto->dim()) {
-    if (!dim.has_dim_value()) {
-      has_dynamic_shape = true;
-      break;
-    }
-  }
-
   emscripten::val output = emscripten::val::undefined();
-  if (!has_dynamic_shape) {
+  if (!HasDynamicShape(input_shape)) {
     // === Static path: compute new_shape at build time and use WebNN reshape. ===
-    std::vector<int64_t> input_shape;
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
-
     int64_t num_pre_axis_elements = std::accumulate(
-        input_shape.begin(), input_shape.begin() + static_cast<int32_t>(axis), 1, std::multiplies<int64_t>());
+        input_shape.begin(), input_shape.begin() + axis, 1, std::multiplies<int64_t>());
     int64_t num_post_axis_elements = std::accumulate(
-        input_shape.begin() + static_cast<int32_t>(axis), input_shape.end(), 1, std::multiplies<int64_t>());
+        input_shape.begin() + axis, input_shape.end(), 1, std::multiplies<int64_t>());
 
     std::vector<uint32_t> new_shape = {SafeInt<uint32_t>(num_pre_axis_elements),
                                        SafeInt<uint32_t>(num_post_axis_elements)};
     output = model_builder.GetBuilder().call<emscripten::val>(
         "reshape", input, emscripten::val::array(new_shape), options);
   } else {
-    // === Dynamic path: use shape() + slice/reduceMul + concat + dynamicReshape. ===
+    // === Dynamic path: prefer static reshape with dim descriptors when possible. ===
     // Flatten(input, axis) produces shape [product(dims[:axis]), product(dims[axis:])].
-    // We use WebNN shape() to get the runtime shape, slice into pre/post segments,
-    // reduce each with mul, then concat into [pre, post] for dynamicReshape.
-    emscripten::val wnn_builder = model_builder.GetBuilder();
-    emscripten::val shape_operand = wnn_builder.call<emscripten::val>(
-        "shape", input, emscripten::val::object());
+    // When one side of the axis split is a single dim or all-static, we can use static reshape
+    // to preserve dim descriptor info. Only fall back to dynamicReshape when a side has
+    // multiple dynamic dims requiring runtime product computation.
 
-    // Helper lambda to compute the product of a contiguous range of shape dims.
-    // Returns a scalar operand (reshaped to [1] for concat).
-    auto reduce_shape_range = [&](int32_t start, int32_t size,
-                                  const std::string& label_suffix) -> emscripten::val {
-      if (size == 0) {
-        // Empty range means product is 1 (e.g., axis=0 → pre-axis is empty).
-        if (model_builder.IsInt64Supported()) {
-          return model_builder.CreateOrGetConstant<int64_t>(
-              ONNX_NAMESPACE::TensorProto_DataType_INT64, 1, {1});
-        } else {
-          return model_builder.CreateOrGetConstant<int32_t>(
-              ONNX_NAMESPACE::TensorProto_DataType_INT32, 1, {1});
+    // Analyze pre-axis dims.
+    bool pre_all_static = true;
+    int64_t pre_static_product = 1;
+    int pre_dynamic_count = 0;
+    for (int32_t i = 0; i < axis; ++i) {
+      if (input_shape[i] == kDynamicDim) {
+        pre_dynamic_count++;
+        pre_all_static = false;
+      } else {
+        pre_static_product *= input_shape[i];
+      }
+    }
+
+    // Analyze post-axis dims.
+    bool post_all_static = true;
+    int64_t post_static_product = 1;
+    int post_dynamic_count = 0;
+    for (int32_t i = axis; i < static_cast<int32_t>(rank); ++i) {
+      if (input_shape[i] == kDynamicDim) {
+        post_dynamic_count++;
+        post_all_static = false;
+      } else {
+        post_static_product *= input_shape[i];
+      }
+    }
+
+    // Try to build a static reshape shape array with dim descriptors.
+    emscripten::val new_shape = emscripten::val::array();
+    bool can_use_static_reshape = true;
+
+    // Pre-axis output dimension.
+    if (pre_all_static) {
+      uint32_t pre_val = SafeInt<uint32_t>(pre_static_product);
+      new_shape.call<void>("push", pre_val);
+    } else if (axis == 1) {
+      // Pre-axis is a single dim — use its dim descriptor directly.
+      new_shape.call<void>("push", input["shape"][0]);
+    } else if (pre_dynamic_count == 1 && pre_static_product == 1) {
+      // All static dims in pre-axis are 1, so product = the single dynamic dim.
+      for (int32_t i = 0; i < axis; ++i) {
+        if (input_shape[i] == kDynamicDim) {
+          new_shape.call<void>("push", input["shape"][static_cast<uint32_t>(i)]);
+          break;
         }
       }
-      if (size == 1) {
-        // Single dim — just slice it out.
-        emscripten::val starts = emscripten::val::array();
-        starts.call<void>("push", start);
-        emscripten::val sizes = emscripten::val::array();
-        sizes.call<void>("push", 1);
-        return wnn_builder.call<emscripten::val>("slice", shape_operand, starts, sizes);
+    } else {
+      can_use_static_reshape = false;
+    }
+
+    // Post-axis output dimension.
+    if (can_use_static_reshape) {
+      if (post_all_static) {
+        uint32_t post_val = SafeInt<uint32_t>(post_static_product);
+        new_shape.call<void>("push", post_val);
+      } else if (axis == static_cast<int32_t>(rank) - 1) {
+        // Post-axis is a single dim — use its dim descriptor directly.
+        new_shape.call<void>("push", input["shape"][static_cast<uint32_t>(axis)]);
+      } else if (post_dynamic_count == 1 && post_static_product == 1) {
+        // All static dims in post-axis are 1, so product = the single dynamic dim.
+        for (int32_t i = axis; i < static_cast<int32_t>(rank); ++i) {
+          if (input_shape[i] == kDynamicDim) {
+            new_shape.call<void>("push", input["shape"][static_cast<uint32_t>(i)]);
+            break;
+          }
+        }
+      } else {
+        can_use_static_reshape = false;
       }
-      // Multiple dims — slice then reduce with mul.
-      emscripten::val starts = emscripten::val::array();
-      starts.call<void>("push", start);
-      emscripten::val sizes = emscripten::val::array();
-      sizes.call<void>("push", size);
-      emscripten::val segment = wnn_builder.call<emscripten::val>(
-          "slice", shape_operand, starts, sizes);
+    }
 
-      emscripten::val reduce_options = emscripten::val::object();
-      reduce_options.set("label", node.Name() + label_suffix);
-      reduce_options.set("keepDimensions", true);
-      emscripten::val axes_array = emscripten::val::array();
-      axes_array.call<void>("push", 0);
-      reduce_options.set("axes", axes_array);
-      return wnn_builder.call<emscripten::val>("reduceProduct", segment, reduce_options);
-    };
+    if (can_use_static_reshape) {
+      output = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, options);
+    } else {
+      // Fall back to dynamicReshape for complex cases (products include multiple dynamic dims).
+      emscripten::val wnn_builder = model_builder.GetBuilder();
+      emscripten::val shape_operand = wnn_builder.call<emscripten::val>(
+          "shape", input, emscripten::val::object());
 
-    int32_t axis32 = static_cast<int32_t>(axis);
-    int32_t rank32 = static_cast<int32_t>(rank);
+      emscripten::val pre_product = shape_utils::ReduceShapeRange(
+          model_builder, shape_operand, 0, axis, node.Name() + "_pre_reduce");
+      emscripten::val post_product = shape_utils::ReduceShapeRange(
+          model_builder, shape_operand, axis, static_cast<int32_t>(rank) - axis, node.Name() + "_post_reduce");
 
-    emscripten::val pre_product = reduce_shape_range(0, axis32, "_pre_reduce");
-    emscripten::val post_product = reduce_shape_range(axis32, rank32 - axis32, "_post_reduce");
+      emscripten::val segments = emscripten::val::array();
+      segments.call<void>("push", pre_product);
+      segments.call<void>("push", post_product);
 
-    // Concat [pre_product, post_product] into a 1-D shape tensor of length 2.
-    emscripten::val concat_inputs = emscripten::val::array();
-    concat_inputs.call<void>("push", pre_product);
-    concat_inputs.call<void>("push", post_product);
-    emscripten::val concat_options = emscripten::val::object();
-    concat_options.set("label", node.Name() + std::string("_concat_shape"));
-    emscripten::val new_shape_operand = wnn_builder.call<emscripten::val>(
-        "concat", concat_inputs, 0, concat_options);
-
-    output = wnn_builder.call<emscripten::val>("dynamicReshape", input, new_shape_operand, options);
+      output = shape_utils::DynamicReshapeWithSegments(model_builder, input, segments, node.Name());
+    }
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));

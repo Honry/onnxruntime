@@ -13,7 +13,6 @@
 #include "core/optimizer/initializer.h"
 
 #include "base_op_builder.h"
-#include "builder_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -52,18 +51,9 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
   const auto& input_defs = node.InputDefs();
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
 
-  // Get rank from shape proto (always available, validated by base class).
-  const auto* shape_proto = input_defs[0]->Shape();
-  const auto input_rank = static_cast<size_t>(shape_proto->dim_size());
-
-  // Check if input has any dynamic dimensions.
-  bool has_dynamic_shape = false;
-  for (const auto& dim : shape_proto->dim()) {
-    if (!dim.has_dim_value()) {
-      has_dynamic_shape = true;
-      break;
-    }
-  }
+  std::vector<int64_t> input_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
+  const auto input_rank = input_shape.size();
 
   // Resolve axes (always static — from attribute or constant initializer).
   std::vector<int32_t> axes_data;
@@ -101,10 +91,8 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
   options.set("label", node.Name());
   emscripten::val output = emscripten::val::undefined();
 
-  if (!has_dynamic_shape) {
+  if (!HasDynamicShape(input_shape)) {
     // === Static path: compute new_shape at build time and use WebNN reshape. ===
-    std::vector<int64_t> input_shape;
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
     std::vector<uint32_t> new_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
 
     if (op_type == "Squeeze") {
@@ -133,46 +121,37 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
                                                               emscripten::val::array(new_shape),
                                                               options);
   } else {
-    // === Dynamic path: axes are always known at build time, so we can determine
-    // which shape indices to keep (Squeeze) or where to insert 1s (Unsqueeze). ===
-    emscripten::val wnn_builder = model_builder.GetBuilder();
+    // === Dynamic path: use static reshape() with input["shape"][i] for original dims. ===
+    // This preserves native dim descriptors for dynamic dims while keeping inserted "1" dims
+    // truly static — avoiding the issue where dynamicReshape makes ALL dims dynamic
+    // (which breaks downstream ops like ScatterND that require static last dim on indices).
+    emscripten::val input_shape_val = input["shape"];
+    emscripten::val new_shape = emscripten::val::array();
 
     if (op_type == "Squeeze") {
-      // Use static reshape() to remove the squeezed axes.
-      // Read each kept dimension from input["shape"][i] which returns:
-      // - A uint32_t for static dims
-      // - A dim descriptor object for dynamic dims
-      emscripten::val new_shape = emscripten::val::array();
       std::set<int32_t> axes_set(axes_data.begin(), axes_data.end());
-      for (size_t i = 0; i < input_rank; ++i) {
-        if (axes_set.count(static_cast<int32_t>(i)) == 0) {
-          new_shape.call<void>("push", input["shape"][i]);
+      for (int32_t i = 0; i < static_cast<int32_t>(input_rank); ++i) {
+        if (axes_set.count(i) == 0) {
+          new_shape.call<void>("push", input_shape_val[i]);
         }
       }
-      output = wnn_builder.call<emscripten::val>("reshape", input, new_shape, options);
     } else {  // Unsqueeze
-      // For Unsqueeze, build the new shape as a JS array by reading the input operand's
-      // dimension values and inserting literal 1s at the specified axes.
-      // Using static reshape() (instead of dynamicReshape) preserves the static-ness of
-      // each dimension — inserted 1s are known static, and input dims carry their original
-      // static/dynamic status. This is important because downstream ops like ScatterND
-      // may require certain dimensions to be statically known.
-      emscripten::val new_shape = emscripten::val::array();
+      int32_t input_dim = 0;
       size_t axes_idx = 0;
-      uint32_t input_dim = 0;
       const auto output_rank = static_cast<int32_t>(rank);
 
-      for (int32_t i = 0; i < output_rank; i++) {
+      for (int32_t i = 0; i < output_rank; ++i) {
         if (axes_idx < axes_data.size() && axes_data[axes_idx] == i) {
-          new_shape.call<void>("push", 1u);  // Inserted dimension, always 1.
+          new_shape.call<void>("push", 1u);
           axes_idx++;
         } else {
-          new_shape.call<void>("push", input["shape"][input_dim]);  // From operand.
+          new_shape.call<void>("push", input_shape_val[input_dim]);
           input_dim++;
         }
       }
-      output = wnn_builder.call<emscripten::val>("reshape", input, new_shape, options);
     }
+
+    output = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
