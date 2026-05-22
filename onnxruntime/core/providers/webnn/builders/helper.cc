@@ -77,6 +77,7 @@ bool IsNodeSupported(const GraphViewer& graph_viewer, const Node& node, const We
 }
 
 bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_name,
+                            const emscripten::val& wnn_limits,
                             const logging::Logger& logger, bool allow_empty_input,
                             bool allow_no_shape) {
   const auto& node_arg_name = node_arg.Name();
@@ -99,6 +100,13 @@ bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_n
     // Skip dims without a concrete value (dim_param-based dynamic dims) — dim.dim_value()
     // returns proto default 0 for these, which would otherwise trigger the empty-tensor reject.
     if (!dim.has_dim_value()) {
+      // If wnn_limits is provided, check whether the browser supports dynamic shapes.
+      // When unsupported, reject nodes with dynamic dims so they fall back to CPU.
+      if (!wnn_limits.isUndefined() && !IsDynamicShapeSupported(wnn_limits)) {
+        LOGS(logger, VERBOSE) << "Node arg [" << node_arg_name << "] of [" << parent_name
+                              << "] has dynamic dimensions which are not supported by this WebNN context";
+        return false;
+      }
       continue;
     }
     if (dim.dim_value() == 0 && !allow_empty_input) {

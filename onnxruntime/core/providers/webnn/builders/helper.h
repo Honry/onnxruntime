@@ -80,6 +80,13 @@ inline bool HasDynamicShape(const std::vector<int64_t>& shape) {
   return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == kDynamicDim; });
 }
 
+// Check if the WebNN context supports dynamic shape operations (shape + dynamicReshape).
+// Returns true if both ops are listed in opSupportLimits, meaning the browser can handle
+// nodes with dynamic (symbolic) dimensions.
+inline bool IsDynamicShapeSupported(const emscripten::val& wnn_limits) {
+  return !wnn_limits["shape"].isUndefined() && !wnn_limits["dynamicReshape"].isUndefined();
+}
+
 template <typename T>
 std::string GetShapeString(std::vector<T>& shape) {
   std::stringstream shape_info;
@@ -232,6 +239,7 @@ inline bool TensorExists(const ConstPointerContainer<std::vector<NodeArg*>>& def
 }
 
 bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_name,
+                            const emscripten::val& wnn_limits,
                             const logging::Logger& logger, bool allow_empty_input = false,
                             bool allow_no_shape = false);
 
