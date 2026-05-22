@@ -24,7 +24,7 @@ class ModelBuilder {
  public:
   ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger, const emscripten::val& context,
                const WebnnDeviceType wnn_device_type, const emscripten::val& wnn_limits,
-               const FreeDimensionBounds& free_dimension_bounds);
+               const FreeDimensionBounds& free_dimension_bounds, bool enable_causal_lm);
   ~ModelBuilder() = default;
 
   Status Compile(std::unique_ptr<Model>& model) ORT_MUST_USE_RESULT;
@@ -55,6 +55,8 @@ class ModelBuilder {
                                              const std::vector<uint32_t>& shape = {});
 
   WebnnDeviceType GetWebnnDeviceType() const { return wnn_device_type_; }
+  // Returns true when GQA should use concat-based (stateful) KV-cache; false for ScatterND (stateless).
+  bool IsCausalLMEnabled() const { return enable_causal_lm_; }
 
   // The initializer will be processed separately, skip it as an initializer.
   void AddInitializerToSkip(const std::string& tensor_name);
@@ -96,6 +98,7 @@ class ModelBuilder {
   WebnnDeviceType wnn_device_type_;
   emscripten::val wnn_limits_ = emscripten::val::undefined();
   FreeDimensionBounds free_dimension_bounds_;
+  bool enable_causal_lm_;
   InlinedHashMap<std::string, emscripten::val> wnn_operands_;
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;

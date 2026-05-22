@@ -7,7 +7,6 @@
 #include "webnn_execution_provider.h"
 
 #include "core/common/parse_string.h"
-
 #include <limits>
 #include <string_view>
 
@@ -82,9 +81,11 @@ Status ParseFreeDimensionBounds(std::string_view value, webnn::FreeDimensionBoun
 
 struct WebNNProviderFactory : IExecutionProviderFactory {
   explicit WebNNProviderFactory(const std::string& webnn_device_flags,
-                                const webnn::FreeDimensionBounds& free_dimension_bounds)
+                                const webnn::FreeDimensionBounds& free_dimension_bounds,
+                                bool enable_causal_lm)
       : webnn_device_flags_(webnn_device_flags),
-        free_dimension_bounds_(free_dimension_bounds) {}
+        free_dimension_bounds_(free_dimension_bounds),
+        enable_causal_lm_(enable_causal_lm) {}
   ~WebNNProviderFactory() override {}
 
   std::unique_ptr<IExecutionProvider> CreateProvider() override;
@@ -93,10 +94,11 @@ struct WebNNProviderFactory : IExecutionProviderFactory {
 
   std::string webnn_device_flags_;
   webnn::FreeDimensionBounds free_dimension_bounds_;
+  bool enable_causal_lm_;
 };
 
 std::unique_ptr<IExecutionProvider> WebNNProviderFactory::CreateProvider() {
-  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, free_dimension_bounds_);
+  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, free_dimension_bounds_, enable_causal_lm_);
 }
 
 std::unique_ptr<IExecutionProvider> WebNNProviderFactory::CreateProvider(
@@ -121,7 +123,7 @@ std::unique_ptr<IExecutionProvider> WebNNProviderFactory::CreateProvider(
                                                             std::numeric_limits<int32_t>::max()));
     merged_bounds[dim_override.dim_identifier] = webnn::FreeDimensionBound{value, value};
   }
-  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, merged_bounds);
+  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, merged_bounds, enable_causal_lm_);
 }
 
 std::shared_ptr<IExecutionProviderFactory> WebNNProviderFactoryCreator::Create(
@@ -136,7 +138,15 @@ std::shared_ptr<IExecutionProviderFactory> WebNNProviderFactoryCreator::Create(
     ORT_THROW_IF_ERROR(ParseFreeDimensionBounds(free_dimension_bounds_it->second, free_dimension_bounds));
   }
 
-  return std::make_shared<onnxruntime::WebNNProviderFactory>(webnn_device_flags, free_dimension_bounds);
+  // enableCausalLM: controls the KV-cache update strategy in GroupQueryAttention.
+  //   "true"  → concat-based (stateful): present_kv = concat(past_kv, new_kv), cache grows each step.
+  //   "false" (default) → ScatterND-based (stateless): new tokens scattered into fixed-size buffer.
+  const auto enable_causal_lm_it = provider_options.find("enableCausalLM");
+  const bool enable_causal_lm = (enable_causal_lm_it != provider_options.end() &&
+                                  enable_causal_lm_it->second == "true");
+
+  return std::make_shared<onnxruntime::WebNNProviderFactory>(webnn_device_flags, free_dimension_bounds,
+                                                             enable_causal_lm);
 }
 
 }  // namespace onnxruntime
