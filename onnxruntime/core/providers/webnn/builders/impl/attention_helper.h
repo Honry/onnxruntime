@@ -13,25 +13,63 @@ namespace webnn {
     RotaryEmbedding Helper: Apply rotary positional embedding to input tensor.
     Reused by both RotaryEmbedding and GQA ops.
 
-    Follows the OpenVINO RoPE fusion pattern (split on last axis):
+    Follows the OpenVINO RoPE fusion pattern (RoPEFusionGPTOSS).
+    Input is BSNH, transposed to BNSH internally for pattern matching.
+    cos/sin are reshaped to [1, 1, max_seq, half_dim] then gathered on axis=2
+    to produce [1, 1, S, half_dim] which broadcasts over [B, N, S, half_dim].
 
-    Input [B, S, num_heads, head_size]     CosCache   PositionIds   SinCache
-          |                                    |           |             |
-      Split(axis=3)                           Gather      |           Gather
-      /           \                             |         |             |
-  first_half   second_half                  Unsqueeze(dim=2)       Unsqueeze(dim=2)
-      |    \     /    |                     → [B,S,1,half]        → [B,S,1,half]
-      |     \   /     |                         |                     |
-      |      \ /      |                         |                     |
-    first*cos  second*sin                   second*cos            first*sin
-        |         |                             |                     |
-        +---sub---+                             +--------add----------+
-             |                                            |
-           res_0                                        res_1
-             \                                          /
-              +----------Concat(axis=3)----------------+
-                              |
-                           Output [B, S, num_heads, head_size]
+                Input [B,S,N,H]
+                  |
+            [Split axis=3 if H > rotary_dim]
+                  |
+       [Deinterleave if interleaved]
+                  |
+           Transpose BSNH→BNSH                    CosCache [max_seq, half_dim]    SinCache [max_seq, half_dim]
+                  |                                       |                              |
+                Split axis=3                     Reshape [1,1,max_seq,half_dim]  Reshape [1,1,max_seq,half_dim]
+                |   |                                     |                              |
++---------------+   |                              Gather axis=2                  Gather axis=2
+|                   |                          (position_ids [S])             (position_ids [S])
+|       Split(first_half, second_half)                    |                              |
+|         [B,N,S,half_dim] each                  cos [1,1,S,half_dim]         sin [1,1,S,half_dim]
+|                   |                                     |                              |
+|       +-----------+-----------+-----------+             |                              |
+|       |           |           |           |             |                              |
+|       |     Mul(2nd,sin)<-----------Mul(1st,sin)<-------+------------------------------+
+|       |           |           |           |             |
+|   Mul(1st,cos)<-----------Mul(2nd,cos)<-----------------+
+|       |           |           |           |
+|       |        Mul(-1)        |           |
+|       |           |           |           |
+|       +---+   +---+           +---+   +---+
+|           |   |                   |   |
+|         Add(res_0)              Add(res_1)
+|           |                         |
+|           +---------Concat----------+
+|                       |
+|         [Re-interleave if interleaved]
+|                       |
+|         [Transpose BNSH→BSNH if !output_bnsh]
+|                       |
++-----------------------+
+                       ||
+                      Join (concat axis=3)
+
+    Formula (in BNSH space):
+      res_0 = first_half * cos + (second_half * sin * -1)
+      res_1 = second_half * cos + first_half * sin
+      output = Concat(res_0, res_1)
+
+    output_bnsh=true:  output stays BNSH [B,N,S,H] (no back-transpose)
+    output_bnsh=false: output transposed back to BSNH [B,S,N,H]
+
+    Interleaved mode (deinterleave before, re-interleave after):
+      Deinterleave: reshape [B,S,N,rotary_dim] → [B,S,N,half_dim,2]
+                    transpose → [B,S,N,2,half_dim]
+                    reshape → [B,S,N,rotary_dim] (first_half || second_half)
+      Re-interleave: reshape [B,N,S,rotary_dim] → [B,N,S,2,half_dim]
+                     transpose → [B,N,S,half_dim,2]
+                     reshape → [B,N,S,rotary_dim]
 */
 inline Status ApplyRotaryEmbedding(
     ModelBuilder& model_builder,
@@ -47,6 +85,7 @@ inline Status ApplyRotaryEmbedding(
     bool interleaved,
     bool has_position_ids,
     bool position_ids_is_offset,
+    bool output_bnsh,              // If true, output stays in BNSH format (no back-transpose)
     emscripten::val& output) {
   emscripten::val wnn_builder = model_builder.GetBuilder();
   ORT_RETURN_IF_NOT(head_size >= rotary_embedding_dim,
@@ -102,16 +141,23 @@ inline Status ApplyRotaryEmbedding(
         "reshape", rope_input, flat_shape, flat_reshape_options);
   }
 
-  // Split rope_input on last axis into two halves: [B, S, num_heads, half_dim] each.
-  // This preserves all dim descriptors for dims 0-2 (batch, seq, num_heads).
+  // Transpose from BSNH to BNSH for OV RoPEFusionGPTOSS pattern matching.
+  // OV expects cos/sin shape [?, 1, ?, half_ndims] which requires BNSH layout.
+  const std::vector<uint32_t> bsnh_to_bnsh_perm{0, 2, 1, 3};
+  emscripten::val to_bnsh_options = emscripten::val::object();
+  to_bnsh_options.set("label", node_name + "_rotary_to_bnsh");
+  to_bnsh_options.set("permutation", emscripten::val::array(bsnh_to_bnsh_perm));
+  rope_input = wnn_builder.call<emscripten::val>("transpose", rope_input, to_bnsh_options);
+
+  // Split rope_input on last axis into two halves: [B, num_heads, S, half_dim] each.
   const std::vector<uint32_t> half_splits{half_rotary_embedding_dim, half_rotary_embedding_dim};
   emscripten::val split_halves_options = emscripten::val::object();
   split_halves_options.set("label", node_name + "_rotary_split_halves");
   split_halves_options.set("axis", 3);
   emscripten::val split_halves = wnn_builder.call<emscripten::val>(
       "split", rope_input, emscripten::val::array(half_splits), split_halves_options);
-  emscripten::val first_half = split_halves[0];   // [B, S, num_heads, half_dim]
-  emscripten::val second_half = split_halves[1];  // [B, S, num_heads, half_dim]
+  emscripten::val first_half = split_halves[0];   // [B, num_heads, S, half_dim]
+  emscripten::val second_half = split_halves[1];  // [B, num_heads, S, half_dim]
 
   // Helper: generate a 1D range [0, 1, ..., sequence_length-1] with dynamic sequence_length.
   auto build_sequence_range = [&](const std::string& label_suffix) -> emscripten::val {
@@ -148,125 +194,143 @@ inline Status ApplyRotaryEmbedding(
         "add", position_ids, position_ids_range, position_ids_add_range_options);
   }
 
-  // Gather cos/sin values based on position_ids.
-  emscripten::val gather_cos = cos_cache;
-  emscripten::val gather_sin = sin_cache;
+  // Reshape cos/sin cache to 4D [1, 1, max_seq, half_dim] BEFORE gathering.
+  // The reshape target is FULLY STATIC (cos_cache shape is always known constants).
+  // Then gather on axis=2 with 1D indices [S] produces [1, 1, S, half_dim] directly.
+  // OV can verify dim 0=1, dim 1=1 (from data input) and dim 3=half_dim (from data input),
+  // satisfying shape_matches('[?, 1, ?, half_ndims]') without needing a Transpose
+  // (which OV's optimization passes eliminate).
+  //
+  // Both paths:
+  //   cos_cache [max_seq, half_dim] → reshape [1, 1, max_seq, half_dim] (4D, all static)
+  //   → gather axis=2 with [S] indices → [1, 1, S, half_dim] (4D)
+  //   → no transpose needed!
+  //
+  // Broadcasting with split output [B, N, S, half_dim] (B=1 for inference):
+  //   [1, 1, S, half_dim] broadcasts as: dim 0: 1→B, dim 1: 1→N, dim 2: S=S, dim 3: half=half ✓
+  emscripten::val cos_4d, sin_4d;
+
+  // Reshape cos_cache [max_seq, half_dim] → [1, 1, max_seq, half_dim] (fully static target).
+  emscripten::val cos_4d_cache_shape = emscripten::val::array();
+  cos_4d_cache_shape.call<void>("push", 1);
+  cos_4d_cache_shape.call<void>("push", 1);
+  cos_4d_cache_shape.call<void>("push", cos_cache["shape"][0]);  // max_seq (static)
+  cos_4d_cache_shape.call<void>("push", half_rotary_embedding_dim);
+  emscripten::val sin_4d_cache_shape = emscripten::val::array();
+  sin_4d_cache_shape.call<void>("push", 1);
+  sin_4d_cache_shape.call<void>("push", 1);
+  sin_4d_cache_shape.call<void>("push", sin_cache["shape"][0]);  // max_seq (static)
+  sin_4d_cache_shape.call<void>("push", half_rotary_embedding_dim);
+
+  emscripten::val reshape_cos_cache_options = emscripten::val::object();
+  reshape_cos_cache_options.set("label", node_name + "_rotary_reshape_cos_cache");
+  emscripten::val reshaped_cos = wnn_builder.call<emscripten::val>(
+      "reshape", cos_cache, cos_4d_cache_shape, reshape_cos_cache_options);
+  emscripten::val reshape_sin_cache_options = emscripten::val::object();
+  reshape_sin_cache_options.set("label", node_name + "_rotary_reshape_sin_cache");
+  emscripten::val reshaped_sin = wnn_builder.call<emscripten::val>(
+      "reshape", sin_cache, sin_4d_cache_shape, reshape_sin_cache_options);
+
+  // Get 1D position indices for gathering on axis=2.
+  emscripten::val gather_indices_1d;
   if (has_position_ids) {
-    emscripten::val gather_cos_options = emscripten::val::object();
-    emscripten::val gather_sin_options = emscripten::val::object();
-    gather_cos_options.set("label", node_name + "_rotary_gather_cos");
-    gather_sin_options.set("label", node_name + "_rotary_gather_sin");
-    gather_cos_options.set("axis", 0);
-    gather_sin_options.set("axis", 0);
-    gather_cos = wnn_builder.call<emscripten::val>("gather", gather_cos, gather_position_ids, gather_cos_options);
-    gather_sin = wnn_builder.call<emscripten::val>("gather", gather_sin, gather_position_ids, gather_sin_options);
+    // Flatten gather_position_ids from [B, S] to [S] (squeeze batch dim, B=1 for inference).
+    emscripten::val flatten_shape = emscripten::val::array();
+    flatten_shape.call<void>("push", gather_position_ids["shape"][1]);
+    emscripten::val flatten_options = emscripten::val::object();
+    flatten_options.set("label", node_name + "_rotary_flatten_position_ids");
+    gather_indices_1d = wnn_builder.call<emscripten::val>(
+        "reshape", gather_position_ids, flatten_shape, flatten_options);
   } else {
-    emscripten::val position_ids_range = build_sequence_range("_without_ids");
-    emscripten::val gather_cos_options = emscripten::val::object();
-    emscripten::val gather_sin_options = emscripten::val::object();
-    gather_cos_options.set("label", node_name + "_rotary_gather_cos_without_ids");
-    gather_sin_options.set("label", node_name + "_rotary_gather_sin_without_ids");
-    gather_cos_options.set("axis", 0);
-    gather_sin_options.set("axis", 0);
-    gather_cos = wnn_builder.call<emscripten::val>("gather", gather_cos, position_ids_range, gather_cos_options);
-    gather_sin = wnn_builder.call<emscripten::val>("gather", gather_sin, position_ids_range, gather_sin_options);
+    gather_indices_1d = build_sequence_range("_for_cos_sin");
   }
 
-  // Unsqueeze cos/sin to 4D then expand to match first_half's exact shape.
-  // The key insight: static expand() with first_half["shape"] produces output that inherits
-  // first_half's dim descriptors, ensuring mul compatibility in ORT backend.
-  // Step 1: Reshape gather_cos from [B,S,half] or [S,half] to [B,S,1,half] using static reshape.
-  emscripten::val cos_4d_shape = emscripten::val::array();
-  emscripten::val sin_4d_shape = emscripten::val::array();
-  if (has_position_ids) {
-    // 3D [B, S, half_dim] → [B, S, 1, half_dim]
-    cos_4d_shape.call<void>("push", gather_cos["shape"][0]);
-    cos_4d_shape.call<void>("push", gather_cos["shape"][1]);
-    cos_4d_shape.call<void>("push", 1);
-    cos_4d_shape.call<void>("push", half_rotary_embedding_dim);
-    sin_4d_shape.call<void>("push", gather_sin["shape"][0]);
-    sin_4d_shape.call<void>("push", gather_sin["shape"][1]);
-    sin_4d_shape.call<void>("push", 1);
-    sin_4d_shape.call<void>("push", half_rotary_embedding_dim);
-  } else {
-    // 2D [S, half_dim] → [1, S, 1, half_dim]
-    cos_4d_shape.call<void>("push", 1);
-    cos_4d_shape.call<void>("push", gather_cos["shape"][0]);
-    cos_4d_shape.call<void>("push", 1);
-    cos_4d_shape.call<void>("push", half_rotary_embedding_dim);
-    sin_4d_shape.call<void>("push", 1);
-    sin_4d_shape.call<void>("push", gather_sin["shape"][0]);
-    sin_4d_shape.call<void>("push", 1);
-    sin_4d_shape.call<void>("push", half_rotary_embedding_dim);
-  }
+  // Gather on axis=2 with 1D indices [S] → [1, 1, S, half_dim] (4D).
+  // OV knows: dim 0=1 (from data), dim 1=1 (from data), dim 3=half_dim (from data).
+  emscripten::val gather_cos_options = emscripten::val::object();
+  gather_cos_options.set("label", node_name + "_rotary_gather_cos");
+  gather_cos_options.set("axis", 2);
+  cos_4d = wnn_builder.call<emscripten::val>("gather", reshaped_cos, gather_indices_1d, gather_cos_options);
+  emscripten::val gather_sin_options = emscripten::val::object();
+  gather_sin_options.set("label", node_name + "_rotary_gather_sin");
+  gather_sin_options.set("axis", 2);
+  sin_4d = wnn_builder.call<emscripten::val>("gather", reshaped_sin, gather_indices_1d, gather_sin_options);
 
-  emscripten::val reshape_cos_options = emscripten::val::object();
-  emscripten::val reshape_sin_options = emscripten::val::object();
-  reshape_cos_options.set("label", node_name + "_rotary_unsqueeze_cos");
-  reshape_sin_options.set("label", node_name + "_rotary_unsqueeze_sin");
-  emscripten::val cos_4d = wnn_builder.call<emscripten::val>(
-      "reshape", gather_cos, cos_4d_shape, reshape_cos_options);
-  emscripten::val sin_4d = wnn_builder.call<emscripten::val>(
-      "reshape", gather_sin, sin_4d_shape, reshape_sin_options);
+  // Core RoPE formula (matches OpenVINO RoPEFusionGPTOSS pattern):
+  //   Input in BNSH: [B, num_heads, S, head_size]
+  //   cos/sin shape: [B, 1, S, half_ndims] (broadcasts over num_heads)
+  //   first_half_mul_cos = Multiply(first_half, cos)
+  //   second_half_mul_sin = Multiply(second_half, sin)
+  //   neg = Multiply(second_half_mul_sin, -1)
+  //   res_0 = Add(first_half_mul_cos, neg)
+  //
+  //   second_half_mul_cos = Multiply(second_half, cos)
+  //   first_half_mul_sin = Multiply(first_half, sin)
+  //   res_1 = Add(second_half_mul_cos, first_half_mul_sin)
+  //
+  //   result = Concat([res_0, res_1], axis=-1)
 
-  // Step 2: Expand cos/sin to first_half's shape using static expand().
-  // expand() with first_half["shape"] will produce output whose dim descriptors
-  // are derived from first_half's shape, making mul compatible.
-  emscripten::val expand_cos_options = emscripten::val::object();
-  expand_cos_options.set("label", node_name + "_rotary_expand_cos");
-  cos_4d = wnn_builder.call<emscripten::val>(
-      "expand", cos_4d, first_half["shape"], expand_cos_options);
-  emscripten::val expand_sin_options = emscripten::val::object();
-  expand_sin_options.set("label", node_name + "_rotary_expand_sin");
-  sin_4d = wnn_builder.call<emscripten::val>(
-      "expand", sin_4d, first_half["shape"], expand_sin_options);
-
-  // Core RoPE formula (matches OpenVINO's RoPE fusion pattern):
-  // res_0 = first_half * cos - second_half * sin
-  // res_1 = second_half * cos + first_half * sin
-
-  emscripten::val mul_first_cos_options = emscripten::val::object();
-  mul_first_cos_options.set("label", node_name + "_rotary_first_mul_cos");
+  emscripten::val first_mul_cos_options = emscripten::val::object();
+  first_mul_cos_options.set("label", node_name + "_rotary_first_mul_cos");
   emscripten::val first_mul_cos = wnn_builder.call<emscripten::val>(
-      "mul", first_half, cos_4d, mul_first_cos_options);
+      "mul", first_half, cos_4d, first_mul_cos_options);
 
-  emscripten::val mul_second_sin_options = emscripten::val::object();
-  mul_second_sin_options.set("label", node_name + "_rotary_second_mul_sin");
+  emscripten::val second_mul_sin_options = emscripten::val::object();
+  second_mul_sin_options.set("label", node_name + "_rotary_second_mul_sin");
   emscripten::val second_mul_sin = wnn_builder.call<emscripten::val>(
-      "mul", second_half, sin_4d, mul_second_sin_options);
+      "mul", second_half, sin_4d, second_mul_sin_options);
+
+  // Multiply by scalar -1 to negate (matches OV's Mul(-1) pattern).
+  const emscripten::val& neg_one_constant =
+      model_builder.CreateOrGetConstant<float>(input_data_type, -1.0f);
+
+  emscripten::val neg_options = emscripten::val::object();
+  neg_options.set("label", node_name + "_rotary_neg");
+  emscripten::val neg_second_mul_sin = wnn_builder.call<emscripten::val>(
+      "mul", second_mul_sin, neg_one_constant, neg_options);
 
   emscripten::val sub_options = emscripten::val::object();
   sub_options.set("label", node_name + "_rotary_sub");
   emscripten::val res_0 = wnn_builder.call<emscripten::val>(
-      "sub", first_mul_cos, second_mul_sin, sub_options);
+      "add", first_mul_cos, neg_second_mul_sin, sub_options);
 
-  emscripten::val mul_second_cos_options = emscripten::val::object();
-  mul_second_cos_options.set("label", node_name + "_rotary_second_mul_cos");
+  emscripten::val second_mul_cos_options = emscripten::val::object();
+  second_mul_cos_options.set("label", node_name + "_rotary_second_mul_cos");
   emscripten::val second_mul_cos = wnn_builder.call<emscripten::val>(
-      "mul", second_half, cos_4d, mul_second_cos_options);
+      "mul", second_half, cos_4d, second_mul_cos_options);
 
-  emscripten::val mul_first_sin_options = emscripten::val::object();
-  mul_first_sin_options.set("label", node_name + "_rotary_first_mul_sin");
+  emscripten::val first_mul_sin_options = emscripten::val::object();
+  first_mul_sin_options.set("label", node_name + "_rotary_first_mul_sin");
   emscripten::val first_mul_sin = wnn_builder.call<emscripten::val>(
-      "mul", first_half, sin_4d, mul_first_sin_options);
+      "mul", first_half, sin_4d, first_mul_sin_options);
 
   emscripten::val add_options = emscripten::val::object();
   add_options.set("label", node_name + "_rotary_add");
   emscripten::val res_1 = wnn_builder.call<emscripten::val>(
       "add", second_mul_cos, first_mul_sin, add_options);
 
-  // Concat results back: [B, S, num_heads, rotary_dim]
+  // Concat results: [B, num_heads, S, rotary_dim] (BNSH)
+  emscripten::val concat_result_inputs = emscripten::val::array();
+  concat_result_inputs.call<void>("push", res_0);
+  concat_result_inputs.call<void>("push", res_1);
   emscripten::val concat_result_options = emscripten::val::object();
   concat_result_options.set("label", node_name + "_rotary_concat_result");
-  emscripten::val concat_inputs = emscripten::val::array();
-  concat_inputs.call<void>("push", res_0);
-  concat_inputs.call<void>("push", res_1);
-  output = wnn_builder.call<emscripten::val>("concat", concat_inputs, 3, concat_result_options);
+  output = wnn_builder.call<emscripten::val>(
+      "concat", concat_result_inputs, 3, concat_result_options);
+
+  if (!output_bnsh) {
+    // Transpose back from BNSH to BSNH.
+    emscripten::val to_bsnh_options = emscripten::val::object();
+    to_bsnh_options.set("label", node_name + "_rotary_to_bsnh");
+    to_bsnh_options.set("permutation", emscripten::val::array(bsnh_to_bnsh_perm));
+    output = wnn_builder.call<emscripten::val>("transpose", output, to_bsnh_options);
+  }
 
   // For interleaved mode, re-interleave the result.
-  // [B, S, num_heads, rotary_dim] → reshape [B, S, num_heads, 2, half_dim]
-  //                                → transpose [B, S, num_heads, half_dim, 2]
-  //                                → reshape [B, S, num_heads, rotary_dim]
+  // The output is [B, ?, ?, rotary_dim] (BSNH or BNSH depending on output_bnsh).
+  // Re-interleave by: reshape → [.., .., .., 2, half_dim]
+  //                    transpose → [.., .., .., half_dim, 2]
+  //                    reshape → [.., .., .., rotary_dim]
   if (interleaved) {
     emscripten::val reinterleave_shape = emscripten::val::array();
     reinterleave_shape.call<void>("push", output["shape"][0]);
@@ -299,6 +363,14 @@ inline Status ApplyRotaryEmbedding(
 
   // Join the rotary output with the rest of the input if head_size > rotary_dim.
   if (head_size != rotary_embedding_dim) {
+    // When output_bnsh=true, partial_input1 is still in BSNH (split before Transpose).
+    // Transpose it to BNSH to match the output format before concatenation.
+    if (output_bnsh) {
+      emscripten::val partial_to_bnsh_options = emscripten::val::object();
+      partial_to_bnsh_options.set("label", node_name + "_rotary_partial_to_bnsh");
+      partial_to_bnsh_options.set("permutation", emscripten::val::array(bsnh_to_bnsh_perm));
+      partial_input1 = wnn_builder.call<emscripten::val>("transpose", partial_input1, partial_to_bnsh_options);
+    }
     emscripten::val concat_back_input_options = emscripten::val::object();
     concat_back_input_options.set("label", node_name + "_rotary_concat_back_input");
     emscripten::val concat_back = emscripten::val::array();

@@ -266,11 +266,17 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   }
 
   // Apply rotary embedding if do_rotary is true
+  bool rotary_produced_bnsh = false;
+  emscripten::val rotary_key_bnsh = emscripten::val::undefined();
   if (do_rotary && has_cos_cache && has_sin_cache) {
     // Determine rotary_embedding_dim from cos_cache shape
     std::vector<int64_t> cos_cache_shape;
     ORT_RETURN_IF_NOT(GetShape(*input_defs[7], cos_cache_shape, logger), "Cannot get cos_cache shape");
     const uint32_t rotary_embedding_dim = static_cast<uint32_t>(cos_cache_shape[1] * 2);
+
+    // Always output BNSH directly to avoid paired transposes that the downstream
+    // TransposeOptimizer would cancel (breaking OpenVINO's RoPE pattern matching).
+    const bool rotary_output_bnsh = true;
 
     // Reshape query to (batch_size, sequence_length, num_heads, head_size) for rotary embedding
     emscripten::val query_reshape_for_rotary = emscripten::val::array();
@@ -298,16 +304,8 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
         rotary_interleaved,
         true,
         use_position_ids_as_offset,  // position_ids_is_offset
+        rotary_output_bnsh,
         rotary_query_output));
-
-    // Reshape back to (batch_size, sequence_length, hidden_size)
-    emscripten::val query_reshape_after_rotary = emscripten::val::array();
-    query_reshape_after_rotary.call<void>("push", rotary_query_output["shape"][0]);
-    query_reshape_after_rotary.call<void>("push", rotary_query_output["shape"][1]);
-    query_reshape_after_rotary.call<void>("push", qkv_hidden_size);
-    common_options.set("label", node.Name() + "_/GQA/query/reshape_after_rotary");
-    query_input = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", rotary_query_output, query_reshape_after_rotary, common_options);
 
     // Reshape key to (batch_size, sequence_length, kv_num_heads, head_size) for rotary embedding
     emscripten::val key_reshape_for_rotary = emscripten::val::array();
@@ -335,48 +333,66 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
         rotary_interleaved,
         true,
         use_position_ids_as_offset,  // position_ids_is_offset
+        rotary_output_bnsh,
         rotary_key_output));
 
-    // Reshape back to (batch_size, sequence_length, kv_hidden_size)
-    const uint32_t kv_hidden_size = kv_num_heads * head_size;
-    emscripten::val key_reshape_after_rotary = emscripten::val::array();
-    key_reshape_after_rotary.call<void>("push", rotary_key_output["shape"][0]);
-    key_reshape_after_rotary.call<void>("push", rotary_key_output["shape"][1]);
-    key_reshape_after_rotary.call<void>("push", kv_hidden_size);
-    common_options.set("label", node.Name() + "_/GQA/key/reshape_after_rotary");
-    key_input = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", rotary_key_output, key_reshape_after_rotary, common_options);
+    // BNSH outputs: use directly, skip reshape-to-flat + later reshape+transpose
+    query_input = rotary_query_output;  // [B, N, S, H]
+    rotary_key_bnsh = rotary_key_output;  // [B, kv_N, S, H]
+    rotary_produced_bnsh = true;
   }
 
-  // Reshape and transpose query: (B, S, N*H) -> (B, N, S, H)
-  emscripten::val reshape_tensor_shape = emscripten::val::array();
-  reshape_tensor_shape.call<void>("push", query_input["shape"][0]);
-  reshape_tensor_shape.call<void>("push", query_input["shape"][1]);
-  reshape_tensor_shape.call<void>("push", num_heads);
-  reshape_tensor_shape.call<void>("push", head_size);
-  common_options.set("label", node.Name() + "_/GQA/query/reshape");
-  emscripten::val reshaped_query = model_builder.GetBuilder().call<emscripten::val>(
-      "reshape", query_input, reshape_tensor_shape, common_options);
-
+  emscripten::val new_query;
+  emscripten::val key_bsnh;
+  emscripten::val value_bsnh;
   emscripten::val transpose_options = emscripten::val::object();
-  transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
-  transpose_options.set("label", node.Name() + "_/GQA/query/transpose");
-  emscripten::val new_query =
-      model_builder.GetBuilder().call<emscripten::val>("transpose", reshaped_query, transpose_options);
 
-  // Reshape key and value from BSW to BSNH: (B, S, kv_N*H) -> (B, S, kv_N, H)
-  emscripten::val reshape_kv_shape = emscripten::val::array();
-  reshape_kv_shape.call<void>("push", key_input["shape"][0]);
-  reshape_kv_shape.call<void>("push", key_input["shape"][1]);
-  reshape_kv_shape.call<void>("push", kv_num_heads);
-  reshape_kv_shape.call<void>("push", head_size);
-  common_options.set("label", node.Name() + "_/GQA/key/reshape_bsnh");
-  emscripten::val key_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-      "reshape", key_input, reshape_kv_shape, common_options);
+  if (rotary_produced_bnsh) {
+    // Query is already BNSH from rotary embedding output.
+    new_query = query_input;
 
-  common_options.set("label", node.Name() + "_/GQA/value/reshape_bsnh");
-  emscripten::val value_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-      "reshape", value_input, reshape_kv_shape, common_options);
+    // Key is already BNSH (rotary_key_bnsh).
+    // The ScatterND path uses BNSH key directly to avoid a Transpose that would
+    // form a pair with the internal RoPE transpose (breaking OV pattern matching).
+
+    // For value (not rotary-embedded), reshape to BSNH.
+    emscripten::val reshape_kv_shape = emscripten::val::array();
+    reshape_kv_shape.call<void>("push", value_input["shape"][0]);
+    reshape_kv_shape.call<void>("push", value_input["shape"][1]);
+    reshape_kv_shape.call<void>("push", kv_num_heads);
+    reshape_kv_shape.call<void>("push", head_size);
+    common_options.set("label", node.Name() + "_/GQA/value/reshape_bsnh");
+    value_bsnh = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", value_input, reshape_kv_shape, common_options);
+  } else {
+    // Normal path: reshape query to 4D + transpose to BNSH.
+    emscripten::val reshape_tensor_shape = emscripten::val::array();
+    reshape_tensor_shape.call<void>("push", query_input["shape"][0]);
+    reshape_tensor_shape.call<void>("push", query_input["shape"][1]);
+    reshape_tensor_shape.call<void>("push", num_heads);
+    reshape_tensor_shape.call<void>("push", head_size);
+    common_options.set("label", node.Name() + "_/GQA/query/reshape");
+    emscripten::val reshaped_query = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", query_input, reshape_tensor_shape, common_options);
+
+    transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
+    transpose_options.set("label", node.Name() + "_/GQA/query/transpose");
+    new_query = model_builder.GetBuilder().call<emscripten::val>("transpose", reshaped_query, transpose_options);
+
+    // Reshape key and value from BSW to BSNH: (B, S, kv_N*H) -> (B, S, kv_N, H)
+    emscripten::val reshape_kv_shape = emscripten::val::array();
+    reshape_kv_shape.call<void>("push", key_input["shape"][0]);
+    reshape_kv_shape.call<void>("push", key_input["shape"][1]);
+    reshape_kv_shape.call<void>("push", kv_num_heads);
+    reshape_kv_shape.call<void>("push", head_size);
+    common_options.set("label", node.Name() + "_/GQA/key/reshape_bsnh");
+    key_bsnh = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", key_input, reshape_kv_shape, common_options);
+
+    common_options.set("label", node.Name() + "_/GQA/value/reshape_bsnh");
+    value_bsnh = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", value_input, reshape_kv_shape, common_options);
+  }
 
   // Compute sequence_length (S) dynamically as a scalar INT32 value.
   // WebNN doesn't have a "shape()" op, so we derive S by: expand([1], shape=[S]) → reduceSum → S.
@@ -385,7 +401,8 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       model_builder.CreateOrGetConstant<int>(ONNX_NAMESPACE::TensorProto_DataType_INT32, 1, {1});
 
   emscripten::val seq_ones_shape = emscripten::val::array();
-  seq_ones_shape.call<void>("push", key_bsnh["shape"][1]);
+  // S is at dim 1 in BSNH (value_bsnh) or dim 2 in BNSH (new_query).
+  seq_ones_shape.call<void>("push", rotary_produced_bnsh ? new_query["shape"][2] : value_bsnh["shape"][1]);
   common_options.set("label", node.Name() + "_/GQA/seq_ones");
   emscripten::val seq_ones = model_builder.GetBuilder().call<emscripten::val>(
       "expand", value_one_constant, seq_ones_shape, common_options);
@@ -404,12 +421,21 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   emscripten::val present_key;
   emscripten::val present_value;
   if (model_builder.IsCausalLMEnabled()) {
-    // Concat path: transpose key/value to BNSH, then concat(past_kv, new_kv, axis=2)
-    transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
-    transpose_options.set("label", node.Name() + "_/GQA/key/transpose_to_bnsh");
-    emscripten::val new_key_bnsh = model_builder.GetBuilder().call<emscripten::val>(
-        "transpose", key_bsnh, transpose_options);
+    // Concat path: key/value in BNSH, then concat(past_kv, new_kv, axis=2)
+    emscripten::val new_key_bnsh;
+    if (rotary_produced_bnsh) {
+      // Key is already BNSH from rotary embedding.
+      new_key_bnsh = rotary_key_bnsh;
+    } else {
+      // Transpose key from BSNH to BNSH.
+      transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
+      transpose_options.set("label", node.Name() + "_/GQA/key/transpose_to_bnsh");
+      new_key_bnsh = model_builder.GetBuilder().call<emscripten::val>(
+          "transpose", key_bsnh, transpose_options);
+    }
 
+    // Value always needs transpose from BSNH to BNSH.
+    transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
     transpose_options.set("label", node.Name() + "_/GQA/value/transpose_to_bnsh");
     emscripten::val new_value_bnsh = model_builder.GetBuilder().call<emscripten::val>(
         "transpose", value_bsnh, transpose_options);
@@ -435,18 +461,42 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     }
   } else {
     // ScatterND path: scatter new key/value into past_kv buffer at the correct position.
-    // key_bsnh/value_bsnh are in BSNH format — used directly as ScatterND updates.
+    // When rotary_produced_bnsh: key is BNSH (rotary_key_bnsh), value transposed to BNSH.
+    // Otherwise: key_bsnh/value_bsnh are in BSNH format.
     if (has_past_key && has_past_value) {
-      /* Build scatter_indices [B,S,kv_N,3] where last dim = [batch_idx, head_idx, seq_idx].
+      /* Build scatter_indices [B,kv_N,S,3] (BNSH) or [B,S,kv_N,3] (BSNH)
+         where last dim = [batch_idx, head_idx, seq_idx].
          - range_b: [0..B-1] broadcast to [B,S,kv_N]
-         - range_k: [0..kv_N-1] broadcast to [B,S,kv_N]
-         - range_s: [0..S-1] + scatter_pos, broadcast to [B,S,kv_N]
+         - range_k: [0..kv_N-1] broadcast to [B,S,kv_N] or [B,kv_N,S]
+         - range_s: [0..S-1] + scatter_pos, broadcast to [B,S,kv_N] or [B,kv_N,S]
          - scatter_pos = seqlens_k - (S-1) = past_sequence_length
       */
 
+      // When rotary_produced_bnsh, key is BNSH [B,kv_N,S,H] — build indices in BNSH layout
+      // to avoid a BNSH→BSNH transpose that would pair with the internal RoPE transpose.
+      // Otherwise key is BSNH [B,S,kv_N,H] — build indices in BSNH layout.
+      // In both cases, index last dim = [batch_idx, head_idx, seq_idx] matching past_key [B,kv_N,max_seq,H].
+
+      // key_for_scatter and value_for_scatter: the update tensors for ScatterND
+      emscripten::val key_for_scatter = rotary_produced_bnsh ? rotary_key_bnsh : key_bsnh;
+      // Value: transpose to BNSH if rotary_produced_bnsh (to share indices), else keep BSNH.
+      emscripten::val value_for_scatter;
+      if (rotary_produced_bnsh) {
+        transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
+        transpose_options.set("label", node.Name() + "_/GQA/value/transpose_to_bnsh_for_scatter");
+        value_for_scatter = model_builder.GetBuilder().call<emscripten::val>(
+            "transpose", value_bsnh, transpose_options);
+      } else {
+        value_for_scatter = value_bsnh;
+      }
+
+      // Dim references for the update tensor (BNSH: [B,kv_N,S,H] or BSNH: [B,S,kv_N,H])
+      // dim_b=0 always, dim_s and dim_k swap between layouts.
+      const uint32_t scatter_dim_s = rotary_produced_bnsh ? 2 : 1;
+
       // scatter_pos_for_scatter: [B,1,1] = seqlens_k reshaped, offset-corrected
       emscripten::val scatter_pos_reshape_shape = emscripten::val::array();
-      scatter_pos_reshape_shape.call<void>("push", key_bsnh["shape"][0]);
+      scatter_pos_reshape_shape.call<void>("push", key_for_scatter["shape"][0]);
       scatter_pos_reshape_shape.call<void>("push", 1);
       scatter_pos_reshape_shape.call<void>("push", 1);
       common_options.set("label", node.Name() + "_/GQA/scatter/scatter_pos_reshape");
@@ -458,14 +508,15 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       scatter_pos_for_scatter = model_builder.GetBuilder().call<emscripten::val>(
           "sub", scatter_pos_for_scatter, s_minus_1, common_options);
 
-      emscripten::val bsk_shape = emscripten::val::array();
-      bsk_shape.call<void>("push", key_bsnh["shape"][0]);
-      bsk_shape.call<void>("push", key_bsnh["shape"][1]);
-      bsk_shape.call<void>("push", key_bsnh["shape"][2]);
+      // expand_shape: [B, kv_N, S] (BNSH) or [B, S, kv_N] (BSNH)
+      emscripten::val expand_shape = emscripten::val::array();
+      expand_shape.call<void>("push", key_for_scatter["shape"][0]);
+      expand_shape.call<void>("push", key_for_scatter["shape"][1]);
+      expand_shape.call<void>("push", key_for_scatter["shape"][2]);
 
-      // range_b: [B] -> [B,S,kv_N]
+      // range_b: [B] → reshape [B,1,1] → expand to expand_shape
       emscripten::val b_shape = emscripten::val::array();
-      b_shape.call<void>("push", key_bsnh["shape"][0]);
+      b_shape.call<void>("push", key_for_scatter["shape"][0]);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_ones");
       emscripten::val range_b = model_builder.GetBuilder().call<emscripten::val>(
           "expand", value_one_constant, b_shape, common_options);
@@ -478,18 +529,18 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_sub");
       range_b = model_builder.GetBuilder().call<emscripten::val>("sub", range_b, value_one_constant, common_options);
       emscripten::val range_b_reshape_shape = emscripten::val::array();
-      range_b_reshape_shape.call<void>("push", key_bsnh["shape"][0]);
+      range_b_reshape_shape.call<void>("push", key_for_scatter["shape"][0]);
       range_b_reshape_shape.call<void>("push", 1);
       range_b_reshape_shape.call<void>("push", 1);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_reshape");
       range_b = model_builder.GetBuilder().call<emscripten::val>(
           "reshape", range_b, range_b_reshape_shape, common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_expand");
-      range_b = model_builder.GetBuilder().call<emscripten::val>("expand", range_b, bsk_shape, common_options);
+      range_b = model_builder.GetBuilder().call<emscripten::val>("expand", range_b, expand_shape, common_options);
 
-      // range_s: [S] -> [B,S,kv_N], then add scatter_pos offset.
+      // range_s: [S] → reshape to [1,1,S] (BNSH) or [1,S,1] (BSNH) → expand, add offset
       emscripten::val s_shape = emscripten::val::array();
-      s_shape.call<void>("push", key_bsnh["shape"][1]);
+      s_shape.call<void>("push", key_for_scatter["shape"][scatter_dim_s]);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_ones");
       emscripten::val range_s_plus_one = model_builder.GetBuilder().call<emscripten::val>(
           "expand", value_one_constant, s_shape, common_options);
@@ -503,36 +554,45 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       emscripten::val range_s = model_builder.GetBuilder().call<emscripten::val>(
           "sub", range_s_plus_one, value_one_constant, common_options);
       emscripten::val range_s_reshape_shape = emscripten::val::array();
-      range_s_reshape_shape.call<void>("push", 1);
-      range_s_reshape_shape.call<void>("push", key_bsnh["shape"][1]);
-      range_s_reshape_shape.call<void>("push", 1);
+      if (rotary_produced_bnsh) {
+        // BNSH: S is dim 2 → reshape to [1,1,S]
+        range_s_reshape_shape.call<void>("push", 1);
+        range_s_reshape_shape.call<void>("push", 1);
+        range_s_reshape_shape.call<void>("push", key_for_scatter["shape"][scatter_dim_s]);
+      } else {
+        // BSNH: S is dim 1 → reshape to [1,S,1]
+        range_s_reshape_shape.call<void>("push", 1);
+        range_s_reshape_shape.call<void>("push", key_for_scatter["shape"][scatter_dim_s]);
+        range_s_reshape_shape.call<void>("push", 1);
+      }
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_reshape");
       range_s = model_builder.GetBuilder().call<emscripten::val>(
           "reshape", range_s, range_s_reshape_shape, common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_expand");
-      range_s = model_builder.GetBuilder().call<emscripten::val>("expand", range_s, bsk_shape, common_options);
+      range_s = model_builder.GetBuilder().call<emscripten::val>("expand", range_s, expand_shape, common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/scatter_pos_expand");
       scatter_pos_for_scatter = model_builder.GetBuilder().call<emscripten::val>("expand", scatter_pos_for_scatter,
-                                                                                 bsk_shape, common_options);
+                                                                                 expand_shape, common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_add_offset");
       range_s = model_builder.GetBuilder().call<emscripten::val>(
           "add", range_s, scatter_pos_for_scatter, common_options);
 
-      // range_k: [kv_N] -> [B,S,kv_N]
+      // range_k: [kv_N] → reshape to [1,kv_N,1] (BNSH) or [1,1,kv_N] (BSNH) → expand
       std::vector<int32_t> range_k_data(kv_num_heads);
       std::iota(range_k_data.begin(), range_k_data.end(), 0);
       std::string range_k_name = "webnn_GQA_range_k_" + std::to_string(kv_num_heads);
       emscripten::val range_k = model_builder.CreateOrGetConstant<int32_t>(
           ONNX_NAMESPACE::TensorProto_DataType_INT32, range_k_name, range_k_data,
-          std::vector<uint32_t>({1, 1, kv_num_heads}));
+          rotary_produced_bnsh ? std::vector<uint32_t>({1, kv_num_heads, 1})
+                               : std::vector<uint32_t>({1, 1, kv_num_heads}));
       common_options.set("label", node.Name() + "_/GQA/scatter/range_k_expand");
-      range_k = model_builder.GetBuilder().call<emscripten::val>("expand", range_k, bsk_shape, common_options);
+      range_k = model_builder.GetBuilder().call<emscripten::val>("expand", range_k, expand_shape, common_options);
 
-      // Reshape all index components to [B,S,kv_N,1] and concat to [B,S,kv_N,3]
+      // Reshape all index components to [B,kv_N,S,1] or [B,S,kv_N,1] and concat to [...,3]
       emscripten::val index_last_dim_shape = emscripten::val::array();
-      index_last_dim_shape.call<void>("push", key_bsnh["shape"][0]);
-      index_last_dim_shape.call<void>("push", key_bsnh["shape"][1]);
-      index_last_dim_shape.call<void>("push", key_bsnh["shape"][2]);
+      index_last_dim_shape.call<void>("push", key_for_scatter["shape"][0]);
+      index_last_dim_shape.call<void>("push", key_for_scatter["shape"][1]);
+      index_last_dim_shape.call<void>("push", key_for_scatter["shape"][2]);
       index_last_dim_shape.call<void>("push", 1);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_reshape_last");
       range_b = model_builder.GetBuilder().call<emscripten::val>(
@@ -555,19 +615,24 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       // ScatterND: update past_kv buffer with new key/value at computed positions
       common_options.set("label", node.Name() + "_/GQA/present_key/ScatterND");
       present_key = model_builder.GetBuilder().call<emscripten::val>(
-          "scatterND", past_key_input, scatter_indices, key_bsnh, common_options);
+          "scatterND", past_key_input, scatter_indices, key_for_scatter, common_options);
 
       common_options.set("label", node.Name() + "_/GQA/present_value/ScatterND");
       present_value = model_builder.GetBuilder().call<emscripten::val>(
-          "scatterND", past_value_input, scatter_indices, value_bsnh, common_options);
+          "scatterND", past_value_input, scatter_indices, value_for_scatter, common_options);
     } else {
       // No past_key/past_value, use key/value directly (first token / prefill).
-      // Transpose key and value to BNSH: (B, S, kv_N, H) -> (B, kv_N, S, H)
-      transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
-      transpose_options.set("label", node.Name() + "_/GQA/key/transpose_to_bnsh");
-      present_key = model_builder.GetBuilder().call<emscripten::val>(
-          "transpose", key_bsnh, transpose_options);
+      // Key/value must be in BNSH format for attention.
+      if (rotary_produced_bnsh) {
+        present_key = rotary_key_bnsh;
+      } else {
+        transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
+        transpose_options.set("label", node.Name() + "_/GQA/key/transpose_to_bnsh");
+        present_key = model_builder.GetBuilder().call<emscripten::val>(
+            "transpose", key_bsnh, transpose_options);
+      }
 
+      transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
       transpose_options.set("label", node.Name() + "_/GQA/value/transpose_to_bnsh");
       present_value = model_builder.GetBuilder().call<emscripten::val>(
           "transpose", value_bsnh, transpose_options);
@@ -674,7 +739,7 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
 
   // Build range [1..S] for the query token positions.
   emscripten::val range_s_ones_shape = emscripten::val::array();
-  range_s_ones_shape.call<void>("push", key_bsnh["shape"][1]);
+  range_s_ones_shape.call<void>("push", value_bsnh["shape"][1]);
   common_options.set("label", node.Name() + "_/GQA/mask/range_s_ones");
   emscripten::val range_s_plus_one = model_builder.GetBuilder().call<emscripten::val>(
       "expand", value_int_one_constant, range_s_ones_shape, common_options);
@@ -710,7 +775,7 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   // Expand to [total_seq, S] then transpose to [S, total_seq] for broadcasting with neq_left.
   emscripten::val reshape_pre_neq_right = emscripten::val::array();
   reshape_pre_neq_right.call<void>("push", true_present_value["shape"][2]);
-  reshape_pre_neq_right.call<void>("push", key_bsnh["shape"][1]);
+  reshape_pre_neq_right.call<void>("push", value_bsnh["shape"][1]);
 
   common_options.set("label", node.Name() + "_/GQA/expand_neq_right");
   emscripten::val expanded_neq_right = model_builder.GetBuilder().call<emscripten::val>(
