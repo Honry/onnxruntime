@@ -8,6 +8,7 @@
 #include <core/graph/graph_viewer.h>
 
 #include "model.h"
+#include "shape_subgraph_folder.h"
 #include "core/framework/execution_provider.h"
 #include "core/providers/webnn/builders/helper.h"
 
@@ -58,6 +59,11 @@ class ModelBuilder {
   // Returns true when GQA should use concat-based (stateful) KV-cache; false for ScatterND (stateless).
   bool IsCausalLMEnabled() const { return enable_causal_lm_; }
 
+  // Shape subgraph folder: check if a NodeArg name has been folded to a constant shape.
+  bool IsFoldedShape(const std::string& name) const;
+  const std::vector<int64_t>* GetFoldedShape(const std::string& name) const;
+  bool IsFoldedNode(NodeIndex node_index) const;
+
   // The initializer will be processed separately, skip it as an initializer.
   void AddInitializerToSkip(const std::string& tensor_name);
 
@@ -99,6 +105,7 @@ class ModelBuilder {
   emscripten::val wnn_limits_ = emscripten::val::undefined();
   FreeDimensionBounds free_dimension_bounds_;
   bool enable_causal_lm_;
+  std::unique_ptr<ShapeSubgraphFolder> shape_folder_;
   InlinedHashMap<std::string, emscripten::val> wnn_operands_;
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;

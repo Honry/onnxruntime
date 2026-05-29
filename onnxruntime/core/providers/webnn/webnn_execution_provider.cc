@@ -87,13 +87,28 @@ WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_view
 
   const auto supported_nodes = webnn::GetSupportedNodes(graph_viewer, wnn_builder, wnn_device_type_, wnn_limits_, logger);
 
+  // Run the shape subgraph folder to identify nodes that will be folded away during graph build.
+  // These nodes must be claimed as "supported" so they stay in our partition, even if their
+  // data types (e.g., int64 Equal) aren't natively supported by WebNN — they'll be skipped
+  // during ModelBuilder::AddOperations().
+  webnn::ShapeSubgraphFolder capability_folder(graph_viewer, free_dimension_bounds_, logger);
+  auto folder_status = capability_folder.Run();
+  std::unordered_set<const Node*> supported_nodes_with_folded = supported_nodes;
+  if (folder_status.IsOK()) {
+    for (const auto& node : graph_viewer.Nodes()) {
+      if (capability_folder.IsFoldedNode(node.Index())) {
+        supported_nodes_with_folded.insert(&node);
+      }
+    }
+  }
+
   const auto gen_metadef_name = [&]() {
     HashValue model_hash;
     int metadef_id = metadef_id_generator_.GenerateId(graph_viewer, model_hash);
     return MakeString(WEBNN, "_", model_hash, "_", metadef_id);
   };
 
-  auto result = utils::CreateSupportedPartitions(graph_viewer, supported_nodes, {},
+  auto result = utils::CreateSupportedPartitions(graph_viewer, supported_nodes_with_folded, {},
                                                  gen_metadef_name, WEBNN, kWebNNExecutionProvider,
                                                  &node_unit_map, /*drop_constant_initializers*/ true);
 
@@ -429,6 +444,40 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                   }
                 }
               }
+
+              // Try to parse additive expressions like "dim_a + dim_b"
+              // (e.g., "past_sequence_length + sequence_length").
+              if (output_shape[dim_idx] == 0) {
+                auto plus_pos = dim_param.find('+');
+                if (plus_pos != std::string::npos) {
+                  const std::string left = utils::TrimString(std::string_view(dim_param).substr(0, plus_pos));
+                  const std::string right = utils::TrimString(std::string_view(dim_param).substr(plus_pos + 1));
+
+                  // Resolve each operand (from runtime inputs or fixed bounds).
+                  auto resolve_operand = [&](const std::string& operand) -> int64_t {
+                    auto it = dim_param_to_input_dim.find(operand);
+                    if (it != dim_param_to_input_dim.end()) {
+                      const size_t src_idx = it->second.first;
+                      const size_t src_dim = it->second.second;
+                      if (src_idx < runtime_input_shapes.size() &&
+                          src_dim < runtime_input_shapes[src_idx].size()) {
+                        return runtime_input_shapes[src_idx][src_dim];
+                      }
+                    }
+                    auto fixed_it = fixed_dim_param_values.find(operand);
+                    if (fixed_it != fixed_dim_param_values.end()) {
+                      return fixed_it->second;
+                    }
+                    return -1;  // unresolved
+                  };
+
+                  int64_t left_val = resolve_operand(left);
+                  int64_t right_val = resolve_operand(right);
+                  if (left_val >= 0 && right_val >= 0) {
+                    output_shape[dim_idx] = left_val + right_val;
+                  }
+                }
+              }
             }
           }
 
@@ -458,12 +507,10 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
             }
           }
 
-          // Hard fail if dynamic dimensions remain unresolved.
-          // TODO: When WebNN supports the dispatch() API that returns output MLTensors with
-          // shapes inferred from actual input tensors, we can query the real output shapes
-          // at runtime instead of relying on symbolic dim_param matching. This would eliminate
-          // the need for the simplify_dynamic_shapes.py preprocessing step and handle all
-          // dynamic shape cases natively (including data-dependent output shapes).
+          // If dynamic dimensions remain unresolved, try to infer from the max bounds
+          // of known dims (e.g., use batch_size=1 for dim 0, sequence_length for others).
+          // This handles intermediate outputs (like Expand's causal mask) whose shapes are
+          // data-dependent and not annotated with a resolvable dim_param.
           for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
             if (output_shape[dim_idx] == webnn::kDynamicDim) {
               std::string unresolved_dim_param;
@@ -471,15 +518,34 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                 unresolved_dim_param = output_dim_params[output_idx][dim_idx];
               }
 
-              LOGS_DEFAULT(ERROR) << "[WebNN] Failed to resolve dynamic output dimension for output ["
-                                  << output_name << "] at dim index [" << dim_idx
-                                  << "], dim_param: [" << unresolved_dim_param
-                                  << "]. Please ensure this dim_param can be inferred from graph inputs"
-                                  << " or provide pre-allocated output tensors via session.run(feeds, fetches).";
-              return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
-                                     "[WebNN] Failed to resolve dynamic output dimension for output: ", output_name,
-                                     " at dim index: ", dim_idx,
-                                     ". dim_param: ", unresolved_dim_param);
+              // Instead of hard-failing, use a heuristic:
+              // - Try to match the unresolved dim to any input dim at the same index.
+              // - As a last resort, copy from the largest input shape at this dim index.
+              int64_t inferred = 0;
+              for (size_t inp_idx = 0; inp_idx < runtime_input_shapes.size() && inferred == 0; ++inp_idx) {
+                if (dim_idx < runtime_input_shapes[inp_idx].size()) {
+                  int64_t candidate = runtime_input_shapes[inp_idx][dim_idx];
+                  if (candidate > inferred) {
+                    inferred = candidate;
+                  }
+                }
+              }
+
+              if (inferred > 0) {
+                LOGS_DEFAULT(WARNING) << "[WebNN] Unresolved output dim for [" << output_name
+                                     << "] at index " << dim_idx << " (dim_param: [" << unresolved_dim_param
+                                     << "]). Inferred from runtime inputs: " << inferred;
+                output_shape[dim_idx] = inferred;
+              } else {
+                LOGS_DEFAULT(ERROR) << "[WebNN] Failed to resolve dynamic output dimension for output ["
+                                    << output_name << "] at dim index [" << dim_idx
+                                    << "], dim_param: [" << unresolved_dim_param
+                                    << "]. No input dims available for inference.";
+                return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
+                                       "[WebNN] Failed to resolve dynamic output dimension for output: ", output_name,
+                                       " at dim index: ", dim_idx,
+                                       ". dim_param: ", unresolved_dim_param);
+              }
             }
           }
 

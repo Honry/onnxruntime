@@ -85,10 +85,11 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     }
   }
 
-  // For per-axis quantization/dequantization and axis is not equal to input_rank - 1,
-  // we need to reshape the scale and zero_point tensors to make them broadcastable with the input tensor.
+  // For per-axis quantization/dequantization, the scale is 1-D.
+  // WebNN requires the scale and zero_point tensors to have the same rank as the input tensor.
+  // We need to reshape them to make them broadcastable with the input tensor.
   if (scale_shape.size() == 1 && input_rank > 1 &&
-      block_size == 0 && axis != static_cast<int32_t>(input_rank - 1)) {
+      block_size == 0) {
     // Insert ones before and after the axis dimension for broadcasting of scale tensor.
     // Use emscripten::val::array() to support dynamic axis dim via input["shape"][axis].
     emscripten::val target_shape = emscripten::val::array();
