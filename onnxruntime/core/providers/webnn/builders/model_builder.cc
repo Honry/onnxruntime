@@ -42,6 +42,13 @@ ModelBuilder::ModelBuilder(const GraphViewer& graph_viewer, const logging::Logge
 }
 
 Status ModelBuilder::Initialize() {
+  // Run shape subgraph folding FIRST, before PreprocessInitializers.
+  // This pre-evaluates shape subgraphs (Where/Equal/Range/ConstantOfShape chains)
+  // so that Reshape/Expand/etc. see constant shapes instead of dynamic subgraphs.
+  // Must run before PreprocessInitializers because AddInitializersToSkip checks IsFoldedShape().
+  shape_folder_ = std::make_unique<ShapeSubgraphFolder>(graph_viewer_, free_dimension_bounds_, logger_);
+  ORT_RETURN_IF_ERROR(shape_folder_->Run());
+
   PreprocessInitializers();
   ORT_RETURN_IF_ERROR(RegisterInitializers());
   ORT_RETURN_IF_ERROR(RegisterModelInputs());
@@ -84,6 +91,12 @@ void ModelBuilder::PreprocessInitializers() {
   const auto& node_indices = graph_viewer_.GetNodesInTopologicalOrder();
   for (size_t i = 0; i < node_indices.size(); i++) {
     const auto* node(graph_viewer_.GetNode(node_indices[i]));
+
+    // Skip nodes that are part of a folded shape subgraph — their initializer inputs
+    // don't need to be registered as WebNN constants.
+    if (IsFoldedNode(node->Index())) {
+      continue;
+    }
 
     // find all initializers consumed. AddInitializersToSkip will potentially decrement the usage count.
     for (const auto* input : node->InputDefs()) {
@@ -401,6 +414,12 @@ Status ModelBuilder::AddOperations() {
   const auto& node_indices = graph_viewer_.GetNodesInTopologicalOrder();
   for (size_t i = 0; i < node_indices.size(); i++) {
     const auto* node(graph_viewer_.GetNode(node_indices[i]));
+
+    // Skip nodes that are part of a folded shape subgraph.
+    if (IsFoldedNode(node->Index())) {
+      continue;
+    }
+
     if (const auto* op_builder = GetOpBuilder(*node)) {
       ORT_RETURN_IF_ERROR(op_builder->AddToModelBuilder(*this, *node, logger_));
     } else {
@@ -500,6 +519,18 @@ void ModelBuilder::RecordDimProvenance(const std::string& dim_name, const DimPro
 const ModelBuilder::DimProvenance* ModelBuilder::GetDimProvenance(const std::string& dim_name) const {
   auto it = dim_provenance_.find(dim_name);
   return it != dim_provenance_.end() ? &it->second : nullptr;
+}
+
+bool ModelBuilder::IsFoldedShape(const std::string& name) const {
+  return shape_folder_ && shape_folder_->IsFoldedShape(name);
+}
+
+const std::vector<int64_t>* ModelBuilder::GetFoldedShape(const std::string& name) const {
+  return shape_folder_ ? shape_folder_->GetFoldedShape(name) : nullptr;
+}
+
+bool ModelBuilder::IsFoldedNode(NodeIndex node_index) const {
+  return shape_folder_ && shape_folder_->IsFoldedNode(node_index);
 }
 
 }  // namespace webnn
