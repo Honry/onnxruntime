@@ -724,6 +724,19 @@ export const run = async (
   const inputCount = inputIndices.length;
   const outputCount = outputIndices.length;
 
+  // Debug trace to verify what fetches/output indices are actually passed into wasm run.
+  const traceEnabled = (wasm as unknown as { webnnEnableTraceEvent?: boolean }).webnnEnableTraceEvent;
+  if (traceEnabled) {
+    const outputNames = outputIndices.map((i) => wasm.UTF8ToString(outputNamesUTF8Encoded[i]));
+    // Keep log compact to avoid overwhelming browser console for large-output models.
+    const preview = outputNames.slice(0, 8).join(', ');
+    const suffix = outputNames.length > 8 ? ` ... (+${outputNames.length - 8} more)` : '';
+    // eslint-disable-next-line no-console
+    console.info(
+      `[WebNN][Trace][JS] run(session=${sessionId}) inputCount=${inputCount} outputCount=${outputCount} outputIndices=[${outputIndices.join(',')}] outputs=[${preview}]${suffix}`,
+    );
+  }
+
   let runOptionsHandle = 0;
   let runOptionsAllocs: number[] = [];
 

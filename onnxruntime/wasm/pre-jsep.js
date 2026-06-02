@@ -108,7 +108,9 @@ Module["jsepInit"] = (name, params) => {
       Module["webnnEnableTraceEvent"],
     ] = params.slice(1);
 
-    // This function is called from both JS and an EM_ASM block, it needs both a minifiable name and an explicit name.
+    // These functions are called from JS and/or emscripten::val::module_property(). They need both
+    // a minifiable name and an explicit string name.
+    Module["webnnReserveTensorId"] = Module.webnnReserveTensorId;
     Module["webnnReleaseTensorId"] = Module.webnnReleaseTensorId;
     Module["webnnUploadTensor"] = Module.webnnUploadTensor;
     Module["webnnRegisterMLContext"] = Module.webnnRegisterMLContext;
