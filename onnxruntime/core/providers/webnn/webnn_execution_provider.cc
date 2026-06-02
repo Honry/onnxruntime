@@ -288,6 +288,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
 
     compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
       Ort::KernelContext ctx(context);
+      auto* internal_ctx = reinterpret_cast<OpKernelContextInternal*>(context);
 
       const size_t num_inputs = ctx.GetInputCount();
       const size_t num_outputs = ctx.GetOutputCount();
@@ -298,7 +299,11 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       const auto& model_outputs = model->GetOutputs();
 
       ORT_RETURN_IF_NOT(model_inputs.size() <= num_inputs, "Inconsistent input sizes");
-      ORT_RETURN_IF_NOT(model_outputs.size() == num_outputs, "Inconsistent output sizes");
+      // In dispatch mode with output sub-setting, num_outputs may be < model_outputs.size().
+      // In other modes, they should match.
+      if (!model->UseDispatch()) {
+        ORT_RETURN_IF_NOT(model_outputs.size() == num_outputs, "Inconsistent output sizes");
+      }
 
       InlinedHashMap<std::string, webnn::OnnxTensorData> inputs;
       inputs.reserve(model_inputs.size());
@@ -326,11 +331,30 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
         std::unique_lock<std::mutex> lock(model->GetMutex());
         InlinedHashMap<std::string, webnn::OnnxTensorData> outputs;
         outputs.reserve(model_outputs.size());
+        size_t requested_output_count = 0;
+        size_t skipped_unrequested_outputs = 0;
+        size_t internal_dispatch_outputs = 0;
+        size_t ort_allocated_outputs = 0;
         for (size_t i = 0; i < model_outputs.size(); i++) {
           const auto& output_name = model_outputs[i];
           const auto& output_info = model->GetInputOutputInfo(output_name);
           auto output_type = output_info.data_type;
           const auto output_idx = model->GetMappedOutputIdx(output_name);
+
+          // Use execution-frame fetch membership to detect whether this output is truly requested
+          // by current session.run(..., fetches). This is reliable for fused kernels where
+          // GetOutputCount/GetOutputMLValue may still expose all graph outputs.
+          const bool output_is_requested = internal_ctx->IsOutputRequested(static_cast<int>(output_idx));
+          OrtValue* output_mlvalue = internal_ctx->GetOutputMLValue(static_cast<int>(output_idx));
+          
+          if (output_is_requested) {
+            ++requested_output_count;
+          } else if (model->UseDispatch()) {
+            ++internal_dispatch_outputs;
+          } else {
+            ++skipped_unrequested_outputs;
+            continue;
+          }
 
           // Use fused-node output shape metadata as allocation baseline.
           std::vector<int64_t> output_shape = output_info.shape;
@@ -443,8 +467,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
               }
             }
             if (has_unresolved) {
-              auto* internal_ctx = reinterpret_cast<OpKernelContextInternal*>(context);
-              OrtValue* pre_alloc = internal_ctx->GetOutputMLValue(static_cast<int>(output_idx));
+              OrtValue* pre_alloc = output_mlvalue;
               if (pre_alloc != nullptr && pre_alloc->IsAllocated() && pre_alloc->IsTensor()) {
                 const auto& pre_alloc_shape = pre_alloc->Get<Tensor>().Shape().GetDims();
                 if (pre_alloc_shape.size() == output_shape.size()) {
@@ -483,15 +506,40 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
             }
           }
 
-          auto output_tensor =
-              ctx.GetOutput(output_idx, output_shape.data(), output_shape.size());
-          void* output_buffer = output_tensor.GetTensorMutableRawData();
+          void* output_buffer = nullptr;
+          if (model->UseDispatch()) {
+            if (output_is_requested) {
+              // Requested output: allocate ORT output tensor.
+              auto output_tensor =
+                  ctx.GetOutput(output_idx, output_shape.data(), output_shape.size());
+              output_buffer = output_tensor.GetTensorMutableRawData();
+              ++ort_allocated_outputs;
+            }
+            // Unrequested output in dispatch mode: buffer stays nullptr.
+            // Model::Dispatch will bind an internal tensor for graph execution.
+          } else {
+            auto* output_tensor = internal_ctx->Output(static_cast<int>(output_idx), output_shape);
+            if (output_tensor == nullptr) {
+              continue;
+            }
+            output_buffer = output_tensor->MutableDataRaw();
+            ++ort_allocated_outputs;
+          }
+
           outputs.emplace(output_name,
                           webnn::OnnxTensorData{
                               webnn::OnnxTensorInfo{output_type, output_shape},
                               output_buffer,
                           });
         }
+
+        LOGS_DEFAULT(INFO) << "[WebNN][Trace] PrepareOutputs mode="
+                           << (model->UseDispatch() ? "dispatch" : "compute")
+                           << " total=" << model_outputs.size()
+                           << " requested=" << requested_output_count
+                           << " ort_allocated=" << ort_allocated_outputs
+                           << " internal_dispatch=" << internal_dispatch_outputs
+                           << " skipped=" << skipped_unrequested_outputs;
 
         return model->Predict(inputs, outputs);
       }

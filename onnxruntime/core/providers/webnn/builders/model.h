@@ -6,6 +6,7 @@
 
 #include "core/common/inlined_containers.h"
 #include "core/common/status.h"
+#include <cstdint>
 #include <mutex>
 
 #include <emscripten.h>
@@ -44,6 +45,9 @@ class Model {
   const std::vector<std::string>& GetOutputs() const { return outputs_; }
   void SetOutputs(std::vector<std::string>&& outputs) { outputs_ = std::move(outputs); }
 
+  bool UseDispatch() const { return use_dispatch_; }
+  bool IsCausalLMEnabled() const { return enable_causal_lm_; }
+
   const OnnxTensorInfo& GetInputOutputInfo(const std::string& name) const;
 
   // Set the mapping between input/output name and ORT kernel context
@@ -77,11 +81,17 @@ class Model {
   InlinedHashMap<std::string, size_t> input_map_;
   InlinedHashMap<std::string, size_t> output_map_;
 
+  // Internal tensor IDs used by dispatch() for graph outputs not requested by fetches.
+  // This keeps WebNN graph-output binding complete without allocating ORT output tensors.
+  InlinedHashMap<std::string, intptr_t> internal_dispatch_output_tensor_ids_;
+
   std::mutex mutex_;
 
   bool use_dispatch_;
+    bool enable_causal_lm_;
 
-  Model(const emscripten::val& context, const emscripten::val& path, const logging::Logger& logger, bool use_dispatch);
+    Model(const emscripten::val& context, const emscripten::val& path, const logging::Logger& logger,
+      bool use_dispatch, bool enable_causal_lm);
 
   void SetInputOutputInfo(InlinedHashMap<std::string, OnnxTensorInfo>&& input_output_info) {
     input_output_info_ = std::move(input_output_info);

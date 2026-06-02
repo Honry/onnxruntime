@@ -195,6 +195,9 @@ class OpKernelContext {
   virtual const OrtValue* GetImplicitInputMLValue(int index) const;
   OrtValue* GetOutputMLValue(int index);
 
+  // Returns true if the given kernel output is requested by current fetches.
+  bool IsOutputRequested(int index) const;
+
 #ifdef ENABLE_ATEN
   Status SetOutputMLValue(int index, const OrtValue& ort_value);
 #endif
