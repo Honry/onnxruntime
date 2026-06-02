@@ -187,6 +187,15 @@ OrtValue* OpKernelContext::GetOutputMLValue(int index) {
   return execution_frame_->GetMutableNodeInputOrOutputMLValue(output_arg_index);
 }
 
+bool OpKernelContext::IsOutputRequested(int index) const {
+  if (index < 0 || index >= OutputCount()) {
+    return false;
+  }
+
+  const int ort_value_idx = GetOrtValueIndexForOutput(index);
+  return execution_frame_->IsFetchRequested(ort_value_idx);
+}
+
 AllocatorPtr OpKernelContext::GetAllocator(const OrtDevice& device) const {
   return execution_frame_->GetAllocator(device);
 }

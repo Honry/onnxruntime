@@ -95,6 +95,9 @@ class IExecutionFrame {
   // get the ort_value_idx from NodeIndexInfo
   int GetNodeIdxToMLValueIdx(int index) const;
 
+  // Returns true if the ort_value_idx is requested in current fetches.
+  bool IsFetchRequested(int ort_value_idx) const;
+
  protected:
   OrtValue& GetMutableMLValue(int ort_value_index) { return const_cast<OrtValue&>(GetMLValue(ort_value_index)); }
 
