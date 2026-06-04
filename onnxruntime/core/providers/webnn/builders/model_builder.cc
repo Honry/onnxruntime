@@ -42,13 +42,6 @@ ModelBuilder::ModelBuilder(const GraphViewer& graph_viewer, const logging::Logge
 }
 
 Status ModelBuilder::Initialize() {
-  // Run shape subgraph folding FIRST, before PreprocessInitializers.
-  // This pre-evaluates shape subgraphs (Where/Equal/Range/ConstantOfShape chains)
-  // so that Reshape/Expand/etc. see constant shapes instead of dynamic subgraphs.
-  // Must run before PreprocessInitializers because AddInitializersToSkip checks IsFoldedShape().
-  shape_folder_ = std::make_unique<ShapeSubgraphFolder>(graph_viewer_, free_dimension_bounds_, logger_);
-  ORT_RETURN_IF_ERROR(shape_folder_->Run());
-
   PreprocessInitializers();
   ORT_RETURN_IF_ERROR(RegisterInitializers());
   ORT_RETURN_IF_ERROR(RegisterModelInputs());
@@ -522,15 +515,18 @@ const ModelBuilder::DimProvenance* ModelBuilder::GetDimProvenance(const std::str
 }
 
 bool ModelBuilder::IsFoldedShape(const std::string& name) const {
-  return shape_folder_ && shape_folder_->IsFoldedShape(name);
+  ORT_UNUSED_PARAMETER(name);
+  return false;
 }
 
 const std::vector<int64_t>* ModelBuilder::GetFoldedShape(const std::string& name) const {
-  return shape_folder_ ? shape_folder_->GetFoldedShape(name) : nullptr;
+  ORT_UNUSED_PARAMETER(name);
+  return nullptr;
 }
 
 bool ModelBuilder::IsFoldedNode(NodeIndex node_index) const {
-  return shape_folder_ && shape_folder_->IsFoldedNode(node_index);
+  ORT_UNUSED_PARAMETER(node_index);
+  return false;
 }
 
 }  // namespace webnn

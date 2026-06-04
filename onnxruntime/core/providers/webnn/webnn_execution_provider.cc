@@ -31,7 +31,8 @@ constexpr const char* WEBNN = "WEBNN";
 
 WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_flags,
                          const webnn::FreeDimensionBounds& free_dimension_bounds,
-                         bool enable_causal_lm)
+                         bool enable_causal_lm,
+                         bool enable_additive_dim_param)
     : IExecutionProvider{
           onnxruntime::kWebNNExecutionProvider,
           // If MLTensor is supported, we force all the tensors to be allocated as MLTensor.
@@ -42,7 +43,8 @@ WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_f
               0)},
                   wnn_device_type_(webnn::DeviceTypeFromString(webnn_device_flags)),
                   free_dimension_bounds_(free_dimension_bounds),
-                  enable_causal_lm_(enable_causal_lm) {
+                  enable_causal_lm_(enable_causal_lm),
+                  enable_additive_dim_param_(enable_additive_dim_param) {
   wnn_context_ = emscripten::val::module_property("currentContext");
   if (!wnn_context_.as<bool>()) {
     ORT_THROW("Failed to create WebNN context.");
@@ -87,20 +89,7 @@ WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_view
 
   const auto supported_nodes = webnn::GetSupportedNodes(graph_viewer, wnn_builder, wnn_device_type_, wnn_limits_, logger);
 
-  // Run the shape subgraph folder to identify nodes that will be folded away during graph build.
-  // These nodes must be claimed as "supported" so they stay in our partition, even if their
-  // data types (e.g., int64 Equal) aren't natively supported by WebNN — they'll be skipped
-  // during ModelBuilder::AddOperations().
-  webnn::ShapeSubgraphFolder capability_folder(graph_viewer, free_dimension_bounds_, logger);
-  auto folder_status = capability_folder.Run();
   std::unordered_set<const Node*> supported_nodes_with_folded = supported_nodes;
-  if (folder_status.IsOK()) {
-    for (const auto& node : graph_viewer.Nodes()) {
-      if (capability_folder.IsFoldedNode(node.Index())) {
-        supported_nodes_with_folded.insert(&node);
-      }
-    }
-  }
 
   const auto gen_metadef_name = [&]() {
     HashValue model_hash;
@@ -301,7 +290,8 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       ORT_UNUSED_PARAMETER(state);
     };
 
-    compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
+    const bool enable_additive_dim_param = enable_additive_dim_param_;
+    compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params, enable_additive_dim_param](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
       Ort::KernelContext ctx(context);
 
       const size_t num_inputs = ctx.GetInputCount();
@@ -447,7 +437,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
 
               // Try to parse additive expressions like "dim_a + dim_b"
               // (e.g., "past_sequence_length + sequence_length").
-              if (output_shape[dim_idx] == 0) {
+              if (enable_additive_dim_param && output_shape[dim_idx] == 0) {
                 auto plus_pos = dim_param.find('+');
                 if (plus_pos != std::string::npos) {
                   const std::string left = utils::TrimString(std::string_view(dim_param).substr(0, plus_pos));

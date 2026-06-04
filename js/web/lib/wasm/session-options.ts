@@ -139,6 +139,11 @@ const setExecutionProviders = async (
           if (enableCausalLM) {
             appendEpOption(epOptions, 'enableCausalLM', 'true', allocs);
           }
+          // enableAdditiveDimParam: parse symbolic dim expressions like "a + b" in output shapes.
+          const enableAdditiveDimParam = (webnnOptions as any)?.enableAdditiveDimParam;
+          if (enableAdditiveDimParam) {
+            appendEpOption(epOptions, 'webnn_enable_additive_dim_param', 'true', allocs);
+          }
         }
         break;
       case 'webgpu':

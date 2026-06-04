@@ -8,7 +8,6 @@
 #include <core/graph/graph_viewer.h>
 
 #include "model.h"
-#include "shape_subgraph_folder.h"
 #include "core/framework/execution_provider.h"
 #include "core/providers/webnn/builders/helper.h"
 
@@ -105,7 +104,6 @@ class ModelBuilder {
   emscripten::val wnn_limits_ = emscripten::val::undefined();
   FreeDimensionBounds free_dimension_bounds_;
   bool enable_causal_lm_;
-  std::unique_ptr<ShapeSubgraphFolder> shape_folder_;
   InlinedHashMap<std::string, emscripten::val> wnn_operands_;
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;
