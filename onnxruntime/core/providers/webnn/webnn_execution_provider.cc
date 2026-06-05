@@ -31,8 +31,7 @@ constexpr const char* WEBNN = "WEBNN";
 
 WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_flags,
                          const webnn::FreeDimensionBounds& free_dimension_bounds,
-                         bool enable_causal_lm,
-                         bool enable_additive_dim_param)
+                         bool enable_causal_lm)
     : IExecutionProvider{
           onnxruntime::kWebNNExecutionProvider,
           // If MLTensor is supported, we force all the tensors to be allocated as MLTensor.
@@ -43,8 +42,7 @@ WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_f
               0)},
                   wnn_device_type_(webnn::DeviceTypeFromString(webnn_device_flags)),
                   free_dimension_bounds_(free_dimension_bounds),
-                  enable_causal_lm_(enable_causal_lm),
-                  enable_additive_dim_param_(enable_additive_dim_param) {
+                  enable_causal_lm_(enable_causal_lm) {
   wnn_context_ = emscripten::val::module_property("currentContext");
   if (!wnn_context_.as<bool>()) {
     ORT_THROW("Failed to create WebNN context.");
@@ -290,8 +288,9 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       ORT_UNUSED_PARAMETER(state);
     };
 
-    const bool enable_additive_dim_param = enable_additive_dim_param_;
-    compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params, enable_additive_dim_param](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
+    // Use additive dim_param fallback when computeShapes() API is not yet available.
+    const bool use_additive_dim_fallback = wnn_context_["computeShapes"].isUndefined();
+    compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params, use_additive_dim_fallback](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
       Ort::KernelContext ctx(context);
 
       const size_t num_inputs = ctx.GetInputCount();
@@ -437,7 +436,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
 
               // Try to parse additive expressions like "dim_a + dim_b"
               // (e.g., "past_sequence_length + sequence_length").
-              if (enable_additive_dim_param && output_shape[dim_idx] == 0) {
+              if (use_additive_dim_fallback && output_shape[dim_idx] == webnn::kDynamicDim) {
                 auto plus_pos = dim_param.find('+');
                 if (plus_pos != std::string::npos) {
                   const std::string left = utils::TrimString(std::string_view(dim_param).substr(0, plus_pos));

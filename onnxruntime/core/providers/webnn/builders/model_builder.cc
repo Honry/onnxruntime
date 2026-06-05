@@ -85,12 +85,6 @@ void ModelBuilder::PreprocessInitializers() {
   for (size_t i = 0; i < node_indices.size(); i++) {
     const auto* node(graph_viewer_.GetNode(node_indices[i]));
 
-    // Skip nodes that are part of a folded shape subgraph — their initializer inputs
-    // don't need to be registered as WebNN constants.
-    if (IsFoldedNode(node->Index())) {
-      continue;
-    }
-
     // find all initializers consumed. AddInitializersToSkip will potentially decrement the usage count.
     for (const auto* input : node->InputDefs()) {
       if (input->Exists() && Contains(initializers, input->Name())) {
@@ -408,11 +402,6 @@ Status ModelBuilder::AddOperations() {
   for (size_t i = 0; i < node_indices.size(); i++) {
     const auto* node(graph_viewer_.GetNode(node_indices[i]));
 
-    // Skip nodes that are part of a folded shape subgraph.
-    if (IsFoldedNode(node->Index())) {
-      continue;
-    }
-
     if (const auto* op_builder = GetOpBuilder(*node)) {
       ORT_RETURN_IF_ERROR(op_builder->AddToModelBuilder(*this, *node, logger_));
     } else {
@@ -512,21 +501,6 @@ void ModelBuilder::RecordDimProvenance(const std::string& dim_name, const DimPro
 const ModelBuilder::DimProvenance* ModelBuilder::GetDimProvenance(const std::string& dim_name) const {
   auto it = dim_provenance_.find(dim_name);
   return it != dim_provenance_.end() ? &it->second : nullptr;
-}
-
-bool ModelBuilder::IsFoldedShape(const std::string& name) const {
-  ORT_UNUSED_PARAMETER(name);
-  return false;
-}
-
-const std::vector<int64_t>* ModelBuilder::GetFoldedShape(const std::string& name) const {
-  ORT_UNUSED_PARAMETER(name);
-  return nullptr;
-}
-
-bool ModelBuilder::IsFoldedNode(NodeIndex node_index) const {
-  ORT_UNUSED_PARAMETER(node_index);
-  return false;
 }
 
 }  // namespace webnn

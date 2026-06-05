@@ -39,13 +39,10 @@ class ExpandOpBuilder : public BaseOpBuilder {
 void ExpandOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
   const auto& input_defs = node.InputDefs();
   const auto& shape_name = input_defs[1]->Name();
-  // Skip the shape input when:
-  // 1. It was folded by the shape subgraph folder (compile-time constant), OR
-  // 2. It is a constant initializer AND the input has static shape.
+  // Skip the shape input when it is a constant initializer AND the input has static shape.
   // When the input has dynamic shape, we need the shape operand for dynamicExpand even if it's constant.
-  if (model_builder.IsFoldedShape(shape_name) ||
-      (model_builder.GetGraphViewer().GetConstantInitializer(shape_name) &&
-       !HasDynamicShape(*input_defs[0]))) {
+  if (model_builder.GetGraphViewer().GetConstantInitializer(shape_name) &&
+      !HasDynamicShape(*input_defs[0])) {
     model_builder.AddInitializerToSkip(shape_name);
   }
 }
@@ -78,13 +75,6 @@ Status ExpandOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                       "Cannot get output shape.");
 
     emscripten::val output_shape_arr = emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(output_shape));
-    output = model_builder.GetBuilder().call<emscripten::val>("expand", input, output_shape_arr, options);
-  } else if (model_builder.IsFoldedShape(input_defs[1]->Name())) {
-    // Folded shape path: shape subgraph was pre-evaluated to a constant vector.
-    const auto* folded = model_builder.GetFoldedShape(input_defs[1]->Name());
-    ORT_RETURN_IF_NOT(folded != nullptr, "IsFoldedShape true but GetFoldedShape returned null");
-
-    emscripten::val output_shape_arr = emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(*folded));
     output = model_builder.GetBuilder().call<emscripten::val>("expand", input, output_shape_arr, options);
   } else {
     // Operand shape path: use dynamicExpand with the shape operand.

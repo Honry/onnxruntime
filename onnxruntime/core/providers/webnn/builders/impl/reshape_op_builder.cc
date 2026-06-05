@@ -38,11 +38,9 @@ class ReshapeOpBuilder : public BaseOpBuilder {
 
 void ReshapeOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
   const auto& shape_name = node.InputDefs()[1]->Name();
-  // Only skip the shape input when it is a constant initializer (consumed at build time)
-  // or when it was folded by the shape subgraph folder.
+  // Only skip the shape input when it is a constant initializer (consumed at build time).
   // When it is an operand, we need it as the newShape input for dynamicReshape.
-  if (model_builder.GetGraphViewer().GetConstantInitializer(shape_name) ||
-      model_builder.IsFoldedShape(shape_name)) {
+  if (model_builder.GetGraphViewer().GetConstantInitializer(shape_name)) {
     model_builder.AddInitializerToSkip(shape_name);
   }
 }
@@ -222,16 +220,6 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       emscripten::val new_shape = emscripten::val::array();
       output = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, options);
     }
-  } else if (model_builder.IsFoldedShape(input_defs[1]->Name())) {
-    // Folded shape path: the shape subgraph was pre-evaluated to a constant vector.
-    const auto* folded = model_builder.GetFoldedShape(input_defs[1]->Name());
-    ORT_RETURN_IF_NOT(folded != nullptr, "IsFoldedShape true but GetFoldedShape returned null");
-
-    emscripten::val new_shape = emscripten::val::array();
-    for (int64_t dim : *folded) {
-      new_shape.call<void>("push", static_cast<uint32_t>(dim));
-    }
-    output = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, options);
   } else {
     // Operand shape path: shape is a non-constant operand. Use dynamicReshape.
     emscripten::val shape_operand = model_builder.GetOperand(input_defs[1]->Name());

@@ -82,12 +82,10 @@ Status ParseFreeDimensionBounds(std::string_view value, webnn::FreeDimensionBoun
 struct WebNNProviderFactory : IExecutionProviderFactory {
   explicit WebNNProviderFactory(const std::string& webnn_device_flags,
                                 const webnn::FreeDimensionBounds& free_dimension_bounds,
-                                bool enable_causal_lm,
-                                bool enable_additive_dim_param)
+                                bool enable_causal_lm)
       : webnn_device_flags_(webnn_device_flags),
         free_dimension_bounds_(free_dimension_bounds),
-        enable_causal_lm_(enable_causal_lm),
-        enable_additive_dim_param_(enable_additive_dim_param) {}
+        enable_causal_lm_(enable_causal_lm) {}
   ~WebNNProviderFactory() override {}
 
   std::unique_ptr<IExecutionProvider> CreateProvider() override;
@@ -97,12 +95,10 @@ struct WebNNProviderFactory : IExecutionProviderFactory {
   std::string webnn_device_flags_;
   webnn::FreeDimensionBounds free_dimension_bounds_;
   bool enable_causal_lm_;
-  bool enable_additive_dim_param_;
 };
 
 std::unique_ptr<IExecutionProvider> WebNNProviderFactory::CreateProvider() {
-  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, free_dimension_bounds_, enable_causal_lm_,
-                                                  enable_additive_dim_param_);
+  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, free_dimension_bounds_, enable_causal_lm_);
 }
 
 std::unique_ptr<IExecutionProvider> WebNNProviderFactory::CreateProvider(
@@ -127,8 +123,7 @@ std::unique_ptr<IExecutionProvider> WebNNProviderFactory::CreateProvider(
                                                             std::numeric_limits<int32_t>::max()));
     merged_bounds[dim_override.dim_identifier] = webnn::FreeDimensionBound{value, value};
   }
-  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, merged_bounds, enable_causal_lm_,
-                                                  enable_additive_dim_param_);
+  return std::make_unique<WebNNExecutionProvider>(webnn_device_flags_, merged_bounds, enable_causal_lm_);
 }
 
 std::shared_ptr<IExecutionProviderFactory> WebNNProviderFactoryCreator::Create(
@@ -150,14 +145,8 @@ std::shared_ptr<IExecutionProviderFactory> WebNNProviderFactoryCreator::Create(
   const bool enable_causal_lm = (enable_causal_lm_it != provider_options.end() &&
                                   enable_causal_lm_it->second == "true");
 
-  // Optional additive symbolic dim expression parsing: "a + b". Default false.
-  const auto enable_additive_dim_param_it = provider_options.find("webnn_enable_additive_dim_param");
-  const bool enable_additive_dim_param = (enable_additive_dim_param_it != provider_options.end() &&
-                                          enable_additive_dim_param_it->second == "true");
-
   return std::make_shared<onnxruntime::WebNNProviderFactory>(webnn_device_flags, free_dimension_bounds,
-                                                             enable_causal_lm,
-                                                             enable_additive_dim_param);
+                                                             enable_causal_lm);
 }
 
 }  // namespace onnxruntime
