@@ -87,15 +87,13 @@ WebNNExecutionProvider::GetCapability(const onnxruntime::GraphViewer& graph_view
 
   const auto supported_nodes = webnn::GetSupportedNodes(graph_viewer, wnn_builder, wnn_device_type_, wnn_limits_, logger);
 
-  std::unordered_set<const Node*> supported_nodes_with_folded = supported_nodes;
-
   const auto gen_metadef_name = [&]() {
     HashValue model_hash;
     int metadef_id = metadef_id_generator_.GenerateId(graph_viewer, model_hash);
     return MakeString(WEBNN, "_", model_hash, "_", metadef_id);
   };
 
-  auto result = utils::CreateSupportedPartitions(graph_viewer, supported_nodes_with_folded, {},
+  auto result = utils::CreateSupportedPartitions(graph_viewer, supported_nodes, {},
                                                  gen_metadef_name, WEBNN, kWebNNExecutionProvider,
                                                  &node_unit_map, /*drop_constant_initializers*/ true);
 
@@ -288,9 +286,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       ORT_UNUSED_PARAMETER(state);
     };
 
-    // Use additive dim_param fallback when computeShapes() API is not yet available.
-    const bool use_additive_dim_fallback = wnn_context_["computeShapes"].isUndefined();
-    compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params, use_additive_dim_fallback](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
+    compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
       Ort::KernelContext ctx(context);
 
       const size_t num_inputs = ctx.GetInputCount();
@@ -436,7 +432,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
 
               // Try to parse additive expressions like "dim_a + dim_b"
               // (e.g., "past_sequence_length + sequence_length").
-              if (use_additive_dim_fallback && output_shape[dim_idx] == webnn::kDynamicDim) {
+              if (output_shape[dim_idx] == webnn::kDynamicDim) {
                 auto plus_pos = dim_param.find('+');
                 if (plus_pos != std::string::npos) {
                   const std::string left = utils::TrimString(std::string_view(dim_param).substr(0, plus_pos));
