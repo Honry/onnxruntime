@@ -478,6 +478,7 @@ bool ReshapeFusion::Fuse_Subgraph(Node& reshape, Graph& graph, const logging::Lo
       shape_value.push_back(-1);
       continue;
     }
+
     return false;
   }
 
