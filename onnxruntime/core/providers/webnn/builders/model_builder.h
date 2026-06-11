@@ -65,7 +65,20 @@ class ModelBuilder {
 
   std::string GetUniqueName(const std::string& base_name);
 
+  // Dim provenance tracking for reshape-derived dim descriptors.
+  struct DimProvenance {
+    std::string source_operand_name;
+    uint32_t source_dim_index;
+    int64_t factor_num;
+    int64_t factor_den;
+  };
+
+  void RecordDimProvenance(const std::string& dim_name, const DimProvenance& prov);
+  const DimProvenance* GetDimProvenance(const std::string& dim_name) const;
+
  private:
+  std::unordered_map<std::string, DimProvenance> dim_provenance_;
+
   const GraphViewer& graph_viewer_;
   const logging::Logger& logger_;
   const bool is_float16array_available_ = !emscripten::val::global("Float16Array").isUndefined() &&
