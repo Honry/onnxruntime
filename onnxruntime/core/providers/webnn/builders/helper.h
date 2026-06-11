@@ -333,6 +333,7 @@ bool GetBidirectionalBroadcastShape(std::vector<int64_t>& shape_a,
 bool SetWebnnDataType(emscripten::val& desc, const int32_t data_type);
 
 bool IsMLTensorSupported();
+bool IsComputeShapesSupported();
 
 uint8_t PackInt8ToUint8DoubledNibbles(int8_t value, const int32_t& data_type);
 uint16_t PackFloat32ToUint16AsFloat16(float value);
