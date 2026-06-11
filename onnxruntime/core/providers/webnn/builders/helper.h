@@ -35,6 +35,9 @@ enum class WebnnDeviceType {
 
 WebnnDeviceType DeviceTypeFromString(const std::string_view& device_type);
 
+// Sentinel value used by GetShape() to represent dynamic (symbolic) dimensions.
+constexpr int64_t kDynamicDim = -1;
+
 // Collects all the initializer tensors in the subGraph and its ancestor graphs.
 InitializedTensorSet CollectAllInitializedTensors(const GraphViewer& graph_viewer);
 
@@ -51,6 +54,29 @@ inline std::vector<int64_t> GetResolvedAxes(const NodeAttrHelper& helper, size_t
 }
 
 bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const logging::Logger& logger);
+
+// Check if a NodeArg has dynamic (symbolic) dimensions.
+// Callers must ensure the NodeArg has a shape proto (guaranteed after IsTensorShapeSupported).
+inline bool HasDynamicShape(const NodeArg& node_arg) {
+  const auto* shape_proto = node_arg.Shape();
+  assert(shape_proto != nullptr);
+  for (const auto& dim : shape_proto->dim()) {
+    if (!dim.has_dim_value()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Check if a shape vector (from GetShape()) contains dynamic dimensions (kDynamicDim placeholders).
+inline bool HasDynamicShape(const std::vector<int64_t>& shape) {
+  return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == kDynamicDim; });
+}
+
+// Check if the WebNN context supports dynamic shape operations (shape + dynamicReshape).
+inline bool IsDynamicShapeSupported(const emscripten::val& wnn_limits) {
+  return !wnn_limits["shape"].isUndefined() && !wnn_limits["dynamicReshape"].isUndefined();
+}
 
 template <typename T>
 std::string GetShapeString(std::vector<T>& shape) {
@@ -179,9 +205,14 @@ inline bool ReadScalarTensorData(const onnx::TensorProto& tensor, emscripten::va
 }
 
 inline bool IsEmptyTensor(const GraphViewer& graph_viewer, const std::string& name) {
-  const auto* tensor_init = graph_viewer.GetConstantInitializer(name);
-  if (name.empty() || !tensor_init) {
+  if (name.empty()) {
     return true;
+  }
+
+  const auto* tensor_init = graph_viewer.GetConstantInitializer(name);
+  if (!tensor_init) {
+    // Non-constant operand (dynamic input) is not empty — it has data at runtime.
+    return false;
   }
 
   const auto& tensor = *tensor_init;
@@ -199,7 +230,9 @@ inline bool TensorExists(const ConstPointerContainer<std::vector<NodeArg*>>& def
 }
 
 bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_name,
-                            const logging::Logger& logger, bool allow_empty_input = false);
+                            const emscripten::val& wnn_limits,
+                            const logging::Logger& logger, bool allow_empty_input = false,
+                            bool allow_no_shape = false);
 
 bool IsInputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limits, const logging::Logger& logger);
 
