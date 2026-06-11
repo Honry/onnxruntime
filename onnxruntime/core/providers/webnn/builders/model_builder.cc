@@ -20,12 +20,14 @@ namespace webnn {
 
 ModelBuilder::ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger,
                            const emscripten::val& context, const WebnnDeviceType wnn_device_type,
-                           const emscripten::val& wnn_limits)
+                           const emscripten::val& wnn_limits,
+                           const FreeDimensionBounds& free_dimension_bounds)
     : graph_viewer_(graph_viewer),
       logger_(logger),
       wnn_context_(context),
       wnn_device_type_(wnn_device_type),
-      wnn_limits_(wnn_limits) {
+      wnn_limits_(wnn_limits),
+      free_dimension_bounds_(free_dimension_bounds) {
   // Create WebNN MLGraphBuilder for each ModelBuilder, because MLGraphBuilder.build()
   // is only allowed to be called once.
   wnn_builder_ = emscripten::val::global("MLGraphBuilder").new_(context);
@@ -258,26 +260,51 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
       return Status::OK();
   }
 
-  std::vector<int32_t> dims;
+  emscripten::val shape_array = emscripten::val::array();
   {  // input_output shape.
     const auto* shape_proto = node_arg.Shape();
     ORT_RETURN_IF(shape_proto == nullptr,
                   "shape_proto cannot be null for ", input_output_type, ": ", name);
     const auto& shape = shape_proto->dim();
-    if (!shape.empty()) {
-      dims.reserve(shape.size());
-      for (const auto& dim : shape) {
-        // dim_param free dimensions should have already been excluded by IsTensorShapeSupported().
-        assert(dim.has_dim_value());
-        dims.push_back(SafeInt<int32_t>(dim.dim_value()));
+    for (const auto& dim : shape) {
+      if (dim.has_dim_value()) {
+        int32_t dim_value = SafeInt<int32_t>(dim.dim_value());
+        shape_array.call<void>("push", dim_value);
+      } else {
+        // Dynamic dimension: create an object with symbolic name for WebNN.
+        std::string dim_name = dim.dim_param();
+        if (dim_name.empty()) {
+          // ORT's shape inference may produce dynamic dims without a dim_param.
+          // Generate a synthetic name based on the tensor name and dimension index.
+          dim_name = name + "_dim_" + std::to_string(shape_array["length"].as<uint32_t>());
+        }
+
+        emscripten::val dim_obj = emscripten::val::object();
+        dim_obj.set("name", emscripten::val(dim_name));
+
+        if (is_input) {
+          const auto it = free_dimension_bounds_.find(dim_name);
+          if (it != free_dimension_bounds_.end()) {
+            const int32_t min_size = it->second.min_size;
+            const int32_t max_size = it->second.max_size;
+            ORT_RETURN_IF(min_size <= 0 || max_size <= 0 || max_size < min_size,
+                          "Invalid FreeDimensionBounds for dynamic dimension: ", dim_name,
+                          ". Require 1 <= minSize <= maxSize.");
+
+            dim_obj.set("minSize", min_size);
+            dim_obj.set("maxSize", max_size);
+          }
+        }
+
+        shape_array.call<void>("push", dim_obj);
       }
     }
   }
 
   emscripten::val desc = emscripten::val::object();
 
-  desc.set("dimensions", emscripten::val::array(dims));
-  desc.set("shape", emscripten::val::array(dims));
+  desc.set("dimensions", shape_array);
+  desc.set("shape", shape_array);
 
   int32_t data_type;
   {  // type
