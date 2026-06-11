@@ -50,9 +50,9 @@ bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const loggin
     return false;
   }
 
-  // We already checked the shape has no dynamic dimension.
   for (const auto& dim : shape_proto->dim()) {
-    shape.push_back(dim.dim_value());
+    // Dynamic (symbolic) dimensions are represented as kDynamicDim (-1).
+    shape.push_back(dim.has_dim_value() ? dim.dim_value() : kDynamicDim);
   }
 
   return true;
@@ -70,22 +70,29 @@ bool IsNodeSupported(const GraphViewer& graph_viewer, const Node& node, const We
 }
 
 bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_name,
-                            const logging::Logger& logger, bool allow_empty_input) {
+                            const emscripten::val& wnn_limits,
+                            const logging::Logger& logger, bool allow_empty_input,
+                            bool allow_no_shape) {
   const auto& node_arg_name = node_arg.Name();
   const auto* shape_proto = node_arg.Shape();
   // Optional tensors can be indicated by an empty name, just ignore it.
   if (node_arg_name.empty()) {
     return true;
   }
-  // We do not support input/output with no shape.
+  // We do not support input/output with no shape (unless allow_no_shape is set).
   if (!shape_proto) {
+    if (allow_no_shape) {
+      return true;
+    }
     LOGS(logger, VERBOSE) << "Node arg [" << node_arg_name << "] of [" << parent_name << "] has not shape";
     return false;
   }
 
   for (const auto& dim : shape_proto->dim()) {
-    // WebNN doesn't support dynamic shape - use sessionOptions.freeDimensionOverrides to fix the shape.
     if (!dim.has_dim_value()) {
+      if (IsDynamicShapeSupported(wnn_limits)) {
+        continue;
+      }
       LOGS(logger, VERBOSE) << "Dynamic shape is not supported, "
                             << "use sessionOptions.FreeDimensionOverrides to set a fixed shape: " << node_arg_name;
       return false;
