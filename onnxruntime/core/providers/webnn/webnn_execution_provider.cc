@@ -4,10 +4,15 @@
 
 #include "webnn_execution_provider.h"
 
+#include <cerrno>
+#include <cstdlib>
+
+#include "core/common/string_utils.h"
 #include "core/framework/compute_capability.h"
 #include "core/framework/data_transfer_manager.h"
 #include "core/framework/memcpy.h"
 #include "core/framework/kernel_registry.h"
+#include "core/framework/op_kernel_context_internal.h"
 #include "core/graph/graph_viewer.h"
 #include "core/session/onnxruntime_cxx_api.h"
 #include "core/providers/webnn/allocator.h"
@@ -194,6 +199,73 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       }
       model->SetOutputMap(std::move(output_map));
     }
+
+    // Build mapping from symbolic dim (dim_param) to fused node input position/dimension.
+    InlinedHashMap<std::string, std::pair<size_t, size_t>> dim_param_to_input_dim;
+    {
+      const auto& input_defs = fused_node.InputDefs();
+      for (size_t input_idx = 0; input_idx < input_defs.size(); ++input_idx) {
+        const auto* input_def = input_defs[input_idx];
+        if (!input_def) {
+          continue;
+        }
+
+        const auto* shape_proto = input_def->Shape();
+        if (!shape_proto) {
+          continue;
+        }
+
+        const auto& dims = shape_proto->dim();
+        for (int dim_idx = 0; dim_idx < dims.size(); ++dim_idx) {
+          const auto& dim = dims[dim_idx];
+          if (!dim.has_dim_value() && dim.has_dim_param() && !dim.dim_param().empty()) {
+            dim_param_to_input_dim.emplace(dim.dim_param(), std::make_pair(input_idx, static_cast<size_t>(dim_idx)));
+          }
+        }
+      }
+    }
+
+    // Build fixed symbolic dimension values from FreeDimensionBounds where min == max.
+    // These can safely be used as runtime allocation dimensions when a dim_param cannot
+    // be traced back to any fused-node input.
+    InlinedHashMap<std::string, int64_t> fixed_dim_param_values;
+    {
+      fixed_dim_param_values.reserve(free_dimension_bounds_.size());
+      for (const auto& kvp : free_dimension_bounds_) {
+        const auto& dim_name = kvp.first;
+        const auto& bound = kvp.second;
+        if (bound.max_size > 0 && bound.min_size == bound.max_size) {
+          fixed_dim_param_values.emplace(dim_name, static_cast<int64_t>(bound.max_size));
+        }
+      }
+    }
+
+    // Record output shapes and symbolic dimensions in fused-node output order.
+    std::vector<std::vector<int64_t>> fused_output_shapes;
+    std::vector<std::vector<std::string>> output_dim_params;
+    {
+      const auto& output_defs = fused_node.OutputDefs();
+      fused_output_shapes.reserve(output_defs.size());
+      output_dim_params.reserve(output_defs.size());
+      for (const auto* output_def : output_defs) {
+        std::vector<int64_t> shape;
+        std::vector<std::string> params;
+        if (output_def) {
+          const auto* shape_proto = output_def->Shape();
+          if (shape_proto) {
+            const auto& dims = shape_proto->dim();
+            shape.reserve(dims.size());
+            params.reserve(dims.size());
+            for (const auto& dim : dims) {
+              shape.push_back(dim.has_dim_value() ? dim.dim_value() : webnn::kDynamicDim);
+              params.push_back((!dim.has_dim_value() && dim.has_dim_param()) ? dim.dim_param() : "");
+            }
+          }
+        }
+        fused_output_shapes.push_back(std::move(shape));
+        output_dim_params.push_back(std::move(params));
+      }
+    }
     models_.emplace(fused_node.Name(), std::move(model));
 
     NodeComputeInfo compute_info;
@@ -207,7 +279,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       ORT_UNUSED_PARAMETER(state);
     };
 
-    compute_info.compute_func = [](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
+    compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
       Ort::KernelContext ctx(context);
 
       const size_t num_inputs = ctx.GetInputCount();
@@ -223,12 +295,14 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
 
       InlinedHashMap<std::string, webnn::OnnxTensorData> inputs;
       inputs.reserve(model_inputs.size());
+      std::vector<std::vector<int64_t>> runtime_input_shapes(num_inputs);
       for (size_t i = 0; i < model_inputs.size(); i++) {
         const auto& input_name = model_inputs[i];
         auto input_idx = model->GetMappedInputIdx(input_name);
         auto input_tensor = ctx.GetInput(input_idx);
         auto tensor_info = input_tensor.GetTensorTypeAndShapeInfo();
         auto shape = tensor_info.GetShape();
+        runtime_input_shapes[input_idx] = shape;
         const void* inputBuffer = const_cast<void*>(input_tensor.GetTensorRawData());
         inputs.emplace(
             input_name,
@@ -243,15 +317,265 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       // TODO, investigate concurrent runs for different executions from the same model.
       {
         std::unique_lock<std::mutex> lock(model->GetMutex());
+
+        // Try computeShapes as the primary shape resolution when dynamic dims exist.
+        InlinedHashMap<std::string, std::vector<int64_t>> computed_output_shapes;
+        bool shapes_computed = false;
+
+        if (model->SupportsComputeShapes()) {
+          bool has_dynamic_output = false;
+          for (size_t i = 0; i < fused_output_shapes.size() && !has_dynamic_output; ++i) {
+            for (const auto& dim : fused_output_shapes[i]) {
+              if (dim == webnn::kDynamicDim) {
+                has_dynamic_output = true;
+                break;
+              }
+            }
+          }
+
+          if (has_dynamic_output) {
+            InlinedHashMap<std::string, std::vector<int64_t>> input_shapes_for_compute;
+            for (size_t i = 0; i < model_inputs.size(); i++) {
+              const auto& input_name = model_inputs[i];
+              auto input_idx = model->GetMappedInputIdx(input_name);
+              input_shapes_for_compute.emplace(input_name, runtime_input_shapes[input_idx]);
+            }
+
+            auto status = model->ComputeShapes(input_shapes_for_compute, computed_output_shapes);
+            if (status.IsOK()) {
+              shapes_computed = true;
+            } else {
+              LOGS_DEFAULT(WARNING) << "[WebNN] computeShapes() failed: " << status.ErrorMessage()
+                                    << ". Falling back to symbolic shape resolution.";
+            }
+          }
+        }
+
         InlinedHashMap<std::string, webnn::OnnxTensorData> outputs;
         outputs.reserve(model_outputs.size());
         for (size_t i = 0; i < model_outputs.size(); i++) {
           const auto& output_name = model_outputs[i];
           const auto& output_info = model->GetInputOutputInfo(output_name);
-          auto output_shape = output_info.shape;
           auto output_type = output_info.data_type;
+          const auto output_idx = model->GetMappedOutputIdx(output_name);
+
+          std::vector<int64_t> output_shape;
+          bool resolved_by_compute_shapes = false;
+
+          if (shapes_computed) {
+            auto it = computed_output_shapes.find(output_name);
+            if (it != computed_output_shapes.end()) {
+              output_shape = it->second;
+              resolved_by_compute_shapes = true;
+            }
+          }
+
+          if (!resolved_by_compute_shapes) {
+            // Use fused-node output shape metadata as allocation baseline.
+            output_shape = output_info.shape;
+            if (output_idx < fused_output_shapes.size() && !fused_output_shapes[output_idx].empty()) {
+              output_shape = fused_output_shapes[output_idx];
+            }
+
+            // Resolve dynamic output dimensions from current runtime input shapes via dim_param.
+            if (output_idx < output_dim_params.size()) {
+              const auto& dim_params = output_dim_params[output_idx];
+              const size_t dims_to_resolve = output_shape.size() < dim_params.size() ? output_shape.size() : dim_params.size();
+
+              for (size_t dim_idx = 0; dim_idx < dims_to_resolve; ++dim_idx) {
+                if (output_shape[dim_idx] != webnn::kDynamicDim) {
+                  continue;
+                }
+
+                const auto& dim_param = dim_params[dim_idx];
+                if (dim_param.empty()) {
+                  continue;
+                }
+
+                // First try exact match.
+                auto it = dim_param_to_input_dim.find(dim_param);
+                if (it != dim_param_to_input_dim.end()) {
+                  const size_t source_input_idx = it->second.first;
+                  const size_t source_dim_idx = it->second.second;
+                  if (source_input_idx < runtime_input_shapes.size()) {
+                    const auto& source_shape = runtime_input_shapes[source_input_idx];
+                    if (source_dim_idx < source_shape.size()) {
+                      output_shape[dim_idx] = source_shape[source_dim_idx];
+                    }
+                  }
+                  continue;
+                }
+
+                // Fall back to fixed FreeDimensionBounds value if available.
+                auto fixed_it = fixed_dim_param_values.find(dim_param);
+                if (fixed_it != fixed_dim_param_values.end()) {
+                  output_shape[dim_idx] = fixed_it->second;
+                  continue;
+                }
+
+                // Try to parse expressions like "N*dim_param" or "dim_param*N" (e.g., "8*latent_height").
+                // These arise from symbolic shape inference simplification.
+                {
+                  auto star_pos = dim_param.find('*');
+                  if (star_pos != std::string::npos) {
+                    const std::string left = utils::TrimString(std::string_view(dim_param).substr(0, star_pos));
+                    const std::string right = utils::TrimString(std::string_view(dim_param).substr(star_pos + 1));
+
+                    // Non-throwing integer parse (std::stoll throws, but WASM builds may have
+                    // exception catching disabled outside the API layer).
+                    auto try_parse_int64 = [](const std::string& s, int64_t& out) -> bool {
+                      if (s.empty()) return false;
+                      char* end = nullptr;
+                      errno = 0;
+                      long long val = std::strtoll(s.c_str(), &end, 10);
+                      if (end == s.c_str() || *end != '\0' || errno == ERANGE) return false;
+                      out = static_cast<int64_t>(val);
+                      return true;
+                    };
+
+                    // Determine which part is the factor and which is the base dim_param.
+                    int64_t factor = 0;
+                    std::string base_param;
+                    bool parsed = false;
+
+                    // Try left as factor, right as dim_param.
+                    if (try_parse_int64(left, factor)) {
+                      base_param = right;
+                      parsed = true;
+                    }
+
+                    // Try right as factor, left as dim_param.
+                    if (!parsed && try_parse_int64(right, factor)) {
+                      base_param = left;
+                      parsed = true;
+                    }
+
+                    if (parsed && factor > 0) {
+                      auto base_it = dim_param_to_input_dim.find(base_param);
+                      if (base_it != dim_param_to_input_dim.end()) {
+                        const size_t src_idx = base_it->second.first;
+                        const size_t src_dim = base_it->second.second;
+                        if (src_idx < runtime_input_shapes.size() &&
+                            src_dim < runtime_input_shapes[src_idx].size()) {
+                          output_shape[dim_idx] = factor * runtime_input_shapes[src_idx][src_dim];
+                        }
+                      } else {
+                        auto fixed_base_it = fixed_dim_param_values.find(base_param);
+                        if (fixed_base_it != fixed_dim_param_values.end()) {
+                          output_shape[dim_idx] = factor * fixed_base_it->second;
+                        }
+                      }
+                    }
+                  }
+                }
+
+                // Try to parse additive expressions like "dim_a + dim_b"
+                // (e.g., "past_sequence_length + sequence_length").
+                if (output_shape[dim_idx] == webnn::kDynamicDim) {
+                  auto plus_pos = dim_param.find('+');
+                  if (plus_pos != std::string::npos) {
+                    const std::string left = utils::TrimString(std::string_view(dim_param).substr(0, plus_pos));
+                    const std::string right = utils::TrimString(std::string_view(dim_param).substr(plus_pos + 1));
+
+                    // Resolve each operand (from runtime inputs or fixed bounds).
+                    auto resolve_operand = [&](const std::string& operand) -> int64_t {
+                      auto it = dim_param_to_input_dim.find(operand);
+                      if (it != dim_param_to_input_dim.end()) {
+                        const size_t src_idx = it->second.first;
+                        const size_t src_dim = it->second.second;
+                        if (src_idx < runtime_input_shapes.size() &&
+                            src_dim < runtime_input_shapes[src_idx].size()) {
+                          return runtime_input_shapes[src_idx][src_dim];
+                        }
+                      }
+                      auto fixed_it = fixed_dim_param_values.find(operand);
+                      if (fixed_it != fixed_dim_param_values.end()) {
+                        return fixed_it->second;
+                      }
+                      return -1;  // unresolved
+                    };
+
+                    int64_t left_val = resolve_operand(left);
+                    int64_t right_val = resolve_operand(right);
+                    if (left_val >= 0 && right_val >= 0) {
+                      output_shape[dim_idx] = left_val + right_val;
+                    }
+                  }
+                }
+              }
+            }
+
+            // Fallback: if any dynamic dimensions remain unresolved, try to read the shape from
+            // a pre-allocated output tensor (provided via session.run(feeds, fetches)).
+            {
+              bool has_unresolved = false;
+              for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
+                if (output_shape[dim_idx] == webnn::kDynamicDim) {
+                  has_unresolved = true;
+                  break;
+                }
+              }
+              if (has_unresolved) {
+                auto* internal_ctx = reinterpret_cast<OpKernelContextInternal*>(context);
+                OrtValue* pre_alloc = internal_ctx->GetOutputMLValue(static_cast<int>(output_idx));
+                if (pre_alloc != nullptr && pre_alloc->IsAllocated() && pre_alloc->IsTensor()) {
+                  const auto& pre_alloc_shape = pre_alloc->Get<Tensor>().Shape().GetDims();
+                  if (pre_alloc_shape.size() == output_shape.size()) {
+                    for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
+                      if (output_shape[dim_idx] == webnn::kDynamicDim && pre_alloc_shape[dim_idx] > 0) {
+                        output_shape[dim_idx] = pre_alloc_shape[dim_idx];
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            // If dynamic dimensions remain unresolved, try to infer from the max bounds
+            // of known dims (e.g., use batch_size=1 for dim 0, sequence_length for others).
+            // This handles intermediate outputs (like Expand's causal mask) whose shapes are
+            // data-dependent and not annotated with a resolvable dim_param.
+            for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
+              if (output_shape[dim_idx] == webnn::kDynamicDim) {
+                std::string unresolved_dim_param;
+                if (output_idx < output_dim_params.size() && dim_idx < output_dim_params[output_idx].size()) {
+                  unresolved_dim_param = output_dim_params[output_idx][dim_idx];
+                }
+
+                // Instead of hard-failing, use a heuristic:
+                // - Try to match the unresolved dim to any input dim at the same index.
+                // - As a last resort, copy from the largest input shape at this dim index.
+                int64_t inferred = 0;
+                for (size_t inp_idx = 0; inp_idx < runtime_input_shapes.size() && inferred == 0; ++inp_idx) {
+                  if (dim_idx < runtime_input_shapes[inp_idx].size()) {
+                    int64_t candidate = runtime_input_shapes[inp_idx][dim_idx];
+                    if (candidate > inferred) {
+                      inferred = candidate;
+                    }
+                  }
+                }
+
+                if (inferred > 0) {
+                  LOGS_DEFAULT(WARNING) << "[WebNN] Unresolved output dim for [" << output_name
+                                       << "] at index " << dim_idx << " (dim_param: [" << unresolved_dim_param
+                                       << "]). Inferred from runtime inputs: " << inferred;
+                  output_shape[dim_idx] = inferred;
+                } else {
+                  LOGS_DEFAULT(ERROR) << "[WebNN] Failed to resolve dynamic output dimension for output ["
+                                      << output_name << "] at dim index [" << dim_idx
+                                      << "], dim_param: [" << unresolved_dim_param
+                                      << "]. No input dims available for inference.";
+                  return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL,
+                                         "[WebNN] Failed to resolve dynamic output dimension for output: ", output_name,
+                                         " at dim index: ", dim_idx,
+                                         ". dim_param: ", unresolved_dim_param);
+                }
+              }
+            }
+          }
+
           auto output_tensor =
-              ctx.GetOutput(i, output_shape.data(), output_shape.size());
+              ctx.GetOutput(output_idx, output_shape.data(), output_shape.size());
           void* output_buffer = output_tensor.GetTensorMutableRawData();
           outputs.emplace(output_name,
                           webnn::OnnxTensorData{
