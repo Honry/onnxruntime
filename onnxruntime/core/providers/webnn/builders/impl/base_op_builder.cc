@@ -45,7 +45,7 @@ bool BaseOpBuilder::HasSupportedInputs(const GraphViewer& graph_viewer, const No
                                        const emscripten::val& wnn_limits, const logging::Logger& logger) const {
   const auto node_name = MakeString("Node [", node.Name(), "] type [", node.OpType(), "]");
   for (const auto* input : node.InputDefs()) {
-    if (!IsTensorShapeSupported(*input, node_name, logger, allow_empty_tensor_as_input_)) {
+    if (!IsTensorShapeSupported(*input, node_name, wnn_limits, logger, allow_empty_tensor_as_input_)) {
       return false;
     }
   }
@@ -74,7 +74,7 @@ bool BaseOpBuilder::HasSupportedOutputs(const Node& node, const emscripten::val&
                                         const logging::Logger& logger) const {
   const auto node_name = MakeString("Node [", node.Name(), "] type [", node.OpType(), "]");
   for (const auto* output : node.OutputDefs()) {
-    if (!IsTensorShapeSupported(*output, node_name, logger)) {
+    if (!IsTensorShapeSupported(*output, node_name, wnn_limits, logger)) {
       return false;
     }
   }
