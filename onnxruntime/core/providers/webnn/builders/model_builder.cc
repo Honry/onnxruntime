@@ -21,13 +21,15 @@ namespace webnn {
 ModelBuilder::ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger,
                            const emscripten::val& context, const WebnnDeviceType wnn_device_type,
                            const emscripten::val& wnn_limits,
-                           const FreeDimensionBounds& free_dimension_bounds)
+                           const FreeDimensionBounds& free_dimension_bounds,
+                           bool enable_causal_lm)
     : graph_viewer_(graph_viewer),
       logger_(logger),
       wnn_context_(context),
       wnn_device_type_(wnn_device_type),
       wnn_limits_(wnn_limits),
-      free_dimension_bounds_(free_dimension_bounds) {
+      free_dimension_bounds_(free_dimension_bounds),
+      enable_causal_lm_(enable_causal_lm) {
   // Create WebNN MLGraphBuilder for each ModelBuilder, because MLGraphBuilder.build()
   // is only allowed to be called once.
   wnn_builder_ = emscripten::val::global("MLGraphBuilder").new_(context);
@@ -268,6 +270,7 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
     const auto& shape = shape_proto->dim();
     for (const auto& dim : shape) {
       if (dim.has_dim_value()) {
+        // Static dimension: use the concrete value.
         int32_t dim_value = SafeInt<int32_t>(dim.dim_value());
         shape_array.call<void>("push", dim_value);
       } else {
@@ -283,6 +286,8 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
         dim_obj.set("name", emscripten::val(dim_name));
 
         if (is_input) {
+          // If FreeDimensionBounds are provided for this dynamic dimension,
+          // use them for WebNN's MLGraphBuilder.input() minSize/maxSize descriptor.
           const auto it = free_dimension_bounds_.find(dim_name);
           if (it != free_dimension_bounds_.end()) {
             const int32_t min_size = it->second.min_size;
@@ -370,10 +375,15 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
     output_names_.push_back(name);
   }
 
+  // Build shape vector for input_output_info.
   std::vector<int64_t> shape;
-  std::transform(dims.cbegin(), dims.cend(),
-                 std::back_inserter(shape),
-                 [](int32_t dim) -> int64_t { return SafeInt<int64_t>(dim); });
+  const auto* shape_proto = node_arg.Shape();
+  if (shape_proto) {
+    for (const auto& dim : shape_proto->dim()) {
+      // For dynamic dimensions, store kDynamicDim since actual shape is determined at runtime.
+      shape.push_back(dim.has_dim_value() ? dim.dim_value() : kDynamicDim);
+    }
+  }
   input_output_info_.emplace(name, OnnxTensorInfo{data_type, shape});
 
   return Status::OK();
@@ -391,7 +401,10 @@ Status ModelBuilder::AddOperations() {
   const auto& node_indices = graph_viewer_.GetNodesInTopologicalOrder();
   for (size_t i = 0; i < node_indices.size(); i++) {
     const auto* node(graph_viewer_.GetNode(node_indices[i]));
+
     if (const auto* op_builder = GetOpBuilder(*node)) {
+      LOGS(logger_, VERBOSE) << "AddOperations: processing node [" << node->Name()
+                             << "] type [" << node->OpType() << "] (" << i + 1 << "/" << node_indices.size() << ")";
       ORT_RETURN_IF_ERROR(op_builder->AddToModelBuilder(*this, *node, logger_));
     } else {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
@@ -412,6 +425,16 @@ Status ModelBuilder::RegisterModelOutputs() {
 
 Status ModelBuilder::Compile(std::unique_ptr<Model>& model) {
   ORT_RETURN_IF_ERROR(Initialize());
+
+  LOGS(logger_, INFO) << "[WebNN] Creating graph with " << input_names_.size() << " input(s) and "
+                      << output_names_.size() << " output(s).";
+  for (const auto& input_name : input_names_) {
+    LOGS(logger_, INFO) << "[WebNN] Graph input: " << input_name;
+  }
+  for (const auto& output_name : output_names_) {
+    LOGS(logger_, INFO) << "[WebNN] Graph output: " << output_name;
+  }
+
   emscripten::val named_operands = emscripten::val::object();
   for (auto& name : output_names_) {
     emscripten::val wnn_output = wnn_operands_.at(name);

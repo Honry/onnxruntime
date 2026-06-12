@@ -24,7 +24,7 @@ class ModelBuilder {
  public:
   ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger, const emscripten::val& context,
                const WebnnDeviceType wnn_device_type, const emscripten::val& wnn_limits,
-               const FreeDimensionBounds& free_dimension_bounds);
+               const FreeDimensionBounds& free_dimension_bounds, bool enable_causal_lm);
   ~ModelBuilder() = default;
 
   Status Compile(std::unique_ptr<Model>& model) ORT_MUST_USE_RESULT;
@@ -55,6 +55,8 @@ class ModelBuilder {
                                              const std::vector<uint32_t>& shape = {});
 
   WebnnDeviceType GetWebnnDeviceType() const { return wnn_device_type_; }
+  // Returns true when GQA should use concat-based (stateful) KV-cache; false for ScatterND (stateless).
+  bool IsCausalLMEnabled() const { return enable_causal_lm_; }
 
   // The initializer will be processed separately, skip it as an initializer.
   void AddInitializerToSkip(const std::string& tensor_name);
@@ -66,10 +68,15 @@ class ModelBuilder {
   std::string GetUniqueName(const std::string& base_name);
 
   // Dim provenance tracking for reshape-derived dim descriptors.
+  // When reshape creates a new dynamic dim (e.g., unk__7 = seq_len * 30),
+  // we record the relationship so a subsequent reshape that inverts it
+  // (e.g., unk__8 = unk__7 / 30 = seq_len) can reuse the original descriptor.
+  // This is required because WebNN ops like expand/gather only accept native
+  // dim descriptors from operand shapes, not freshly created JS objects.
   struct DimProvenance {
-    std::string source_operand_name;
-    uint32_t source_dim_index;
-    int64_t factor_num;
+    std::string source_operand_name;  // operand holding the original dim
+    uint32_t source_dim_index;        // index of the dim in source operand's shape
+    int64_t factor_num;               // new_dim = source_dim * factor_num / factor_den
     int64_t factor_den;
   };
 
@@ -77,6 +84,7 @@ class ModelBuilder {
   const DimProvenance* GetDimProvenance(const std::string& dim_name) const;
 
  private:
+  // Maps dim descriptor name → its provenance (relationship to a source operand's dim).
   std::unordered_map<std::string, DimProvenance> dim_provenance_;
 
   const GraphViewer& graph_viewer_;
@@ -90,6 +98,7 @@ class ModelBuilder {
   WebnnDeviceType wnn_device_type_;
   emscripten::val wnn_limits_ = emscripten::val::undefined();
   FreeDimensionBounds free_dimension_bounds_;
+  bool enable_causal_lm_;
   InlinedHashMap<std::string, emscripten::val> wnn_operands_;
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;
