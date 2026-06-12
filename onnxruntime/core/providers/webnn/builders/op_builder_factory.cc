@@ -40,10 +40,15 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateBinaryOpBuilder("Div", op_registrations);
     CreateBinaryOpBuilder("Pow", op_registrations);
     CreateBinaryOpBuilder("PRelu", op_registrations);
+    CreateBinaryOpBuilder("Mod", op_registrations);
   }
 
   {  // Ternary
     CreateTernaryOpBuilder("Where", op_registrations);
+  }
+
+  {  // Range
+    CreateRangeOpBuilder("Range", op_registrations);
   }
 
   {  // Activations
@@ -80,6 +85,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
 
   {  // Concat
     CreateConcatOpBuilder("Concat", op_registrations);
+  }
+
+  {  // ConstantOfShape
+    CreateConstantOfShapeOpBuilder("ConstantOfShape", op_registrations);
   }
 
   {  // CumSum
