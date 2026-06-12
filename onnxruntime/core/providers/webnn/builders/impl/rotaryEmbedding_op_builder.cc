@@ -185,7 +185,9 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
         "reshape", input, new_shape, reshape_input_options);
   }
 
-  // Apply rotary embedding using the helper function
+  // Apply rotary embedding using the helper function.
+  // For 4D input: output_bnsh=true avoids a back-transpose that would form a pair with the
+  // external transpose, preventing the downstream optimizer from breaking RoPE pattern matching.
   emscripten::val output;
   ORT_RETURN_IF_ERROR(ApplyRotaryEmbedding(
       model_builder,
@@ -201,14 +203,13 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
       interleaved,
       has_position_ids,
       position_ids_is_offset,
+      input_is_4d,  // output_bnsh: 4D input is BNSH, output stays BNSH; 3D needs BSNH for reshape
       output));
 
   if (input_is_4d) {
-    // The output is in 4D shape, we need to transpose it back to the original shape.
-    // Reuse the transpose_options' permutation because the original permutation also
-    // happens to be its own inverse. (inverse({0, 2, 1, 3} == {0, 2, 1, 3})
-    transpose_options.set("label", node_name + "_transpose_output");
-    output = wnn_builder.call<emscripten::val>("transpose", output, transpose_options);
+    // Output is already BNSH (same as original input layout). No transpose needed.
+    // The external Transpose(BNSH→BSNH) at input + internal Transpose(BSNH→BNSH) cancel each other,
+    // and without a back-transpose, the optimizer has nothing to push through.
   } else {
     // The output is in 3D shape, we need to reshape it back to the original shape.
     // The output shape is same as the input shape.

@@ -340,6 +340,15 @@ export declare namespace InferenceSession {
     numThreads?: number;
     powerPreference?: 'default' | 'low-power' | 'high-performance';
     freeDimensionBounds?: { readonly [dimensionName: string]: FreeDimensionBound };
+    /**
+     * When true, the GroupQueryAttention (GQA) op uses a stateful concat-based KV-cache strategy:
+     * present_kv = concat(past_kv, new_kv). The cache grows each decode step.
+     *
+     * When false (default), GQA uses a stateless ScatterND-based strategy: new tokens are
+     * scattered into a fixed-size past_kv buffer at the position indicated by seqlens_k.
+     * This is suitable for models that manage the KV-cache externally (e.g., via I/O binding).
+     */
+    enableCausalLM?: boolean;
   }
 
   /**
