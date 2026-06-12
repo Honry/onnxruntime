@@ -12,40 +12,26 @@
 #include "attention_helper.h"
 
 // WebNN doesn't provide a dedicated op for RotaryEmbedding. Instead, we implement it by using a
-// combination of WebNN ops. The decomposed graph is referenced from DML EP at:
-// onnxruntime/core/providers/dml/DmlExecutionProvider/src/Operators/DmlOperatorRotaryEmbedding.cpp
+// combination of WebNN ops. The decomposition follows the OpenVINO RoPE fusion pattern
+// (split on last axis), implemented in attention_helper.h::ApplyRotaryEmbedding.
 /*
-                 Input                            CosCache   PositionIds     SinCache
-                   |                                 |           |              |
-                   |                                 |  +--------+-----------+  |
-                 Split                               |  |                    |  |
-                  |  |                              Gather                  Gather
-          +-------+  |                                |                        |
-          |          |                                |                        |
-          |     Identity----------+                   |                        |
-          |        |              |                   |                        |
-          |        |              |                   |                        |
-          |    --Split--          |                   |                        |
-          |    \       /          | +-----------------+                        |
-          |     \     /           | |                                          |
-          |      \   /            Mul                                          |
-          |       \ /              |                                           |
-          |        X               |                                           |
-          |       / \              |                                           |
-          |      /   \             |                                           |
-          |       Join             |                                           |
-          |        |               |                                           |
-          |        | +---------------------------------------------------------+
-          |        | |             |
-          |        Mul             |
-          |         |              |
-          |         +-----+ +------+
-          |               | |
-          |               Add
-          |                |
-          +-------------+  |
-                        |  |
-                        Join
+    Input [B, S, num_heads, head_size]     CosCache   PositionIds   SinCache
+          |                                    |           |             |
+      Split(axis=3)                           Gather      |           Gather
+      /           \                             |         |             |
+  first_half   second_half                  Unsqueeze(dim=2)       Unsqueeze(dim=2)
+      |    \     /    |                     → [B,S,1,half]        → [B,S,1,half]
+      |     \   /     |                         |                     |
+      |      \ /      |                     Expand(first_half.shape)  Expand(first_half.shape)
+    first*cos  second*sin                       |                     |
+        |         |                         second*cos            first*sin
+        +---sub---+                             |                     |
+             |                                  +--------add----------+
+           res_0                                          |
+             \                                          res_1
+              +----------Concat(axis=3)----------------+  /
+                              |
+                           Output [B, S, num_heads, head_size]
 */
 namespace onnxruntime {
 namespace webnn {
@@ -93,6 +79,7 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
   const bool position_ids_is_offset = has_position_ids && position_ids_shape.size() == 1;
 
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
+  emscripten::val original_input = input;
   emscripten::val position_ids = emscripten::val::undefined();
   if (has_position_ids) {
     position_ids = model_builder.GetOperand(input_defs[position_ids_idx]->Name());
@@ -111,15 +98,12 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
   // The input can be:
   // - 3D: [batch_size, sequence_length, hidden_size]
   // - 4D: [batch_size, num_heads, sequence_length, head_size]
-  const uint32_t batch_size = static_cast<uint32_t>(input_shape[0]);
-  uint32_t sequence_length, hidden_size, head_size;
+  uint32_t hidden_size, head_size;
   if (input_is_4d) {
-    sequence_length = static_cast<uint32_t>(input_shape[2]);
     hidden_size = static_cast<uint32_t>(input_shape[1] * input_shape[3]);
     num_heads = static_cast<uint32_t>(input_shape[1]);
     head_size = static_cast<uint32_t>(input_shape[3]);
   } else {
-    sequence_length = static_cast<uint32_t>(input_shape[1]);
     hidden_size = static_cast<uint32_t>(input_shape[2]);
     // Since opset 23, if the input is 3D, the num_heads must be provided.
     if (is_onnx_domain) {
@@ -127,7 +111,8 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
       head_size = hidden_size / num_heads;
     } else {
       if (num_heads == 0) {
-        head_size = static_cast<uint32_t>(cos_cache_shape[1]) * 2;
+        // Per MS RotaryEmbedding spec, cos_cache shape is [max_seq, head_size/2].
+        head_size = static_cast<uint32_t>(cos_cache_shape.back()) * 2;
         num_heads = hidden_size / head_size;
       } else {
         head_size = hidden_size / num_heads;
@@ -137,6 +122,43 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
 
   if (rotary_embedding_dim == 0) {
     rotary_embedding_dim = head_size;
+  }
+
+  // The cos/sin cache should have shape [max_seq, head_size/2] per the spec.
+  // However, some models provide [max_seq, head_size] (full width).
+  // Detect this by comparing cos_cache's last dim with head_size:
+  //   - If cos_cache_last == head_size (and head_size > 1): full-width cache, split to half.
+  //   - If cos_cache_last == head_size/2: already half-width, no action needed.
+  const uint32_t half_rotary_embedding_dim = rotary_embedding_dim / 2;
+  const uint32_t cos_cache_last_dim = static_cast<uint32_t>(cos_cache_shape.back());
+  if (cos_cache_last_dim == head_size && cos_cache_last_dim > half_rotary_embedding_dim) {
+    // Cache stores full head_size values (e.g., [max_seq, 128] when head_size=128).
+    // Split the last axis and take the first half to get [max_seq, 64].
+    const uint32_t last_axis = static_cast<uint32_t>(cos_cache_shape.size() - 1);
+    const std::vector<uint32_t> split_sizes{half_rotary_embedding_dim,
+                                            cos_cache_last_dim - half_rotary_embedding_dim};
+
+    emscripten::val split_cos_options = emscripten::val::object();
+    split_cos_options.set("label", node_name + "_split_cos_cache_half");
+    split_cos_options.set("axis", last_axis);
+    emscripten::val split_cos = wnn_builder.call<emscripten::val>(
+        "split", cos_cache, emscripten::val::array(split_sizes), split_cos_options);
+    cos_cache = split_cos[0];
+
+    emscripten::val split_sin_options = emscripten::val::object();
+    split_sin_options.set("label", node_name + "_split_sin_cache_half");
+    split_sin_options.set("axis", last_axis);
+    emscripten::val split_sin = wnn_builder.call<emscripten::val>(
+        "split", sin_cache, emscripten::val::array(split_sizes), split_sin_options);
+    sin_cache = split_sin[0];
+
+    // If head_size was derived from cos_cache (num_heads==0 case), it was computed as
+    // cos_cache_last*2 which is wrong for full-width cache. Correct it.
+    if (!input_is_4d && !is_onnx_domain && head_size == cos_cache_last_dim * 2) {
+      head_size = cos_cache_last_dim;
+      num_heads = hidden_size / head_size;
+      rotary_embedding_dim = head_size;
+    }
   }
 
   emscripten::val transpose_options = emscripten::val::object();
@@ -151,11 +173,16 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
     transpose_options.set("permutation", emscripten::val::array(permutation));
     input = wnn_builder.call<emscripten::val>("transpose", input, transpose_options);
   } else {
-    const std::vector<uint32_t> new_shape{batch_size, sequence_length, num_heads, head_size};
+    emscripten::val new_shape = emscripten::val::array();
+    // Use input.shape to avoid passing literal 0 for dynamic dimensions.
+    new_shape.call<void>("push", input["shape"][0]);
+    new_shape.call<void>("push", input["shape"][1]);
+    new_shape.call<void>("push", num_heads);
+    new_shape.call<void>("push", head_size);
     emscripten::val reshape_input_options = emscripten::val::object();
     reshape_input_options.set("label", node_name + "_reshape_input");
     input = wnn_builder.call<emscripten::val>(
-        "reshape", input, emscripten::val::array(new_shape), reshape_input_options);
+        "reshape", input, new_shape, reshape_input_options);
   }
 
   // Apply rotary embedding using the helper function
@@ -168,8 +195,6 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
       sin_cache,
       position_ids,
       input_data_type,
-      batch_size,
-      sequence_length,
       num_heads,
       head_size,
       rotary_embedding_dim,
@@ -187,11 +212,14 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
   } else {
     // The output is in 3D shape, we need to reshape it back to the original shape.
     // The output shape is same as the input shape.
-    const std::vector<uint32_t> output_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
+    emscripten::val output_shape = emscripten::val::array();
+    output_shape.call<void>("push", original_input["shape"][0]);
+    output_shape.call<void>("push", original_input["shape"][1]);
+    output_shape.call<void>("push", original_input["shape"][2]);
     emscripten::val reshape_output_options = emscripten::val::object();
     reshape_output_options.set("label", node_name + "_reshape_output");
     output = wnn_builder.call<emscripten::val>(
-        "reshape", output, emscripten::val::array(output_shape), reshape_output_options);
+      "reshape", output, output_shape, reshape_output_options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -222,13 +250,36 @@ bool RotaryEmbeddingOpBuilder::IsOpSupportedImpl(const GraphViewer&, const Node&
   const int rotary_embedding_dim = helper.Get("rotary_embedding_dim", 0);
   const auto sequence_length = input_size == 4 ? input_shape[2] : input_shape[1];
 
+  // For the 4D case, num_heads (dim[1]) and head_size (dim[3]) must be static
+  // because they define the tensor decomposition structure.
+  if (input_size == 4) {
+    if (input_shape[1] == kDynamicDim || input_shape[3] == kDynamicDim) {
+      LOGS(logger, VERBOSE) << "RotaryEmbedding: 4D input requires static num_heads (dim[1]) and head_size (dim[3])";
+      return false;
+    }
+  }
+
+  // For the 3D case, hidden_size (dim[2]) must be static.
+  if (input_size == 3 && input_shape[2] == kDynamicDim) {
+    LOGS(logger, VERBOSE) << "RotaryEmbedding: 3D input requires static hidden_size (dim[2])";
+    return false;
+  }
+
+  // cos_cache's second dimension (half_rotary_embedding_dim) must be static.
+  if (cos_cache_shape[1] == kDynamicDim) {
+    LOGS(logger, VERBOSE) << "RotaryEmbedding: cos_cache requires static second dimension";
+    return false;
+  }
+
   if (is_onnx_domain) {
     if (input_size == 3 && num_heads == 0) {
       LOGS(logger, VERBOSE) << "RotaryEmbedding: num_heads must be provided if input is 3D";
       return false;
     }
   } else {
-    if (is_packed_batching == 0 && sequence_length > cos_cache_shape[0]) {
+    // Skip sequence_length vs cos_cache comparison when either dimension is dynamic.
+    if (is_packed_batching == 0 && sequence_length > 0 && cos_cache_shape[0] > 0 &&
+        sequence_length > cos_cache_shape[0]) {
       LOGS(logger, VERBOSE) << "RotaryEmbedding: updating cos_cache and sin_cache is not currently supported";
       return false;
     }
@@ -239,7 +290,7 @@ bool RotaryEmbeddingOpBuilder::IsOpSupportedImpl(const GraphViewer&, const Node&
     }
   }
 
-  if (input_size == 4 && num_heads != 0 && num_heads != input_shape[1]) {
+  if (input_size == 4 && num_heads != 0 && input_shape[1] > 0 && num_heads != input_shape[1]) {
     LOGS(logger, VERBOSE) << "RotaryEmbedding: when input has 4 dimensions, num_heads must be 0 or have the same value "
                              "as the second dimension of the input";
     return false;
@@ -283,7 +334,7 @@ bool RotaryEmbeddingOpBuilder::HasSupportedInputsImpl(const GraphViewer&,
   }
 
   // Check if the input data type is supported by each decomposed WebNN op.
-  // Decomposed ops include: "Add", "Concat", "Gather", "Mul", "Reshape" and "Split".
+  // Decomposed ops include: "Add", "Concat", "Expand", "Gather", "Mul", "Reshape" and "Split".
   for (const std::string_view decomposed_op_type : decomposed_op_map.at(op_type)) {
     const std::string_view webnn_op_type = GetWebNNOpType(decomposed_op_type);
     const std::string_view webnn_input_name = GetWebNNOpFirstInputName(decomposed_op_type);
