@@ -80,14 +80,21 @@ Status PoolOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get shape");
   AutoPadType auto_pad_type = StringToAutoPadType(helper.Get("auto_pad", "NOTSET"));
   if (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type) {
-    std::vector<int64_t> pads_out;
-    ORT_RETURN_IF_ERROR(HandleAutoPad(input_shape, onnx_kernel_shape[0], onnx_kernel_shape[1],
-                                      onnx_pads,
-                                      helper.Get("strides", std::vector<int64_t>{1, 1}),
-                                      helper.Get("dilations", std::vector<int64_t>{1, 1}),
-                                      auto_pad_type,
-                                      pads_out));
-    pads = GetNarrowedIntFromInt64<uint32_t>(pads_out);
+    if (HasDynamicShape(input_shape)) {
+      // When spatial dims are dynamic, use WebNN's native autoPad instead of computing explicit pads.
+      options.set("autoPad", emscripten::val(auto_pad_type == AutoPadType::SAME_UPPER
+                                                 ? "same-upper"
+                                                 : "same-lower"));
+    } else {
+      std::vector<int64_t> pads_out;
+      ORT_RETURN_IF_ERROR(HandleAutoPad(input_shape, onnx_kernel_shape[0], onnx_kernel_shape[1],
+                                        onnx_pads,
+                                        helper.Get("strides", std::vector<int64_t>{1, 1}),
+                                        helper.Get("dilations", std::vector<int64_t>{1, 1}),
+                                        auto_pad_type,
+                                        pads_out));
+      pads = GetNarrowedIntFromInt64<uint32_t>(pads_out);
+    }
   }
   // Permute the ONNX's pads, which is [beginning_height, beginning_width, ending_height, ending_width],
   // while WebNN's padding is [beginning_height, ending_height, beginning_width, ending_width].
