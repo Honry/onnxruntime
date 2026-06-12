@@ -12,6 +12,7 @@
 #include "core/providers/webnn/builders/op_builder_factory.h"
 
 #include "base_op_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -287,38 +288,67 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
   const auto& input_defs = node.InputDefs();
   emscripten::val input_a = model_builder.GetOperand(input_defs[0]->Name());
   emscripten::val input_b = model_builder.GetOperand(input_defs[1]->Name());
+  // Check if inputs have dynamic shapes.
+  std::vector<int64_t> input_a_shape, input_b_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_a_shape, logger), "Cannot get shape");
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[1], input_b_shape, logger), "Cannot get shape");
+  const bool has_dynamic_a = HasDynamicShape(input_a_shape);
+  const bool has_dynamic_b = HasDynamicShape(input_b_shape);
+  const bool has_dynamic = has_dynamic_a || has_dynamic_b;
+  emscripten::val wnn_builder = model_builder.GetBuilder();
+
+
   std::vector<uint32_t> new_a_shape, new_b_shape;
   if (input_a_labels.size() < a_0.size()) {
-    std::vector<int64_t> input_a_shape;
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_a_shape, logger), "Cannot get shape");
-    std::transform(input_a_shape.begin(), input_a_shape.end(), std::back_inserter(new_a_shape),
-                   [](int64_t i) { return static_cast<uint32_t>(i); });
-    for (uint32_t i = 0; i < a_0.size() - input_a_labels.size(); ++i) {
-      new_a_shape.push_back(SafeInt<int32_t>(1));
+    uint32_t extra_dims = static_cast<uint32_t>(a_0.size() - input_a_labels.size());
+    if (has_dynamic_a) {
+      // Dynamic path: use shape op + concat with constant [1]s, then dynamicReshape.
+      emscripten::val shape_op = wnn_builder.call<emscripten::val>("shape", input_a);
+      emscripten::val segments = emscripten::val::array();
+      segments.call<void>("push", shape_op);
+      for (uint32_t i = 0; i < extra_dims; ++i) {
+        segments.call<void>("push", shape_utils::GetShapeConstantOne(model_builder));
+      }
+      input_a = shape_utils::DynamicReshapeWithSegments(
+          model_builder, input_a, segments, node.Name() + "_reshape_a_unsqueeze");
+    } else {
+      std::transform(input_a_shape.begin(), input_a_shape.end(), std::back_inserter(new_a_shape),
+                     [](int64_t i) { return static_cast<uint32_t>(i); });
+      for (uint32_t i = 0; i < extra_dims; ++i) {
+        new_a_shape.push_back(SafeInt<int32_t>(1));
+      }
+      emscripten::val options = emscripten::val::object();
+      options.set("label", node.Name() + "_reshape");
+      input_a = wnn_builder.call<emscripten::val>("reshape",
+                                                   input_a,
+                                                   emscripten::val::array(new_a_shape),
+                                                   options);
     }
-
-    emscripten::val options = emscripten::val::object();
-    options.set("label", node.Name() + "_reshape");
-    input_a = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                               input_a,
-                                                               emscripten::val::array(new_a_shape),
-                                                               options);
   }
   if (input_b_labels.size() < b_0.size()) {
-    std::vector<int64_t> input_b_shape;
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[1], input_b_shape, logger), "Cannot get shape");
-    std::transform(input_b_shape.begin(), input_b_shape.end(), std::back_inserter(new_b_shape),
-                   [](int64_t i) { return static_cast<uint32_t>(i); });
-    for (uint32_t i = 0; i < b_0.size() - input_b_labels.size(); ++i) {
-      new_b_shape.push_back(SafeInt<int32_t>(1));
+    uint32_t extra_dims = static_cast<uint32_t>(b_0.size() - input_b_labels.size());
+    if (has_dynamic_b) {
+      emscripten::val shape_op = wnn_builder.call<emscripten::val>("shape", input_b);
+      emscripten::val segments = emscripten::val::array();
+      segments.call<void>("push", shape_op);
+      for (uint32_t i = 0; i < extra_dims; ++i) {
+        segments.call<void>("push", shape_utils::GetShapeConstantOne(model_builder));
+      }
+      input_b = shape_utils::DynamicReshapeWithSegments(
+          model_builder, input_b, segments, node.Name() + "_reshape_b_unsqueeze");
+    } else {
+      std::transform(input_b_shape.begin(), input_b_shape.end(), std::back_inserter(new_b_shape),
+                     [](int64_t i) { return static_cast<uint32_t>(i); });
+      for (uint32_t i = 0; i < extra_dims; ++i) {
+        new_b_shape.push_back(SafeInt<int32_t>(1));
+      }
+      emscripten::val options = emscripten::val::object();
+      options.set("label", node.Name() + "_reshape");
+      input_b = wnn_builder.call<emscripten::val>("reshape",
+                                                   input_b,
+                                                   emscripten::val::array(new_b_shape),
+                                                   options);
     }
-
-    emscripten::val options = emscripten::val::object();
-    options.set("label", node.Name() + "_reshape");
-    input_b = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                               input_b,
-                                                               emscripten::val::array(new_b_shape),
-                                                               options);
   }
 
   // Inputs Transpose
@@ -328,68 +358,102 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
     emscripten::val options = emscripten::val::object();
     options.set("permutation", emscripten::val::array(permutation_a));
     options.set("label", node.Name() + "_transpose");
-    input_a = model_builder.GetBuilder().call<emscripten::val>("transpose", input_a, options);
+    input_a = wnn_builder.call<emscripten::val>("transpose", input_a, options);
   }
   if (permutation_b != sequence) {
     emscripten::val options = emscripten::val::object();
     options.set("permutation", emscripten::val::array(permutation_b));
     options.set("label", node.Name() + "_transpose");
-    input_b = model_builder.GetBuilder().call<emscripten::val>("transpose", input_b, options);
+    input_b = wnn_builder.call<emscripten::val>("transpose", input_b, options);
   }
 
   // Input Reshape: if the number of (1,1,0) > 1, flatten the b_2 and a_3 dims.
   if (a_3.size() > 1) {
-    if (new_a_shape.empty()) {
-      std::vector<int64_t> input_a_shape;
-      ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_a_shape, logger), "Cannot get shape");
-      std::transform(input_a_shape.begin(), input_a_shape.end(), std::back_inserter(new_a_shape),
-                     [](int64_t i) { return static_cast<uint32_t>(i); });
-    }
-    if (new_b_shape.empty()) {
-      std::vector<int64_t> input_b_shape;
-      ORT_RETURN_IF_NOT(GetShape(*input_defs[1], input_b_shape, logger), "Cannot get shape");
-      std::transform(input_b_shape.begin(), input_b_shape.end(), std::back_inserter(new_b_shape),
-                     [](int64_t i) { return static_cast<uint32_t>(i); });
-    }
-    std::vector<uint32_t> new_new_a_shape, new_new_b_shape;
-    uint32_t a_dim = 1, b_dim = 1;
-    for (auto idx : a_1) {
-      new_new_a_shape.push_back(new_a_shape[idx]);
-    }
-    for (auto idx : a_2) {
-      new_new_a_shape.push_back(new_a_shape[idx]);
-    }
-    for (auto idx : a_3) {
-      a_dim *= new_a_shape[idx];
-    }
-    new_new_a_shape.push_back(a_dim);
-    for (auto idx : b_1) {
-      new_new_b_shape.push_back(new_b_shape[idx]);
-    }
-    for (auto idx : b_2) {
-      b_dim *= new_b_shape[idx];
-    }
-    new_new_b_shape.push_back(b_dim);
-    for (auto idx : b_3) {
-      new_new_b_shape.push_back(new_b_shape[idx]);
-    }
+    if (has_dynamic) {
+      // Dynamic path: use shape/slice/reduceProduct/dynamicReshape.
+      // After transpose, input_a layout is [a_1..., a_2, a_3...].
+      // Target: [a_1..., a_2, product(a_3...)].
+      uint32_t a1_count = static_cast<uint32_t>(a_1.size());
+      uint32_t a2_count = static_cast<uint32_t>(a_2.size());
+      uint32_t a3_count = static_cast<uint32_t>(a_3.size());
 
-    emscripten::val options = emscripten::val::object();
-    options.set("label", node.Name() + "_reshape");
-    input_a = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                               input_a,
-                                                               emscripten::val::array(new_new_a_shape),
-                                                               options);
-    input_b = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                               input_b,
-                                                               emscripten::val::array(new_b_shape),
-                                                               options);
+      emscripten::val shape_a = wnn_builder.call<emscripten::val>("shape", input_a);
+      emscripten::val segments_a = emscripten::val::array();
+      if (a1_count > 0) {
+        segments_a.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_a, 0, a1_count));
+      }
+      segments_a.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_a, a1_count, a2_count));
+      segments_a.call<void>("push", shape_utils::ReduceShapeRange(
+          model_builder, shape_a, a1_count + a2_count, a3_count, node.Name() + "_a3_product"));
+      input_a = shape_utils::DynamicReshapeWithSegments(
+          model_builder, input_a, segments_a, node.Name() + "_reshape_a_flatten");
+
+      // After transpose, input_b layout is [b_1..., b_2..., b_3].
+      // Target: [b_1..., product(b_2...), b_3].
+      uint32_t b1_count = static_cast<uint32_t>(b_1.size());
+      uint32_t b2_count = static_cast<uint32_t>(b_2.size());
+      uint32_t b3_count = static_cast<uint32_t>(b_3.size());
+
+      emscripten::val shape_b = wnn_builder.call<emscripten::val>("shape", input_b);
+      emscripten::val segments_b = emscripten::val::array();
+      if (b1_count > 0) {
+        segments_b.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_b, 0, b1_count));
+      }
+      segments_b.call<void>("push", shape_utils::ReduceShapeRange(
+          model_builder, shape_b, b1_count, b2_count, node.Name() + "_b2_product"));
+      segments_b.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_b, b1_count + b2_count, b3_count));
+      input_b = shape_utils::DynamicReshapeWithSegments(
+          model_builder, input_b, segments_b, node.Name() + "_reshape_b_flatten");
+    } else {
+      // Static path: compute shapes at compile time.
+      if (new_a_shape.empty()) {
+        std::transform(input_a_shape.begin(), input_a_shape.end(), std::back_inserter(new_a_shape),
+                       [](int64_t i) { return static_cast<uint32_t>(i); });
+      }
+      if (new_b_shape.empty()) {
+        std::transform(input_b_shape.begin(), input_b_shape.end(), std::back_inserter(new_b_shape),
+                       [](int64_t i) { return static_cast<uint32_t>(i); });
+      }
+      std::vector<uint32_t> new_new_a_shape, new_new_b_shape;
+      uint32_t a_dim = 1, b_dim = 1;
+      for (auto idx : a_1) {
+        new_new_a_shape.push_back(new_a_shape[idx]);
+      }
+      for (auto idx : a_2) {
+        new_new_a_shape.push_back(new_a_shape[idx]);
+      }
+      for (auto idx : a_3) {
+        a_dim *= new_a_shape[idx];
+      }
+      new_new_a_shape.push_back(a_dim);
+      for (auto idx : b_1) {
+        new_new_b_shape.push_back(new_b_shape[idx]);
+      }
+      for (auto idx : b_2) {
+        b_dim *= new_b_shape[idx];
+      }
+      new_new_b_shape.push_back(b_dim);
+      for (auto idx : b_3) {
+        new_new_b_shape.push_back(new_b_shape[idx]);
+      }
+
+      emscripten::val options = emscripten::val::object();
+      options.set("label", node.Name() + "_reshape");
+      input_a = wnn_builder.call<emscripten::val>("reshape",
+                                                   input_a,
+                                                   emscripten::val::array(new_new_a_shape),
+                                                   options);
+      input_b = wnn_builder.call<emscripten::val>("reshape",
+                                                   input_b,
+                                                   emscripten::val::array(new_new_b_shape),
+                                                   options);
+    }
   }
 
   // Step 2. Matmul
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name() + "_matmul");
-  output = model_builder.GetBuilder().call<emscripten::val>("matmul", input_a, input_b, options);
+  output = wnn_builder.call<emscripten::val>("matmul", input_a, input_b, options);
   std::vector<uint32_t> output_indices = a_1;
   output_indices.push_back(a_2.back());
   output_indices.push_back(b_3.back());
@@ -442,7 +506,7 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
     emscripten::val options = emscripten::val::object();
     options.set("permutation", emscripten::val::array(p));
     options.set("label", node.Name() + "_transpose");
-    output = model_builder.GetBuilder().call<emscripten::val>("transpose", output, options);
+    output = wnn_builder.call<emscripten::val>("transpose", output, options);
   }
 
   // Step 4. Output ReduceSum
@@ -454,7 +518,7 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
     emscripten::val options_reduce = emscripten::val::object();
     options_reduce.set("axes", emscripten::val::array(axes_data));
     options_reduce.set("label", node.Name() + "_reduceSum");
-    output = model_builder.GetBuilder().call<emscripten::val>("reduceSum", output, options_reduce);
+    output = wnn_builder.call<emscripten::val>("reduceSum", output, options_reduce);
   }
   return Status::OK();
 }
@@ -501,6 +565,95 @@ RecognizedOperatorType DetermineRecognizedOperatorType(const std::vector<uint32_
   }
 
   return RecognizedOperatorType::Pairwise;
+}
+
+// Returns true if the pairwise Einsum decomposition requires reshape operations
+// (i.e., a_3.size() > 1 for flattening summation dims, or extra dims need to be added).
+// When this returns true and inputs have dynamic shapes, IsDynamicShapeSupported() must be checked.
+static bool PairwiseNeedsReshape(const std::vector<uint32_t>& label_indices,
+                                 const std::vector<Component>& components,
+                                 uint32_t num_labels) {
+  auto input_a_labels = components[0].GetLabels(label_indices);
+  auto input_b_labels = components[1].GetLabels(label_indices);
+
+  std::map<uint32_t, int32_t> input_a_axes_map, input_b_axes_map, output_axes_map;
+  auto output_labels = components[2].GetLabels(label_indices);
+
+  for (uint32_t i = 0; i <= num_labels + 1; ++i) {
+    input_a_axes_map[i] = input_b_axes_map[i] = output_axes_map[i] = -1;
+  }
+  int32_t index = 0;
+  for (auto axis : input_a_labels) {
+    input_a_axes_map[axis] = index++;
+  }
+  index = 0;
+  for (auto axis : input_b_labels) {
+    input_b_axes_map[axis] = index++;
+  }
+  index = 0;
+  for (auto axis : output_labels) {
+    output_axes_map[axis] = index++;
+  }
+
+  std::vector<uint32_t> a_0, a_1, a_2, a_3, b_0, b_1, b_3;
+  bool a_flag = false;
+  bool b_flag = false;
+
+  for (uint32_t i = 0; i < num_labels; ++i) {
+    if (input_a_axes_map[i] != -1) {
+      if (input_b_axes_map[i] != -1) {
+        if (output_axes_map[i] != -1) {
+          a_1.push_back(i);
+          b_1.push_back(i);
+        } else {
+          a_3.push_back(i);
+        }
+      } else {
+        if (a_flag) {
+          a_1.push_back(i);
+          b_1.push_back(i);
+        } else {
+          a_2.push_back(i);
+          a_flag = true;
+        }
+      }
+    } else {
+      if (input_b_axes_map[i] != -1) {
+        if (b_flag) {
+          a_1.push_back(i);
+          b_1.push_back(i);
+        } else {
+          b_3.push_back(i);
+          b_flag = true;
+        }
+      }
+    }
+  }
+
+  if (!a_flag) {
+    a_2.push_back(num_labels + 1);
+  }
+  if (!b_flag) {
+    b_3.push_back(num_labels + 2);
+  }
+  if (a_3.empty()) {
+    a_3.push_back(num_labels);
+  }
+
+  a_0 = a_1;
+  a_0.insert(a_0.end(), a_2.begin(), a_2.end());
+  a_0.insert(a_0.end(), a_3.begin(), a_3.end());
+
+  b_0 = b_1;
+  b_0.insert(b_0.end(), a_3.begin(), a_3.end());  // b_2 has same labels as a_3
+  b_0.insert(b_0.end(), b_3.begin(), b_3.end());
+
+  // Reshape is needed if:
+  // 1. a_3.size() > 1: multiple summation dims need flattening
+  // 2. Input needs extra dims appended (unsqueeze)
+  return a_3.size() > 1 ||
+         input_a_labels.size() < a_0.size() ||
+         input_b_labels.size() < b_0.size();
 }
 
 // Add operator related.
@@ -692,7 +845,7 @@ Status EinsumOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
 bool EinsumOpBuilder::IsOpSupportedImpl(const GraphViewer&,
                                         const Node& node,
-                                        const WebnnDeviceType device_type,
+                                        const WebnnDeviceType /* device_type */,
                                         const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
 
@@ -764,6 +917,21 @@ bool EinsumOpBuilder::HasSupportedInputsImpl(const GraphViewer&, const Node& nod
 
   RecognizedOperatorType recognized_operator_type = DetermineRecognizedOperatorType(label_indices, components,
                                                                                     output_dimensions);
+
+  // Check dynamic shape support based on the recognized pattern.
+  bool has_dynamic = HasDynamicShape(input0_shape) || (has_input1 && HasDynamicShape(input1_shape));
+  if (has_dynamic) {
+    if (recognized_operator_type == RecognizedOperatorType::Diagonal) {
+      LOGS(logger, VERBOSE) << "Einsum diagonal does not support dynamic shapes";
+      return false;
+    }
+    if (recognized_operator_type == RecognizedOperatorType::Pairwise &&
+        PairwiseNeedsReshape(label_indices, components, num_labels) &&
+        !IsDynamicShapeSupported(wnn_limits)) {
+      LOGS(logger, VERBOSE) << "Einsum pairwise with reshape requires dynamic shape support (shape + dynamicReshape)";
+      return false;
+    }
+  }
 
   std::string_view decomposed_op_type;
   if (recognized_operator_type == RecognizedOperatorType::None) {
