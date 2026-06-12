@@ -137,6 +137,12 @@ const setExecutionProviders = async (
               appendEpOption(epOptions, 'FreeDimensionBounds', serializedBounds, allocs);
             }
           }
+          // enableCausalLM: selects between concat-based (stateful) vs ScatterND-based (stateless)
+          // KV-cache strategy in the GroupQueryAttention op builder.
+          const enableCausalLM = (webnnOptions as InferenceSession.WebNNContextOptions)?.enableCausalLM;
+          if (enableCausalLM) {
+            appendEpOption(epOptions, 'enableCausalLM', 'true', allocs);
+          }
         }
         break;
       case 'webgpu':

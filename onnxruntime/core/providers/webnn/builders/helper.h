@@ -81,6 +81,8 @@ inline bool HasDynamicShape(const std::vector<int64_t>& shape) {
 }
 
 // Check if the WebNN context supports dynamic shape operations (shape + dynamicReshape).
+// Returns true if both ops are listed in opSupportLimits, meaning the browser can handle
+// nodes with dynamic (symbolic) dimensions.
 inline bool IsDynamicShapeSupported(const emscripten::val& wnn_limits) {
   return !wnn_limits["shape"].isUndefined() && !wnn_limits["dynamicReshape"].isUndefined();
 }
