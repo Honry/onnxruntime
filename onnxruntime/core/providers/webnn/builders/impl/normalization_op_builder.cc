@@ -96,33 +96,9 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
       ORT_RETURN_IF_NOT(GetType(*input_defs[0], input_type, logger), "Cannot get input type");
       emscripten::val common_options = emscripten::val::object();
 
-      if (input_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
-        // Decomposed *SimplifiedLayerNormalization may lose precision if its data type is float16.
-        // So cast all inputs to float32 to ensure precision.
-        common_options.set("label", node.Name() + "_cast_input_to_fp32");
-        input = model_builder.GetBuilder().call<emscripten::val>("cast", input,
-                                                                 emscripten::val("float32"), common_options);
-
-        common_options.set("label", node.Name() + "_cast_scale_to_fp32");
-        scale = model_builder.GetBuilder().call<emscripten::val>("cast", scale,
-                                                                 emscripten::val("float32"), common_options);
-
-        if (!bias.isUndefined()) {
-          common_options.set("label", node.Name() + "_cast_bias_to_fp32");
-          bias = model_builder.GetBuilder().call<emscripten::val>("cast", bias,
-                                                                  emscripten::val("float32"), common_options);
-        }
-      }
-
       // If it is SkipSimplifiedLayerNormalization, add the skip and bias (if it exists) to the input.
       if (op_type == "SkipSimplifiedLayerNormalization") {
         emscripten::val skip = model_builder.GetOperand(input_defs[1]->Name());
-        if (input_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
-          // Cast skip to float32
-          common_options.set("label", node.Name() + "_cast_skip_to_fp32");
-          skip = model_builder.GetBuilder().call<emscripten::val>("cast", skip,
-                                                                  emscripten::val("float32"), common_options);
-        }
         common_options.set("label", node.Name() + "_add_skip");
         input = model_builder.GetBuilder().call<emscripten::val>("add", input, skip, common_options);
         if (!bias.isUndefined()) {
@@ -134,20 +110,12 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
         // Now input equals to input_skip_bias_sum.
         if (TensorExists(output_defs, 3)) {
           emscripten::val input_skip_bias_sum = input;
-          if (input_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
-            // Cast input_skip_bias_sum back to float16.
-            common_options.set("label", node.Name() + "_cast_input_skip_bias_sum_to_fp16");
-            input_skip_bias_sum = model_builder.GetBuilder().call<emscripten::val>("cast", input_skip_bias_sum,
-                                                                                   emscripten::val("float16"),
-                                                                                   common_options);
-          }
           model_builder.AddOperand(output_defs[3]->Name(), input_skip_bias_sum);
         }
       }
 
       // Pow
-      emscripten::val pow_constant =
-          model_builder.CreateOrGetConstant<float>(ONNX_NAMESPACE::TensorProto_DataType_FLOAT, 2);
+      emscripten::val pow_constant = model_builder.CreateOrGetConstant<float>(input_type, 2);
       common_options.set("label", node.Name() + "_pow");
       emscripten::val pow =
           model_builder.GetBuilder().call<emscripten::val>("pow", input, pow_constant, common_options);
@@ -160,8 +128,7 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
       emscripten::val reduce_mean = model_builder.GetBuilder().call<emscripten::val>("reduceMean", pow, reduce_options);
 
       // Add
-      emscripten::val add_constant =
-          model_builder.CreateOrGetConstant<float>(ONNX_NAMESPACE::TensorProto_DataType_FLOAT, epsilon);
+      emscripten::val add_constant = model_builder.CreateOrGetConstant<float>(input_type, epsilon);
       common_options.set("label", node.Name() + "_add");
       emscripten::val add =
           model_builder.GetBuilder().call<emscripten::val>("add", reduce_mean, add_constant, common_options);
@@ -183,55 +150,84 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
         common_options.set("label", node.Name() + "_add_bias");
         output = model_builder.GetBuilder().call<emscripten::val>("add", output, bias, common_options);
       }
-
-      if (input_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT16) {
-        // Cast output back to float16.
-        common_options.set("label", node.Name() + "_cast_output_to_fp16");
-        output = model_builder.GetBuilder().call<emscripten::val>("cast", output,
-                                                                  emscripten::val("float16"), common_options);
-      }
     }
   } else if (op_type == "InstanceNormalization") {
     // WebNN spec only supports 4D input for instanceNormalization.
-    // Supports 3D input by prepending 1 size dimension.
-    // For models with dimensions greater than 4, they will be reshaped into 4D.
+    // Supports 3D input by appending a size-1 dimension.
+    // For models with dimensions greater than 4, the trailing dims are folded into one.
     constexpr size_t webnn_shape_rank = 4;
     if (input_shape.size() != webnn_shape_rank) {
-      std::vector<uint32_t> new_shape;
-      new_shape.reserve(std::max(input_shape.size(), webnn_shape_rank));
-      std::transform(input_shape.begin(), input_shape.end(),
-                     std::back_inserter(new_shape),
-                     [](int64_t dim) -> uint32_t { return SafeInt<uint32_t>(dim); });
+      // Build the 4D reshape target as a JS array. For dynamic dims (input_shape[i] == kDynamicDim)
+      // we copy the original dim descriptor object from the input operand's shape; for
+      // static dims we push the concrete unsigned value. This preserves the native dim
+      // descriptors required by WebNN for downstream ops like conv2d.
+      emscripten::val input_operand_shape = input["shape"];
+      emscripten::val new_shape = emscripten::val::array();
 
-      ptrdiff_t excess_rank = new_shape.size() - webnn_shape_rank;
-      auto insertion_point = new_shape.begin() + 3;
+      auto push_input_dim = [&](size_t i) {
+        if (input_shape[i] > 0) {
+          uint32_t dim_value = SafeInt<uint32_t>(input_shape[i]);
+          new_shape.call<void>("push", dim_value);
+        } else {
+          // Dynamic dim: copy the native descriptor from the input operand.
+          new_shape.call<void>("push", input_operand_shape[static_cast<uint32_t>(i)]);
+        }
+      };
+
       if (input_shape.size() < webnn_shape_rank) {
-        // Pad the shape with extra 1's to satisfy WebNN v1's rank requirements.
-        new_shape.insert(insertion_point, -excess_rank, 1);
+        // Copy original dims, then pad with 1's at the tail to reach 4D.
+        for (size_t i = 0; i < input_shape.size(); ++i) {
+          push_input_dim(i);
+        }
+        for (size_t i = input_shape.size(); i < webnn_shape_rank; ++i) {
+          new_shape.call<void>("push", 1u);
+        }
       } else {
-        // Fold the extra range to fit within WebNN v1's rank requirements.
-        uint32_t sum = std::accumulate(
-            insertion_point, insertion_point + excess_rank + 1, 1, std::multiplies<uint32_t>());
-        new_shape.erase(insertion_point, insertion_point + excess_rank);
-        *insertion_point = sum;
+        // 5D+: copy first 3 dims, then fold dims [3..end] into a single dim.
+        // Folding requires concrete (static) values for the folded range.
+        for (size_t i = 0; i < 3; ++i) {
+          push_input_dim(i);
+        }
+        uint32_t folded = 1;
+        for (size_t i = 3; i < input_shape.size(); ++i) {
+          ORT_RETURN_IF(input_shape[i] == kDynamicDim,
+                        "InstanceNormalization with dynamic dim at index ", i,
+                        " cannot be folded into 4D for WebNN.");
+          folded *= SafeInt<uint32_t>(input_shape[i]);
+        }
+        new_shape.call<void>("push", folded);
       }
       emscripten::val reshape_input_options = emscripten::val::object();
       reshape_input_options.set("label", node.Name() + "_reshape_input");
       input = model_builder.GetBuilder().call<emscripten::val>("reshape",
                                                                input,
-                                                               emscripten::val::array(new_shape),
+                                                               new_shape,
                                                                reshape_input_options);
     }
 
     output = model_builder.GetBuilder().call<emscripten::val>("instanceNormalization", input, options);
-    // Reshape back to the original output shape for 3D input.
-    if (input_shape.size() != 4) {
-      std::vector<uint32_t> output_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
+    // Reshape back to the original input shape for non-4D cases. Use the original input
+    // operand's shape descriptors so that dynamic dims preserve their native descriptors
+    // and downstream consumers (Mul, Add, Conv2d) see the correct static channel dim.
+    if (input_shape.size() != webnn_shape_rank) {
+      const NodeArg* original_input_def = input_defs[0];
+      // Re-fetch the original input operand (input variable was reassigned above).
+      const emscripten::val& original_input = model_builder.GetOperand(original_input_def->Name());
+      emscripten::val original_shape = original_input["shape"];
+      emscripten::val output_shape = emscripten::val::array();
+      for (size_t i = 0; i < input_shape.size(); ++i) {
+        if (input_shape[i] > 0) {
+          uint32_t dim_value = SafeInt<uint32_t>(input_shape[i]);
+          output_shape.call<void>("push", dim_value);
+        } else {
+          output_shape.call<void>("push", original_shape[static_cast<uint32_t>(i)]);
+        }
+      }
       emscripten::val reshape_output_options = emscripten::val::object();
-      reshape_output_options.set("label", node.Name() + "reshape_output");
+      reshape_output_options.set("label", node.Name() + "_reshape_output");
       output = model_builder.GetBuilder().call<emscripten::val>("reshape",
                                                                 output,
-                                                                emscripten::val::array(output_shape),
+                                                                output_shape,
                                                                 reshape_output_options);
     }
   } else {
@@ -278,6 +274,21 @@ bool NormalizationOpBuilder::IsOpSupportedImpl(const GraphViewer&,
   if (op_type == "BatchNormalization" && helper.Get("training_mode", 0)) {
     LOGS(logger, VERBOSE) << "BatchNormalization with training_mode set to true is not supported.";
     return false;
+  }
+
+  // InstanceNormalization with rank > 4 needs to fold trailing dims into one.
+  // That folding requires concrete (static) values for those trailing dims.
+  if (op_type == "InstanceNormalization") {
+    std::vector<int64_t> input_shape;
+    if (GetShape(*input_defs[0], input_shape, logger) && input_shape.size() > 4) {
+      for (size_t i = 3; i < input_shape.size(); ++i) {
+        if (input_shape[i] == kDynamicDim) {
+          LOGS(logger, VERBOSE) << "InstanceNormalization with dynamic dim at index " << i
+                                << " (rank > 4) is not supported";
+          return false;
+        }
+      }
+    }
   }
 
   return true;
