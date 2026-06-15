@@ -59,6 +59,7 @@ void CreateRotaryEmbeddingOpBuilder(const std::string& op_type, OpBuilderRegistr
 void CreateScatterElementsOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateScatterNDOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateShapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateSizeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateSliceOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateSoftmaxOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateSplitOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);

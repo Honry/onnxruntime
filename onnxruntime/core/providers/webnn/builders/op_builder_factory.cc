@@ -244,6 +244,10 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateShapeOpBuilder("Shape", op_registrations);
   }
 
+  {  // Size
+    CreateSizeOpBuilder("Size", op_registrations);
+  }
+
   {  // Slice
     CreateSliceOpBuilder("Slice", op_registrations);
   }
