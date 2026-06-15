@@ -106,6 +106,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | ScatterElements | ai.onnx(11-12, 13-15, 16-17, 18+) | scatterElements | Only supports 'reduction' == 'none' |
 | ScatterND | ai.onnx(11-12, 13-15, 16-17, 18+) | scatterND | Only supports 'reduction' == 'none' |
 | Shape | ai.onnx(7-12, 13-14, 15-18, 19-20, 21+) | shape, slice | |
+| Size | ai.onnx(7-12, 13-18, 19-20, 21+) | shape, reduceProduct | |
 | SimplifiedLayerNormalization | ai.onnx(1+) | pow, reduceMean, add, sqrt, div, mul | |
 | Sigmoid | ai.onnx(7-12, 13+) | sigmoid | |
 | Sign | ai.onnx(9-12, 13+) | sign | |

@@ -2369,8 +2369,8 @@
       "test_sin",
       // "test_sinh_example",
       // "test_sinh",
-      // // "test_size_example",
-      // // "test_size",
+      "test_size_example",
+      "test_size",
       // tests "test_slice_*" on opset > 9 are excluded because starts, ends, axes and steps are non-constant inputs.
       "opset{7,8,9}/test_slice_default_axes",
       // "test_slice_default_steps",
