@@ -40,6 +40,7 @@ common::Status SetConvBaseOptions(ModelBuilder& model_builder,
                                   const std::vector<int64_t>& dilations,
                                   std::vector<int64_t>& pads,
                                   const bool is_conv1d,
+                                  const bool needs_dynamic_padding,
                                   const logging::Logger& logger) {
   NodeAttrHelper helper(node);
   const auto& input_defs = node.InputDefs();
@@ -52,16 +53,12 @@ common::Status SetConvBaseOptions(ModelBuilder& model_builder,
   if (op_type == "Conv" || op_type == "ConvInteger") {
     // Calculate explicit padding for autoPad.
     if (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type) {
-      if (has_dynamic_spatial) {
-        // When spatial dims are dynamic, use WebNN's native autoPad instead of computing explicit pads.
-        options.set("autoPad", emscripten::val(auto_pad_type == AutoPadType::SAME_UPPER
-                                                   ? "same-upper"
-                                                   : "same-lower"));
-      } else {
+      if (!has_dynamic_spatial) {
         ORT_RETURN_IF_ERROR(HandleAutoPad(input_shape, weight_shape[2], weight_shape[3],
                                           pads, strides, dilations, auto_pad_type, pads_out));
         pads = pads_out;
       }
+      // Dynamic case: padding was already applied to input via ComputeDynamicSamePadding.
     }
   } else if (op_type == "ConvTranspose") {
     std::vector<int64_t> output_shape = helper.Get("output_shape", std::vector<int64_t>{-1, -1});
@@ -77,15 +74,7 @@ common::Status SetConvBaseOptions(ModelBuilder& model_builder,
     }
     options.set("outputPadding", emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(output_padding)));
 
-    if (has_dynamic_spatial) {
-      // When spatial dims are dynamic, WebNN doesn't support outputSizes.
-      // Use explicit pads directly and let WebNN infer the output shape.
-      if (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type) {
-        options.set("autoPad", emscripten::val(auto_pad_type == AutoPadType::SAME_UPPER
-                                                   ? "same-upper"
-                                                   : "same-lower"));
-      }
-    } else {
+    if (!has_dynamic_spatial) {
       // If output shape is explicitly provided, compute the pads.
       // Otherwise compute the output shape, as well as the pads if the auto_pad attribute is SAME_UPPER/SAME_LOWER.
       ORT_RETURN_IF_ERROR(ComputeConvTransposePadsAndOutputShape(input_shape, weight_shape[2], weight_shape[3],
@@ -97,6 +86,7 @@ common::Status SetConvBaseOptions(ModelBuilder& model_builder,
       }
       pads = pads_out;
     }
+    // Dynamic case: padding was already applied to input via ComputeDynamicSamePadding.
   } else {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
                            "conv_op_builder only supports Op Conv, ConvInteger and ConvTranspose.");
@@ -109,8 +99,10 @@ common::Status SetConvBaseOptions(ModelBuilder& model_builder,
 
   // Permute the ONNX's pads, which is [beginning_height, beginning_width, ending_height, ending_width],
   // while WebNN's padding is [beginning_height, ending_height, beginning_width, ending_width].
-  const std::vector<int64_t> padding{pads[0], pads[2], pads[1], pads[3]};
-  options.set("padding", emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(padding)));
+  if (!needs_dynamic_padding) {
+    const std::vector<int64_t> padding{pads[0], pads[2], pads[1], pads[3]};
+    options.set("padding", emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(padding)));
+  }
 
   // Add bias if present.
   if (input_defs.size() > 2 && op_type != "ConvInteger") {
@@ -158,6 +150,7 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
       new_shape.call<void>("push", 1u);
       common_options.set("label", node.Name() + "_reshape_input");
       input = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, common_options);
+      input_shape.push_back(1);  // Track the 4D shape for downstream padding computation.
     } else {
       input_shape.push_back(1);
       std::vector<uint32_t> new_input_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
@@ -185,10 +178,22 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
                                                               common_options);
   }
 
+  // For dynamic spatial dims with SAME_UPPER/SAME_LOWER, compute padding dynamically and
+  // apply a pad op before conv2d (WebNN conv2d/convTranspose2d don't have autoPad).
+  AutoPadType auto_pad_type = StringToAutoPadType(helper.Get("auto_pad", "NOTSET"));
+  const bool needs_dynamic_padding = has_dynamic_spatial &&
+      (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type);
+  if (needs_dynamic_padding) {
+    input = ComputeDynamicSamePadding(model_builder, input, input_shape,
+                                     weight_shape[2], weight_shape[3],
+                                     strides, auto_pad_type, node.Name());
+  }
+
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
   ORT_RETURN_IF_ERROR(SetConvBaseOptions(
-      model_builder, node, options, input_shape, weight_shape, strides, dilations, pads, is_conv1d, logger));
+      model_builder, node, options, input_shape, weight_shape, strides, dilations, pads, is_conv1d,
+      needs_dynamic_padding, logger));
 
   if (op_type == "Conv") {
     output = model_builder.GetBuilder().call<emscripten::val>("conv2d", input, filter, options);

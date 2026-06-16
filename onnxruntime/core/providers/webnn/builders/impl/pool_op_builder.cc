@@ -71,20 +71,21 @@ Status PoolOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   options.set("dilations", emscripten::val::array(dilations));
 
   // Add Padding.
-  // Usually using auto padding is more efficient than using explicit padding.
-  // Try to see if we can map explicit padding to auto padding.
   const auto onnx_strides = helper.Get("strides", std::vector<int64_t>{1, 1});
   const auto onnx_pads = helper.Get("pads", std::vector<int64_t>{0, 0, 0, 0});
   auto pads = helper.Get("pads", std::vector<uint32_t>{0, 0, 0, 0});
   std::vector<int64_t> input_shape;
   ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get shape");
   AutoPadType auto_pad_type = StringToAutoPadType(helper.Get("auto_pad", "NOTSET"));
+  bool needs_dynamic_padding = false;
   if (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type) {
     if (HasDynamicShape(input_shape)) {
-      // When spatial dims are dynamic, use WebNN's native autoPad instead of computing explicit pads.
-      options.set("autoPad", emscripten::val(auto_pad_type == AutoPadType::SAME_UPPER
-                                                 ? "same-upper"
-                                                 : "same-lower"));
+      // WebNN pool2d doesn't have autoPad. Compute padding dynamically and apply pad op.
+      input = ComputeDynamicSamePadding(
+          model_builder, input, input_shape,
+          onnx_kernel_shape[0], onnx_kernel_shape[1],
+          onnx_strides, auto_pad_type, node.Name());
+      needs_dynamic_padding = true;
     } else {
       std::vector<int64_t> pads_out;
       ORT_RETURN_IF_ERROR(HandleAutoPad(input_shape, onnx_kernel_shape[0], onnx_kernel_shape[1],
@@ -98,8 +99,10 @@ Status PoolOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   }
   // Permute the ONNX's pads, which is [beginning_height, beginning_width, ending_height, ending_width],
   // while WebNN's padding is [beginning_height, ending_height, beginning_width, ending_width].
-  const std::vector<uint32_t> padding{pads[0], pads[2], pads[1], pads[3]};
-  options.set("padding", emscripten::val::array(padding));
+  if (!needs_dynamic_padding) {
+    const std::vector<uint32_t> padding{pads[0], pads[2], pads[1], pads[3]};
+    options.set("padding", emscripten::val::array(padding));
+  }
 
   const auto ceil_mode = helper.Get("ceil_mode", 0);
   emscripten::val output_shape_rounding = ceil_mode == 0 ? emscripten::val("floor") : emscripten::val("ceil");

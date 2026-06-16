@@ -90,6 +90,7 @@ inline emscripten::val DynamicReshapeWithSegments(ModelBuilder& model_builder,
   return wnn_builder.call<emscripten::val>("dynamicReshape", input, target_shape, options);
 }
 
+
 }  // namespace shape_utils
 }  // namespace webnn
 }  // namespace onnxruntime

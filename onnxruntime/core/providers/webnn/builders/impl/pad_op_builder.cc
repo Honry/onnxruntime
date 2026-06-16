@@ -230,7 +230,21 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
           "where", mask_const, pads_expanded, zeros_const, opts);
     }
 
-    output = builder.call<emscripten::val>("dynamicPad", input, pads_op, options);
+    // Split ONNX pads [begin0..beginR, end0..endR] into two operands for dynamicPad.
+    emscripten::val slice_opts = emscripten::val::object();
+    slice_opts.set("label", label + "_pads_begin_slice");
+    emscripten::val beginning_pads = builder.call<emscripten::val>(
+        "slice", pads_op,
+        emscripten::val::array(std::vector<uint32_t>{0}),
+        emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
+        slice_opts);
+    slice_opts.set("label", label + "_pads_end_slice");
+    emscripten::val ending_pads = builder.call<emscripten::val>(
+        "slice", pads_op,
+        emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
+        emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
+        slice_opts);
+    output = builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -311,13 +325,13 @@ bool PadOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, const
     return false;
   }
 
-  // Check pads operand type against dynamicPad's "pads" parameter.
+  // Check pads operand type against dynamicPad's "beginningPadding" parameter.
   int32_t pads_type;
   if (!GetType(*input_defs[1], pads_type, logger)) {
     return false;
   }
   if (!IsDataTypeSupportedByWebNNOp("Pad", webnn_op_type, pads_type, wnn_limits,
-                                    "pads", "pads", logger)) {
+                                    "beginningPadding", "pads", logger)) {
     return false;
   }
 

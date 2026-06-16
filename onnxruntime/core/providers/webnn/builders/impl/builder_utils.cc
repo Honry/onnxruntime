@@ -7,6 +7,8 @@
 
 #include "builder_utils.h"
 #include "core/providers/webnn/builders/helper.h"
+#include "core/providers/webnn/builders/model_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -146,6 +148,109 @@ common::Status ComputeConvTransposePadsAndOutputShape(const std::vector<int64_t>
   pads_out = {padding_top, padding_left, padding_bottom, padding_right};
 
   return Status::OK();
+}
+
+emscripten::val ComputeDynamicSamePadding(ModelBuilder& model_builder,
+                                          const emscripten::val& input,
+                                          const std::vector<int64_t>& input_shape,
+                                          int64_t kernel_h, int64_t kernel_w,
+                                          const std::vector<int64_t>& strides,
+                                          AutoPadType auto_pad_type,
+                                          const std::string& node_name) {
+  const auto& builder = model_builder.GetBuilder();
+  const size_t rank = input_shape.size();
+  const size_t h_idx = 2;
+  const size_t w_idx = 3;
+
+  constexpr int32_t INT32 = ONNX_NAMESPACE::TensorProto_DataType_INT32;
+  const auto scalar_shape = std::vector<uint32_t>{1};
+
+  auto compute_pad_for_dim = [&](size_t dim_idx, int64_t kernel_size, int64_t stride) {
+    emscripten::val shape_op = builder.call<emscripten::val>("shape", input);
+    emscripten::val dim_val = shape_utils::SliceShapeRange(builder, shape_op, static_cast<int32_t>(dim_idx), 1);
+
+    emscripten::val cast_opts = emscripten::val::object();
+    cast_opts.set("label", node_name + "_cast_dim" + std::to_string(dim_idx));
+    dim_val = builder.call<emscripten::val>("cast", dim_val, emscripten::val("int32"), cast_opts);
+
+    emscripten::val stride_const = model_builder.CreateOrGetConstant<int32_t>(INT32, static_cast<int32_t>(stride), scalar_shape);
+    emscripten::val kernel_const = model_builder.CreateOrGetConstant<int32_t>(INT32, static_cast<int32_t>(kernel_size), scalar_shape);
+    emscripten::val one_const = model_builder.CreateOrGetConstant<int32_t>(INT32, 1, scalar_shape);
+    emscripten::val two_const = model_builder.CreateOrGetConstant<int32_t>(INT32, 2, scalar_shape);
+    emscripten::val zero_const = model_builder.CreateOrGetConstant<int32_t>(INT32, 0, scalar_shape);
+
+    emscripten::val opts = emscripten::val::object();
+    const std::string dim_suffix = "_dim" + std::to_string(dim_idx);
+
+    // output_size = (input_size + stride - 1) / stride
+    opts.set("label", node_name + "_add_stride" + dim_suffix);
+    emscripten::val numerator = builder.call<emscripten::val>("add", dim_val, stride_const, opts);
+    opts.set("label", node_name + "_sub_one" + dim_suffix);
+    numerator = builder.call<emscripten::val>("sub", numerator, one_const, opts);
+    opts.set("label", node_name + "_div_stride" + dim_suffix);
+    emscripten::val output_size = builder.call<emscripten::val>("div", numerator, stride_const, opts);
+
+    // pad_needed = (output_size - 1) * stride + kernel - input_size
+    opts.set("label", node_name + "_out_sub_one" + dim_suffix);
+    emscripten::val pad_needed = builder.call<emscripten::val>("sub", output_size, one_const, opts);
+    opts.set("label", node_name + "_mul_stride" + dim_suffix);
+    pad_needed = builder.call<emscripten::val>("mul", pad_needed, stride_const, opts);
+    opts.set("label", node_name + "_add_kernel" + dim_suffix);
+    pad_needed = builder.call<emscripten::val>("add", pad_needed, kernel_const, opts);
+    opts.set("label", node_name + "_sub_input" + dim_suffix);
+    pad_needed = builder.call<emscripten::val>("sub", pad_needed, dim_val, opts);
+
+    // pad_needed = max(0, pad_needed)
+    opts.set("label", node_name + "_max_zero" + dim_suffix);
+    pad_needed = builder.call<emscripten::val>("max", pad_needed, zero_const, opts);
+
+    emscripten::val pad_begin, pad_end;
+    if (auto_pad_type == AutoPadType::SAME_UPPER) {
+      opts.set("label", node_name + "_pad_begin" + dim_suffix);
+      pad_begin = builder.call<emscripten::val>("div", pad_needed, two_const, opts);
+    } else {
+      opts.set("label", node_name + "_pad_add_one" + dim_suffix);
+      emscripten::val pad_plus_one = builder.call<emscripten::val>("add", pad_needed, one_const, opts);
+      opts.set("label", node_name + "_pad_begin" + dim_suffix);
+      pad_begin = builder.call<emscripten::val>("div", pad_plus_one, two_const, opts);
+    }
+    opts.set("label", node_name + "_pad_end" + dim_suffix);
+    pad_end = builder.call<emscripten::val>("sub", pad_needed, pad_begin, opts);
+
+    return std::make_pair(pad_begin, pad_end);
+  };
+
+  auto [pad_begin_h, pad_end_h] = compute_pad_for_dim(h_idx, kernel_h, strides[0]);
+  auto [pad_begin_w, pad_end_w] = compute_pad_for_dim(w_idx, kernel_w, strides[1]);
+
+  // Build two separate pads operands for dynamicPad (follows WebNN pad() style):
+  // dynamicPad(input, beginningPadding, endingPadding, options)
+  emscripten::val zero_const = model_builder.CreateOrGetConstant<int32_t>(INT32, 0, scalar_shape);
+
+  emscripten::val begin_segments = emscripten::val::array();
+  emscripten::val end_segments = emscripten::val::array();
+  for (size_t i = 0; i < rank; ++i) {
+    if (i == h_idx) {
+      begin_segments.call<void>("push", pad_begin_h);
+      end_segments.call<void>("push", pad_end_h);
+    } else if (i == w_idx) {
+      begin_segments.call<void>("push", pad_begin_w);
+      end_segments.call<void>("push", pad_end_w);
+    } else {
+      begin_segments.call<void>("push", zero_const);
+      end_segments.call<void>("push", zero_const);
+    }
+  }
+
+  emscripten::val concat_options = emscripten::val::object();
+  concat_options.set("label", node_name + "_same_pad_begin_concat");
+  emscripten::val beginning_pads = builder.call<emscripten::val>("concat", begin_segments, 0, concat_options);
+  concat_options.set("label", node_name + "_same_pad_end_concat");
+  emscripten::val ending_pads = builder.call<emscripten::val>("concat", end_segments, 0, concat_options);
+
+  emscripten::val pad_options = emscripten::val::object();
+  pad_options.set("label", node_name + "_same_pad");
+  return builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, pad_options);
 }
 
 }  // namespace webnn

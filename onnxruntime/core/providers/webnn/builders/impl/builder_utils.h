@@ -8,9 +8,12 @@
 
 #include "core/common/status.h"
 #include "core/graph/basic_types.h"
+#include <emscripten/val.h>
 
 namespace onnxruntime {
 namespace webnn {
+
+class ModelBuilder;  // Forward declaration.
 
 // Try to see if we can map explicit padding to auto padding for Conv/Pool.
 // Since usually use auto padding is more efficient.
@@ -34,6 +37,17 @@ common::Status ComputeConvTransposePadsAndOutputShape(const std::vector<int64_t>
                                                       AutoPadType auto_pad_type,
                                                       std::vector<int64_t>& pads_out,
                                                       std::vector<int64_t>& output_shape_out) ORT_MUST_USE_RESULT;
+
+// Compute SAME_UPPER/SAME_LOWER padding dynamically using WebNN graph ops and apply dynamicPad.
+// Used when spatial dimensions are dynamic and explicit padding cannot be pre-computed.
+// Returns the padded input operand.
+emscripten::val ComputeDynamicSamePadding(ModelBuilder& model_builder,
+                                          const emscripten::val& input,
+                                          const std::vector<int64_t>& input_shape,
+                                          int64_t kernel_h, int64_t kernel_w,
+                                          const std::vector<int64_t>& strides,
+                                          AutoPadType auto_pad_type,
+                                          const std::string& node_name);
 
 }  // namespace webnn
 }  // namespace onnxruntime
