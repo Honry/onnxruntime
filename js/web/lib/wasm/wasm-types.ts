@@ -313,6 +313,15 @@ export declare namespace WebNN {
     ): MLOperand;
 
     /**
+     * [exported from pre-jsep.js] Load raw external data as a Uint8Array.
+     * @param externalFilePath - specify the relative external data file path.
+     * @param dataOffset - specify the byte offset in the file.
+     * @param dataLength - specify the byte length to read.
+     * @returns the raw data as a Uint8Array.
+     */
+    webnnLoadExternalData(externalFilePath: string, dataOffset: number, dataLength: number): Uint8Array;
+
+    /**
      * [exported from pre-jsep.js] Register a WebNN graph input.
      * @param inputName - specify the input name.
      */
