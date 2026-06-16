@@ -70,6 +70,14 @@ Module["webnnInit"] = (params) => {
       shouldConvertInt64ToInt32
     );
   };
+  Module["webnnLoadExternalData"] = (externalFilePath, dataOffset, dataLength) => {
+    return backend["loadExternalData"](
+      externalFilePath,
+      dataOffset,
+      dataLength,
+      Module.MountedFiles
+    );
+  };
   Module["webnnRegisterGraphInput"] =
     backend["registerGraphInput"].bind(backend);
   Module["webnnIsGraphInput"] = backend["isGraphInput"].bind(backend);

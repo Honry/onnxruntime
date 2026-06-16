@@ -386,6 +386,33 @@ export class WebNNBackend {
     return builder.constant(desc, bufferView);
   }
 
+  // Load raw external data as a Uint8Array without creating an MLOperand.
+  public loadExternalData(
+    externalFilePath: string,
+    dataOffset: number,
+    dataLength: number,
+    mountedFiles: Map<string, Uint8Array> | undefined,
+  ): Uint8Array {
+    if (!mountedFiles) {
+      throw new Error('External mounted files are not available.');
+    }
+
+    let filePath = externalFilePath;
+    if (externalFilePath.startsWith('./')) {
+      filePath = externalFilePath.substring(2);
+    }
+    const fileData = mountedFiles.get(filePath);
+    if (!fileData) {
+      throw new Error(`File with name ${filePath} not found in preloaded files.`);
+    }
+
+    if (dataOffset + dataLength > fileData.byteLength) {
+      throw new Error('Out of bounds: data offset and length exceed the external file data size.');
+    }
+
+    return fileData.slice(dataOffset, dataOffset + dataLength);
+  }
+
   public registerGraphInput(inputName: string): void {
     this.temporaryGraphInputs.push(inputName);
   }

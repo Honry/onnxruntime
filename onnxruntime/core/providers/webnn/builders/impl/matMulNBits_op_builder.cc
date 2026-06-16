@@ -2,6 +2,7 @@
 // Copyright (c) Intel Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include "core/framework/tensorprotoutils.h"
 #include "core/providers/shared/utils/utils.h"
 #include "core/providers/webnn/builders/helper.h"
 #include "core/providers/webnn/builders/model_builder.h"
@@ -33,7 +34,7 @@ class MatMulNBitsBuilder : public BaseOpBuilder {
 
 void MatMulNBitsBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
   // Inputs B and zero_points (if present) must be initializers.
-  // For 4-bit: they are uint8 (packed pairs) and need re-registration as uint4 WebNN constants.
+  // For 4-bit: they are uint8 (packed pairs) and need re-registration as int4 WebNN constants.
   // For 8-bit: B is uint8 and needs re-registration as uint8 WebNN constant with correct shape.
   //            zero_points (if present) also need re-registration.
   const auto& input_defs = node.InputDefs();
@@ -54,7 +55,7 @@ void MatMulNBitsBuilder::AddInitializersToSkip(ModelBuilder& model_builder, cons
 // DequantizeLinear + Transpose + MatMul.
 //
 // Supports both 4-bit and 8-bit quantization:
-// - 4-bit: B stored as uint8 (packed pairs), registered as 'uint4' with shape
+// - 4-bit: B stored as uint8 (packed pairs), registered as 'int4' with shape
 //          [N, n_blocks_per_col, blob_size * 2].
 // - 8-bit: B stored as uint8 (one element per byte), registered as 'uint8' with shape
 //          [N, n_blocks_per_col, block_size].
@@ -62,7 +63,7 @@ void MatMulNBitsBuilder::AddInitializersToSkip(ModelBuilder& model_builder, cons
 // Common transformations:
 // 1. scales: reshape to [N, n_blocks_per_col, 1].
 // 2. zero_points: same shape as reshaped scales. If present, must be a constant initializer.
-//                 Otherwise, created with default value (8 for uint4, 0 for uint8).
+//                 Otherwise, created with default value (0 for int4, 128 for uint8).
 Status MatMulNBitsBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                                  const Node& node,
                                                  const logging::Logger& logger) const {
@@ -91,35 +92,102 @@ Status MatMulNBitsBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   const bool has_zero_points = TensorExists(input_defs, 3);
 
   if (bits == 4) {
-    // 4-bit path: B is stored as uint8 (packed pairs), register as uint4 with doubled blob_size.
+    // 4-bit path: register as int4 (symmetric quantization, zp=0).
+    // ONNX MatMulNBits stores weights as uint8 (packed pairs of 4-bit values) with default zp=8.
+    // Dequantization: (uint4_val - 8) * scale. We reinterpret as int4 with zp=0:
+    // int4_val * scale (mathematically equivalent). The conversion XORs each packed byte with
+    // 0x88, which flips the sign bit (MSB) of both 4-bit nibbles, computing int4_val = uint4_val - 8.
+    // The XOR is applied in-place on the .slice() copy that WebNN constant creation already
+    // requires (for Wasm memory growth safety), so this adds zero extra memory allocation.
     const uint32_t double_blob_size = SafeInt<uint32_t>(B_shape[2] * 2);
     const std::vector<uint32_t> x_shape{N, n_blocks_per_col, double_blob_size};
     emscripten::val x_shape_array = emscripten::val::array(x_shape);
     emscripten::val x_desc = emscripten::val::object();
-    x_desc.set("dataType", emscripten::val("uint4"));
+    x_desc.set("dataType", emscripten::val("int4"));
     x_desc.set("shape", x_shape_array);
     x_desc.set("dimensions", x_shape_array);
-    const auto B_tensor = *initializers.at(input_defs[1]->Name());
-    ORT_RETURN_IF_ERROR(model_builder.RegisterConstant(B_tensor, dq_x, x_desc, logger));
 
-    // zero_points for 4-bit
+    // JS function to XOR each byte with 0x88 in-place (uint4 -> int4 sign bit flip).
+    emscripten::val xor_fn = emscripten::val::global("Function").new_(
+        emscripten::val("buf"),
+        emscripten::val("const u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);"
+                        "for (let i = 0; i < u8.length; i++) u8[i] ^= 0x88;"
+                        "return buf;"));
+
+    const auto B_tensor = *initializers.at(input_defs[1]->Name());
+    emscripten::val b_buffer = emscripten::val::undefined();
+    if (utils::HasExternalData(B_tensor) && !utils::HasExternalDataInMemory(B_tensor)) {
+      std::basic_string<ORTCHAR_T> external_file_path;
+      onnxruntime::FileOffsetType data_offset;
+      SafeInt<size_t> tensor_byte_size;
+      ORT_RETURN_IF_ERROR(utils::GetExternalDataInfo(
+          B_tensor, model_builder.GetGraphViewer().ModelPath(), external_file_path, data_offset, tensor_byte_size));
+      auto webnnLoadExternalData = emscripten::val::module_property("webnnLoadExternalData");
+      b_buffer = webnnLoadExternalData(emscripten::val(external_file_path),
+                                       static_cast<int32_t>(data_offset),
+                                       static_cast<int32_t>(tensor_byte_size));
+    } else {
+      std::byte* tensor_ptr = nullptr;
+      std::vector<uint8_t> unpacked_tensor;
+      if (B_tensor.has_raw_data()) {
+        tensor_ptr = reinterpret_cast<std::byte*>(const_cast<char*>(B_tensor.raw_data().c_str()));
+      } else {
+        ORT_RETURN_IF_NOT(UnpackInitializerData(B_tensor, unpacked_tensor,
+                                                model_builder.GetGraphViewer(), logger),
+                          "Failed to unpack B tensor");
+        tensor_ptr = reinterpret_cast<std::byte*>(unpacked_tensor.data());
+      }
+      const auto& b_dims = B_tensor.dims();
+      auto num_bytes = SafeInt<size_t>(Product(b_dims));
+      emscripten::val b_view = emscripten::val{
+          emscripten::typed_memory_view(num_bytes, reinterpret_cast<uint8_t*>(tensor_ptr))};
+      b_buffer = b_view.call<emscripten::val>("slice");
+    }
+    b_buffer = xor_fn(b_buffer);
+    dq_x = model_builder.GetBuilder().call<emscripten::val>("constant", x_desc, b_buffer["buffer"]);
+
     emscripten::val zero_points_desc = emscripten::val::object();
-    zero_points_desc.set("dataType", emscripten::val("uint4"));
+    zero_points_desc.set("dataType", emscripten::val("int4"));
     zero_points_desc.set("shape", x_scale_shape_array);
     zero_points_desc.set("dimensions", x_scale_shape_array);
     if (has_zero_points) {
-      const auto zero_points_tensor = *initializers.at(input_defs[3]->Name());
-      ORT_RETURN_IF_ERROR(model_builder.RegisterConstant(zero_points_tensor, x_zero_point, zero_points_desc, logger));
+      const auto zp_tensor = *initializers.at(input_defs[3]->Name());
+      emscripten::val zp_buffer = emscripten::val::undefined();
+      if (utils::HasExternalData(zp_tensor) && !utils::HasExternalDataInMemory(zp_tensor)) {
+        std::basic_string<ORTCHAR_T> external_file_path;
+        onnxruntime::FileOffsetType data_offset;
+        SafeInt<size_t> tensor_byte_size;
+        ORT_RETURN_IF_ERROR(utils::GetExternalDataInfo(
+            zp_tensor, model_builder.GetGraphViewer().ModelPath(), external_file_path, data_offset, tensor_byte_size));
+        auto webnnLoadExternalData = emscripten::val::module_property("webnnLoadExternalData");
+        zp_buffer = webnnLoadExternalData(emscripten::val(external_file_path),
+                                          static_cast<int32_t>(data_offset),
+                                          static_cast<int32_t>(tensor_byte_size));
+      } else {
+        std::byte* tensor_ptr = nullptr;
+        std::vector<uint8_t> unpacked_tensor;
+        if (zp_tensor.has_raw_data()) {
+          tensor_ptr = reinterpret_cast<std::byte*>(const_cast<char*>(zp_tensor.raw_data().c_str()));
+        } else {
+          ORT_RETURN_IF_NOT(UnpackInitializerData(zp_tensor, unpacked_tensor,
+                                                  model_builder.GetGraphViewer(), logger),
+                            "Failed to unpack zero_points tensor");
+          tensor_ptr = reinterpret_cast<std::byte*>(unpacked_tensor.data());
+        }
+        const auto& zp_dims = zp_tensor.dims();
+        auto num_bytes = SafeInt<size_t>(Product(zp_dims));
+        emscripten::val zp_view = emscripten::val{
+            emscripten::typed_memory_view(num_bytes, reinterpret_cast<uint8_t*>(tensor_ptr))};
+        zp_buffer = zp_view.call<emscripten::val>("slice");
+      }
+      zp_buffer = xor_fn(zp_buffer);
+      x_zero_point = model_builder.GetBuilder().call<emscripten::val>(
+          "constant", zero_points_desc, zp_buffer["buffer"]);
     } else {
-      // Default zero_point for uint4 is 8
-      const int8_t default_zero_point = 8;
       auto num_elements = (Product(x_scale_shape) + 1) / 2;
-      emscripten::val default_zero_point_buffer = emscripten::val::global("Uint8Array").new_(num_elements);
-      default_zero_point_buffer.call<void>("fill",
-                                           emscripten::val(PackInt8ToUint8DoubledNibbles(
-                                               default_zero_point, ONNX_NAMESPACE::TensorProto_DataType_UINT4)));
-      x_zero_point =
-          model_builder.GetBuilder().call<emscripten::val>("constant", zero_points_desc, default_zero_point_buffer);
+      emscripten::val zp_buffer = emscripten::val::global("Uint8Array").new_(num_elements);
+      x_zero_point = model_builder.GetBuilder().call<emscripten::val>(
+          "constant", zero_points_desc, zp_buffer);
     }
   } else {
     assert(bits == 8);
@@ -266,11 +334,11 @@ bool MatMulNBitsBuilder::HasSupportedInputsImpl(const GraphViewer&,
   }
 
   // Determine the WebNN data type based on the bits attribute.
-  // For 4-bit: data is packed uint4. For 8-bit: data is plain uint8.
+  // For 4-bit: int4 (symmetric quantization). For 8-bit: plain uint8.
   NodeAttrHelper attr_helper(node);
   const auto bits = attr_helper.Get("bits", 4);
   const int32_t dq_input_type = (bits == 8) ? ONNX_NAMESPACE::TensorProto_DataType_UINT8
-                                            : ONNX_NAMESPACE::TensorProto_DataType_UINT4;
+                                            : ONNX_NAMESPACE::TensorProto_DataType_INT4;
 
   // Ensure the quantized data type is supported by WebNN's dequantizeLinear op.
   // Also check that the zero_point type is supported (same type as quantized input).
