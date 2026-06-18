@@ -72,7 +72,7 @@ Status GruOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
     options.set("initialHiddenState", model_builder.GetOperand(input_defs[5]->Name()));
   }
 
-  bool linear_before_reset = !!helper.Get("linear_before_reset ", 0);
+  bool linear_before_reset = !!helper.Get("linear_before_reset", 0);
   options.set("resetAfter", linear_before_reset);
 
   const auto& output_defs = node.OutputDefs();
