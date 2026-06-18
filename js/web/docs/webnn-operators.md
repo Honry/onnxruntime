@@ -122,7 +122,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Sub | ai.onnx(7-12, 13, 14+) | sub | |
 | Tan | ai.onnx(7+) | tan | |
 | Tanh | ai.onnx(7-12, 13+) | tanh | |
-| Tile | ai.onnx(7-12, 13+) | tile | Input 'repeats' should be a constant |
+| Tile | ai.onnx(7-12, 13+) | tile, dynamicTile | |
 | Transpose | ai.onnx(7-12, 13-20, 21+) | transpose | |
 | Trilu | ai.onnx(14+) | triangular | Input 'k' (option 'diagonal' for WebNN) if present should be a constant |
 | Unsqueeze | ai.onnx(7-10, 11-12, 13-20, 21+) | reshape, dynamicReshape, shape, slice, concat | Input 'axes' if present should be a constant |

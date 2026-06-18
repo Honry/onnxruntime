@@ -28,52 +28,105 @@ class TileOpBuilder : public BaseOpBuilder {
  private:
   bool IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node& node,
                          const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+  bool HasSupportedInputsImpl(const GraphViewer& graph_viewer, const Node& node,
+                              const emscripten::val& wnn_limits,
+                              const logging::Logger& logger) const override;
 };
 
 // Add operator related.
 
 void TileOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
-  model_builder.AddInitializerToSkip(node.InputDefs()[1]->Name());
+  const auto& input_defs = node.InputDefs();
+  const auto& repetitions_name = input_defs[1]->Name();
+  if (model_builder.GetGraphViewer().GetConstantInitializer(repetitions_name)) {
+    model_builder.AddInitializerToSkip(repetitions_name);
+  }
 }
 
 Status TileOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                             const Node& node,
                                             const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
-  const auto& initializers(model_builder.GetInitializerTensors());
-  const auto& repetitions_initializer = *initializers.at(input_defs[1]->Name());
-  const int64_t* raw_repetitions_data = repetitions_initializer.int64_data().empty()
-                                            ? reinterpret_cast<const int64_t*>(repetitions_initializer.raw_data().data())
-                                            : repetitions_initializer.int64_data().data();
-  const auto size = repetitions_initializer.dims()[0];
-  TensorShapeVector repetitions_data{raw_repetitions_data, raw_repetitions_data + size};
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
-  std::vector<uint32_t> repetitions;
-  std::transform(repetitions_data.cbegin(), repetitions_data.cend(),
-                 std::back_inserter(repetitions),
-                 [](int64_t repetition) -> uint32_t { return SafeInt<uint32_t>(repetition); });
-
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
-  emscripten::val output = model_builder.GetBuilder().call<emscripten::val>("tile",
-                                                                            input,
-                                                                            emscripten::val::array(repetitions),
-                                                                            options);
+
+  const auto& initializers(model_builder.GetInitializerTensors());
+  const bool is_constant_repetitions = initializers.count(input_defs[1]->Name()) > 0;
+
+  emscripten::val output = emscripten::val::undefined();
+  if (is_constant_repetitions) {
+    // Static path: read repetitions at build time and use WebNN tile.
+    const auto& repetitions_initializer = *initializers.at(input_defs[1]->Name());
+    const int64_t* raw_repetitions_data = repetitions_initializer.int64_data().empty()
+                                              ? reinterpret_cast<const int64_t*>(repetitions_initializer.raw_data().data())
+                                              : repetitions_initializer.int64_data().data();
+    const auto size = repetitions_initializer.dims()[0];
+    TensorShapeVector repetitions_data{raw_repetitions_data, raw_repetitions_data + size};
+    std::vector<uint32_t> repetitions;
+    std::transform(repetitions_data.cbegin(), repetitions_data.cend(),
+                   std::back_inserter(repetitions),
+                   [](int64_t repetition) -> uint32_t { return SafeInt<uint32_t>(repetition); });
+    output = model_builder.GetBuilder().call<emscripten::val>("tile",
+                                                              input,
+                                                              emscripten::val::array(repetitions),
+                                                              options);
+  } else {
+    // Dynamic path: pass repetitions as MLOperand to dynamicTile.
+    emscripten::val repetitions_operand = model_builder.GetOperand(input_defs[1]->Name());
+    output = model_builder.GetBuilder().call<emscripten::val>("dynamicTile", input, repetitions_operand, options);
+  }
+
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   return Status::OK();
 }
 
 // Operator support related.
 
-bool TileOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
-                                      const Node& node,
+bool TileOpBuilder::IsOpSupportedImpl(const GraphViewer& /* graph_viewer */,
+                                      const Node& /* node */,
                                       const WebnnDeviceType /* device_type */,
-                                      const logging::Logger& logger) const {
+                                      const logging::Logger& /* logger */) const {
+  return true;
+}
+
+bool TileOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
+                                           const Node& node,
+                                           const emscripten::val& wnn_limits,
+                                           const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   const auto& repetitions_name = input_defs[1]->Name();
-  const auto* init = graph_viewer.GetConstantInitializer(repetitions_name);
-  if (!init) {
-    LOGS(logger, VERBOSE) << "Repetitions of tile must be a constant initializer";
+
+  if (graph_viewer.GetConstantInitializer(repetitions_name)) {
+    return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
+  }
+
+  // When repetitions is an operand, check inputs against dynamicTile's limits.
+  const std::string_view webnn_op_type = "dynamicTile";
+
+  // Check input 0 (data tensor) against dynamicTile's "input" parameter.
+  int32_t input_type;
+  if (!GetType(*input_defs[0], input_type, logger)) {
+    return false;
+  }
+  if (!IsDataTypeSupportedByWebNNOp("Tile", webnn_op_type, input_type, wnn_limits,
+                                    "input", "input", logger)) {
+    return false;
+  }
+  std::vector<int64_t> input_shape;
+  if (!GetShape(*input_defs[0], input_shape, logger) ||
+      !IsInputRankSupported(wnn_limits, webnn_op_type, "input",
+                            input_shape.size(), node.Name(), logger)) {
+    return false;
+  }
+
+  // Check input 1 (repetitions operand) against dynamicTile's "repetitions" parameter.
+  int32_t repetitions_type;
+  if (!GetType(*input_defs[1], repetitions_type, logger)) {
+    return false;
+  }
+  if (!IsDataTypeSupportedByWebNNOp("Tile", webnn_op_type, repetitions_type, wnn_limits,
+                                    "repetitions", "repeats", logger)) {
     return false;
   }
 
