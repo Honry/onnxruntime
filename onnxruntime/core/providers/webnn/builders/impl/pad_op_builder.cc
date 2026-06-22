@@ -157,8 +157,8 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
 
   emscripten::val output = emscripten::val::undefined();
 
-  if (is_constant_pads) {
-    // Constant path: emit WebNN pad with uint32 arrays. Handle negative padding via clamp + slice.
+  if (is_constant_pads && !HasDynamicShape(input_shape)) {
+    // Static path: input is all-static and pads are constant.
     std::vector<uint32_t> webnn_start, webnn_end;
     bool negative_padding = clampNegativeValues(start_padding, webnn_start);
     negative_padding |= clampNegativeValues(end_padding, webnn_end);
@@ -177,6 +177,18 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
                                              emscripten::val::array(starts),
                                              emscripten::val::array(sizes), slice_opts);
     }
+  } else if (is_constant_pads) {
+    // Constant pads but dynamic input: use dynamicPad with constant pads operands.
+    // Split ONNX pads [begin0..beginR, end0..endR] into two operands.
+    std::vector<uint32_t> start_u32(start_padding.begin(), start_padding.end());
+    std::vector<uint32_t> end_u32(end_padding.begin(), end_padding.end());
+    const emscripten::val& beginning_pads = model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, label + "_beginning_pads",
+        start_u32, {static_cast<uint32_t>(rank)});
+    const emscripten::val& ending_pads = model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, label + "_ending_pads",
+        end_u32, {static_cast<uint32_t>(rank)});
+    output = builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, options);
   } else {
     // Dynamic path: pads is a runtime operand. Call dynamicPad.
     emscripten::val pads_op = model_builder.GetOperand(input_defs[1]->Name());

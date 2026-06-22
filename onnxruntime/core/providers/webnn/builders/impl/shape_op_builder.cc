@@ -27,10 +27,19 @@ Status ShapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
 
-  // Use WebNN shape() to get the shape of the input tensor as a 1-D tensor.
+  // Use WebNN shape() to get the shape of the input tensor as a 1-D uint32 tensor.
+  // Cast to int64 if supported (ONNX Shape output is int64; this also enables reshapeFusion
+  // in the ORT backend which expects int64 shape tensors).
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
   emscripten::val output = model_builder.GetBuilder().call<emscripten::val>("shape", input, options);
+
+  if (model_builder.IsInt64Supported()) {
+    emscripten::val cast_options = emscripten::val::object();
+    cast_options.set("label", node.Name() + "_cast");
+    output = model_builder.GetBuilder().call<emscripten::val>(
+        "cast", output, emscripten::val("int64"), cast_options);
+  }
 
   // Handle start/end attributes (opset 15+).
   // Only need to slice when start or end is explicitly specified.

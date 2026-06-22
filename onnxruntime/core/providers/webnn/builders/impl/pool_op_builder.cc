@@ -119,8 +119,18 @@ Status PoolOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
     emscripten::val pad_options = emscripten::val::object();
     pad_options.set("label", node.Name() + "_pad");
-    input = model_builder.GetBuilder().call<emscripten::val>("pad", input, emscripten::val::array(beginning_padding),
-                                                             emscripten::val::array(ending_padding), pad_options);
+    if (HasDynamicShape(input_shape)) {
+      const emscripten::val& begin_op = model_builder.CreateOrGetConstant<uint32_t>(
+          ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_pad_begin",
+          beginning_padding, {static_cast<uint32_t>(beginning_padding.size())});
+      const emscripten::val& end_op = model_builder.CreateOrGetConstant<uint32_t>(
+          ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_pad_end",
+          ending_padding, {static_cast<uint32_t>(ending_padding.size())});
+      input = model_builder.GetBuilder().call<emscripten::val>("dynamicPad", input, begin_op, end_op, pad_options);
+    } else {
+      input = model_builder.GetBuilder().call<emscripten::val>("pad", input, emscripten::val::array(beginning_padding),
+                                                               emscripten::val::array(ending_padding), pad_options);
+    }
   }
 
   emscripten::val output = model_builder.GetBuilder().call<emscripten::val>(webnn_op_name.c_str(), input, options);

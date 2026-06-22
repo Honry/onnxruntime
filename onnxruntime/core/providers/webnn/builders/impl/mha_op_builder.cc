@@ -78,10 +78,11 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
   int32_t input_query_type = 0;
   ORT_RETURN_IF_NOT(GetType(*input_defs[0], input_query_type, logger), "Could not get input data type.");
 
-  // Get query rank from WebNN operand (works even without ONNX shape proto).
   uint32_t hidden_size, head_size;
   const auto* q_shape_proto = input_defs[0]->Shape();
-  const uint32_t q_rank = query_input["shape"]["length"].as<uint32_t>();
+  std::vector<int64_t> q_input_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], q_input_shape, logger), "Cannot get query shape");
+  const uint32_t q_rank = static_cast<uint32_t>(q_input_shape.size());
   if (q_rank == 3) {  // Query with shape (batch_size, sequence_length, hidden_size)
     // Read hidden_size from a shape proto with a static last dim. The WebNN operand shape
     // may contain dynamic dim descriptors (objects) after upstream dynamicReshape, even for
@@ -102,15 +103,21 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
     head_size = hidden_size / num_heads;
     key_input = model_builder.GetOperand(input_defs[1]->Name());
 
-    const uint32_t k_rank = key_input["shape"]["length"].as<uint32_t>();
+    std::vector<int64_t> k_input_shape;
+    ORT_RETURN_IF_NOT(GetShape(*input_defs[1], k_input_shape, logger), "Cannot get key shape");
+    const uint32_t k_rank = static_cast<uint32_t>(k_input_shape.size());
 
     if (k_rank == 5) {  // packed KV with shape (batch_size, kv_sequence_length, num_heads, 2, head_size)
       k_reshape_skip = false;
       v_reshape_skip = false;
       split_options.set("axis", 3);
       split_options.set("label", node.Name() + "_/MHA/key/split");
-      emscripten::val output_array =
-          model_builder.GetBuilder().call<emscripten::val>("split", key_input, 2, split_options);
+      emscripten::val output_array = emscripten::val::undefined();
+      if (HasDynamicShape(k_input_shape)) {
+        output_array = model_builder.GetBuilder().call<emscripten::val>("dynamicSplit", key_input, 2, split_options);
+      } else {
+        output_array = model_builder.GetBuilder().call<emscripten::val>("split", key_input, 2, split_options);
+      }
       key_input = output_array[0];
       value_input = output_array[1];
     } else {
@@ -121,7 +128,9 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
       }
       value_input = model_builder.GetOperand(input_defs[2]->Name());
 
-      const uint32_t v_rank = value_input["shape"]["length"].as<uint32_t>();
+      std::vector<int64_t> v_input_shape;
+      ORT_RETURN_IF_NOT(GetShape(*input_defs[2], v_input_shape, logger), "Cannot get value shape");
+      const uint32_t v_rank = static_cast<uint32_t>(v_input_shape.size());
       if (v_rank == 3) {  // Value with shape (batch_size, kv_sequence_length, v_hidden_size)
         v_reshape_skip = false;
       } else {  // past_value with shape (batch_size, num_heads, kv_sequence_length, head_size)
@@ -129,18 +138,20 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
       }
     }
   } else {  // packed QKV with shape (batch_size, kv_sequence_length, num_heads, 3, head_size)
-    if (q_shape_proto && q_shape_proto->dim_size() > 4 && q_shape_proto->dim(4).has_dim_value()) {
-      head_size = static_cast<uint32_t>(q_shape_proto->dim(4).dim_value());
-    } else {
-      head_size = query_input["shape"][4].as<uint32_t>();
-    }
+    ORT_RETURN_IF(q_input_shape.size() <= 4 || q_input_shape[4] <= 0,
+                  "MultiHeadAttention: packed QKV must have static head_size at dim 4");
+    head_size = static_cast<uint32_t>(q_input_shape[4]);
     hidden_size = num_heads * head_size;
     k_reshape_skip = false;
     v_reshape_skip = false;
     split_options.set("axis", 3);
     split_options.set("label", node.Name() + "_/MHA/query/split");
-    emscripten::val output_array =
-        model_builder.GetBuilder().call<emscripten::val>("split", query_input, 3, split_options);
+    emscripten::val output_array = emscripten::val::undefined();
+    if (HasDynamicShape(q_input_shape)) {
+      output_array = model_builder.GetBuilder().call<emscripten::val>("dynamicSplit", query_input, 3, split_options);
+    } else {
+      output_array = model_builder.GetBuilder().call<emscripten::val>("split", query_input, 3, split_options);
+    }
     query_input = output_array[0];
     key_input = output_array[1];
     value_input = output_array[2];

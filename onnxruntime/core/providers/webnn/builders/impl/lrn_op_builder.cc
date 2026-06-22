@@ -78,9 +78,22 @@ Status LRNOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   std::vector<uint32_t> ending_padding{0, 0, 0, trailing_padding};
   emscripten::val pad_options = emscripten::val::object();
   pad_options.set("label", node_name + "_pad");
-  emscripten::val pad_output =
-      wnn_builder.call<emscripten::val>("pad", pow1_output, emscripten::val::array(beginning_padding),
-                                        emscripten::val::array(ending_padding), pad_options);
+
+  std::vector<int64_t> input_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
+  emscripten::val pad_output = emscripten::val::undefined();
+  if (HasDynamicShape(input_shape)) {
+    const emscripten::val& begin_op = model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, node_name + "_pad_begin",
+        beginning_padding, {static_cast<uint32_t>(beginning_padding.size())});
+    const emscripten::val& end_op = model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, node_name + "_pad_end",
+        ending_padding, {static_cast<uint32_t>(ending_padding.size())});
+    pad_output = wnn_builder.call<emscripten::val>("dynamicPad", pow1_output, begin_op, end_op, pad_options);
+  } else {
+    pad_output = wnn_builder.call<emscripten::val>("pad", pow1_output, emscripten::val::array(beginning_padding),
+                                                    emscripten::val::array(ending_padding), pad_options);
+  }
 
   // averagePool2d(pad_output, pool_options)
   const std::vector<uint32_t> kernel_shape = {1, size};
