@@ -9,7 +9,6 @@
 #include "core/providers/webnn/builders/op_builder_factory.h"
 
 #include "base_op_builder.h"
-#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -43,40 +42,31 @@ Status FlattenOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
   emscripten::val output = emscripten::val::undefined();
 
-  const emscripten::val& wnn_limits = model_builder.GetOpSupportLimits();
-  if (!wnn_limits["flatten"].isUndefined()) {
+  if (HasDynamicShape(input_shape)) {
+    // Dynamic input: native flatten is always available (introduced with dynamic shape support).
     emscripten::val flatten_options = emscripten::val::object();
     flatten_options.set("axis", axis);
     flatten_options.set("label", node.Name());
     output = model_builder.GetBuilder().call<emscripten::val>("flatten", input, flatten_options);
-  } else if (!HasDynamicShape(input_shape)) {
-    // Fallback: static reshape to [pre_axis_product, post_axis_product].
-    int64_t pre = std::accumulate(
-        input_shape.begin(), input_shape.begin() + axis, int64_t{1}, std::multiplies<int64_t>());
-    int64_t post = std::accumulate(
-        input_shape.begin() + axis, input_shape.end(), int64_t{1}, std::multiplies<int64_t>());
-    std::vector<uint32_t> new_shape{SafeInt<uint32_t>(pre), SafeInt<uint32_t>(post)};
-    emscripten::val options = emscripten::val::object();
-    options.set("label", node.Name());
-    output = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", input, emscripten::val::array(new_shape), options);
   } else {
-    // Fallback: dynamic reshape via ReduceShapeRange.
-    emscripten::val wnn_builder = model_builder.GetBuilder();
-    emscripten::val shape_options = emscripten::val::object();
-    shape_options.set("label", node.Name() + "_shape");
-    emscripten::val shape_operand = wnn_builder.call<emscripten::val>("shape", input, shape_options);
-
-    emscripten::val pre_product = shape_utils::ReduceShapeRange(
-        model_builder, shape_operand, 0, static_cast<int32_t>(axis), node.Name() + "_pre_reduce");
-    emscripten::val post_product = shape_utils::ReduceShapeRange(
-        model_builder, shape_operand, static_cast<int32_t>(axis),
-        static_cast<int32_t>(rank) - static_cast<int32_t>(axis), node.Name() + "_post_reduce");
-
-    emscripten::val segments = emscripten::val::array();
-    segments.call<void>("push", pre_product);
-    segments.call<void>("push", post_product);
-    output = shape_utils::DynamicReshapeWithSegments(model_builder, input, segments, node.Name());
+    // Static input: use native op if available, otherwise fall back to reshape.
+    const emscripten::val& wnn_limits = model_builder.GetOpSupportLimits();
+    if (!wnn_limits["flatten"].isUndefined()) {
+      emscripten::val flatten_options = emscripten::val::object();
+      flatten_options.set("axis", axis);
+      flatten_options.set("label", node.Name());
+      output = model_builder.GetBuilder().call<emscripten::val>("flatten", input, flatten_options);
+    } else {
+      int64_t pre = std::accumulate(
+          input_shape.begin(), input_shape.begin() + axis, int64_t{1}, std::multiplies<int64_t>());
+      int64_t post = std::accumulate(
+          input_shape.begin() + axis, input_shape.end(), int64_t{1}, std::multiplies<int64_t>());
+      std::vector<uint32_t> new_shape{SafeInt<uint32_t>(pre), SafeInt<uint32_t>(post)};
+      emscripten::val options = emscripten::val::object();
+      options.set("label", node.Name());
+      output = model_builder.GetBuilder().call<emscripten::val>(
+          "reshape", input, emscripten::val::array(new_shape), options);
+    }
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));

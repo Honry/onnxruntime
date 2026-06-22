@@ -9,6 +9,7 @@
 #include "core/providers/webnn/builders/op_builder_factory.h"
 
 #include "base_op_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -49,29 +50,58 @@ Status DepthToSpaceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   emscripten::val options = emscripten::val::object();
 
   if (has_dynamic_shape) {
-    // Dynamic shape path: use input["shape"][i] for dynamic dims, literals for static dims.
-    // blocksize is always a constant attribute.
-    const int64_t channels = input_shape[1];  // channels must be static (validated in IsOpSupportedImpl)
+    // Dynamic shape path: B, H, W may be dynamic; channels and blocksize are static.
+    const int64_t channels = input_shape[1];
     const int64_t new_channels = channels / (blocksize * blocksize);
 
-    // Step 1: Reshape to 6D
-    emscripten::val shape1 = emscripten::val::array();
-    shape1.call<void>("push", input["shape"][0]);  // batch (may be dynamic)
+    // Step 1: Reshape to 6D [B, bs, bs, C', H, W] (DCR) or [B, C', bs, bs, H, W] (CRD)
+    std::vector<int64_t> shape1_dims;
+    shape1_dims.push_back(0);  // B (dynamic)
     if (mode == "DCR") {
-      shape1.call<void>("push", static_cast<uint32_t>(blocksize));
-      shape1.call<void>("push", static_cast<uint32_t>(blocksize));
-      shape1.call<void>("push", static_cast<uint32_t>(new_channels));
+      shape1_dims.push_back(blocksize);
+      shape1_dims.push_back(blocksize);
+      shape1_dims.push_back(new_channels);
     } else {
-      shape1.call<void>("push", static_cast<uint32_t>(new_channels));
-      shape1.call<void>("push", static_cast<uint32_t>(blocksize));
-      shape1.call<void>("push", static_cast<uint32_t>(blocksize));
+      shape1_dims.push_back(new_channels);
+      shape1_dims.push_back(blocksize);
+      shape1_dims.push_back(blocksize);
     }
-    shape1.call<void>("push", input["shape"][2]);  // height (may be dynamic)
-    shape1.call<void>("push", input["shape"][3]);  // width (may be dynamic)
+    shape1_dims.push_back(0);  // H (dynamic, dim 2 of input → dim 4 of target)
+    shape1_dims.push_back(0);  // W (dynamic, dim 3 of input → dim 5 of target)
+    // Note: ComputeShape gathers dim at same index — but here target dim 4 should get input dim 2.
+    // ComputeShape can't handle cross-index gathering. Build manually using SliceShapeRange.
+    emscripten::val wnn_builder = model_builder.GetBuilder();
+    emscripten::val shape_opts = emscripten::val::object();
+    shape_opts.set("label", node.Name() + "_shape1_shape");
+    emscripten::val input_shape_op = wnn_builder.call<emscripten::val>("shape", input, shape_opts);
+
+    emscripten::val shape1_segments = emscripten::val::array();
+    // B from input dim 0
+    shape1_segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, input_shape_op, 0, 1));
+    // Static middle dims
+    if (mode == "DCR") {
+      std::vector<uint32_t> mid{static_cast<uint32_t>(blocksize), static_cast<uint32_t>(blocksize),
+                                static_cast<uint32_t>(new_channels)};
+      shape1_segments.call<void>("push", model_builder.CreateOrGetConstant<uint32_t>(
+          ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_shape1_mid",
+          mid, {3}));
+    } else {
+      std::vector<uint32_t> mid{static_cast<uint32_t>(new_channels), static_cast<uint32_t>(blocksize),
+                                static_cast<uint32_t>(blocksize)};
+      shape1_segments.call<void>("push", model_builder.CreateOrGetConstant<uint32_t>(
+          ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_shape1_mid",
+          mid, {3}));
+    }
+    // H, W from input dims 2, 3
+    shape1_segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, input_shape_op, 2, 2));
+
+    shape_opts.set("label", node.Name() + "_shape1_concat");
+    emscripten::val shape1_operand = wnn_builder.call<emscripten::val>(
+        "concat", shape1_segments, 0, shape_opts);
 
     options.set("label", node.Name() + "_reshape1");
-    emscripten::val tmp = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", input, shape1, options);
+    emscripten::val tmp = wnn_builder.call<emscripten::val>(
+        "dynamicReshape", input, shape1_operand, options);
 
     // Step 2: Transpose
     const std::vector<uint32_t> perm = (mode == "DCR")
@@ -80,41 +110,42 @@ Status DepthToSpaceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     options = emscripten::val::object();
     options.set("label", node.Name() + "_transpose");
     options.set("permutation", emscripten::val::array(perm));
-    tmp = model_builder.GetBuilder().call<emscripten::val>("transpose", tmp, options);
+    tmp = wnn_builder.call<emscripten::val>("transpose", tmp, options);
 
-    // Step 3: Reshape to output shape [batch, new_channels, height*blocksize, width*blocksize]
-    emscripten::val shape2 = emscripten::val::array();
-    shape2.call<void>("push", input["shape"][0]);  // batch
-    shape2.call<void>("push", static_cast<uint32_t>(new_channels));
+    // Step 3: Reshape to [B, C', H*bs, W*bs]. After transpose, tensor is
+    // [B, C', H, bs, W, bs]. Target is {0, C', -1, -1} but only one -1 allowed.
+    // Use ComputeShape with {0, C', -1} on a flattened view... or build manually.
+    // Simplest: shape(tmp) → gather B (dim 0), constant C', then for H*bs and W*bs
+    // we can multiply: gather dim 2 * constant(bs), gather dim 4 * constant(bs).
+    // But WebNN doesn't have elementwise multiply on shape operands easily.
+    // Alternative: use {0, new_channels, -1} with flatten semantics — but input is 6D
+    // and -1 would give H*bs*W*bs (wrong, we need two separate dims).
+    //
+    // Best approach: compute H*bs = reduceProduct(dims[2:4]), W*bs = reduceProduct(dims[4:6])
+    shape_opts.set("label", node.Name() + "_shape2_shape");
+    emscripten::val tmp_shape = wnn_builder.call<emscripten::val>("shape", tmp, shape_opts);
 
-    // For new_height and new_width, use output shape proto to preserve dim_param names.
-    const auto* output_shape_proto = output_defs[0]->Shape();
-    if (output_shape_proto && output_shape_proto->dim_size() == 4) {
-      // Use output shape proto dims for height and width (preserves dim_param names).
-      for (int d = 2; d <= 3; ++d) {
-        const auto& dim = output_shape_proto->dim(d);
-        if (dim.has_dim_value()) {
-          shape2.call<void>("push", static_cast<uint32_t>(dim.dim_value()));
-        } else if (dim.has_dim_param()) {
-          emscripten::val dim_desc = emscripten::val::object();
-          dim_desc.set("name", emscripten::val(dim.dim_param()));
-          shape2.call<void>("push", dim_desc);
-        } else {
-          // Fallback: use concrete computation if height/width are static.
-          int64_t val = input_shape[d] * blocksize;
-          shape2.call<void>("push", static_cast<uint32_t>(val));
-        }
-      }
-    } else {
-      // No output shape proto — height/width must be static.
-      shape2.call<void>("push", static_cast<uint32_t>(input_shape[2] * blocksize));
-      shape2.call<void>("push", static_cast<uint32_t>(input_shape[3] * blocksize));
-    }
+    emscripten::val shape2_segments = emscripten::val::array();
+    // B from dim 0
+    shape2_segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, tmp_shape, 0, 1));
+    // C' (static)
+    shape2_segments.call<void>("push", model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, static_cast<uint32_t>(new_channels), {1}));
+    // H*bs = reduceProduct(dims[2:4]) — dims 2,3 of transposed tensor are H and bs
+    shape2_segments.call<void>("push", shape_utils::ReduceShapeRange(
+        model_builder, tmp_shape, 2, 2, node.Name() + "_shape2_h_reduce"));
+    // W*bs = reduceProduct(dims[4:6]) — dims 4,5 of transposed tensor are W and bs
+    shape2_segments.call<void>("push", shape_utils::ReduceShapeRange(
+        model_builder, tmp_shape, 4, 2, node.Name() + "_shape2_w_reduce"));
+
+    shape_opts.set("label", node.Name() + "_shape2_concat");
+    emscripten::val shape2_operand = wnn_builder.call<emscripten::val>(
+        "concat", shape2_segments, 0, shape_opts);
 
     options = emscripten::val::object();
     options.set("label", node.Name());
-    emscripten::val output = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", tmp, shape2, options);
+    emscripten::val output = wnn_builder.call<emscripten::val>(
+        "dynamicReshape", tmp, shape2_operand, options);
 
     model_builder.AddOperand(output_defs[0]->Name(), std::move(output));
   } else {

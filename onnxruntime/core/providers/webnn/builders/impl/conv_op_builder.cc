@@ -139,25 +139,21 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
   const bool has_dynamic_spatial = HasDynamicShape(input_shape);
 
   emscripten::val common_options = emscripten::val::object();
-  // Support conv1d by prepending a 1 or 2 size dimensions.
+  // Support conv1d by appending a size-1 spatial dimension (3D → 4D).
   if (is_conv1d) {
-    // Reshape input from 3D to 4D by appending a size-1 dimension.
+    input_shape.push_back(1);  // Track the 4D shape for downstream padding computation.
     if (has_dynamic_spatial) {
-      emscripten::val new_shape = emscripten::val::array();
-      for (size_t i = 0; i < input_shape.size(); ++i) {
-        new_shape.call<void>("push", input["shape"][i]);
-      }
-      new_shape.call<void>("push", 1u);
-      common_options.set("label", node.Name() + "_reshape_input");
-      input = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, common_options);
-      input_shape.push_back(1);  // Track the 4D shape for downstream padding computation.
+      // Dynamic input: use unsqueeze (available with dynamic shape support).
+      emscripten::val unsqueeze_input_options = emscripten::val::object();
+      unsqueeze_input_options.set("axes", emscripten::val::array(std::vector<uint32_t>{3}));
+      unsqueeze_input_options.set("label", node.Name() + "_reshape_input");
+      input = model_builder.GetBuilder().call<emscripten::val>("unsqueeze", input, unsqueeze_input_options);
     } else {
-      input_shape.push_back(1);
+      // Static input: use reshape with concrete values.
       std::vector<uint32_t> new_input_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
       common_options.set("label", node.Name() + "_reshape_input");
-      input = model_builder.GetBuilder().call<emscripten::val>("reshape", input,
-                                                               emscripten::val::array(new_input_shape),
-                                                               common_options);
+      input = model_builder.GetBuilder().call<emscripten::val>(
+          "reshape", input, emscripten::val::array(new_input_shape), common_options);
     }
 
     weight_shape.resize(4, 1);  // Ensure 4D by appending 1's if needed.
@@ -260,26 +256,23 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
     output = model_builder.GetBuilder().call<emscripten::val>("convTranspose2d", input, filter, options);
   }
 
-  // If it's a conv1d, reshape it back.
+  // If it's a conv1d, remove the appended size-1 dim (4D → 3D).
   if (is_conv1d) {
     if (has_dynamic_spatial) {
-      // Use the 4D output's shape, dropping the last dimension.
-      emscripten::val new_shape = emscripten::val::array();
-      for (size_t i = 0; i < 3; ++i) {
-        new_shape.call<void>("push", output["shape"][i]);
-      }
-      common_options.set("label", node.Name() + "_reshape_output");
-      output = model_builder.GetBuilder().call<emscripten::val>("reshape", output, new_shape, common_options);
+      // Dynamic: use squeeze (available with dynamic shape support).
+      emscripten::val squeeze_output_options = emscripten::val::object();
+      squeeze_output_options.set("axes", emscripten::val::array(std::vector<uint32_t>{3}));
+      squeeze_output_options.set("label", node.Name() + "_reshape_output");
+      output = model_builder.GetBuilder().call<emscripten::val>("squeeze", output, squeeze_output_options);
     } else {
+      // Static: use reshape with concrete output shape.
       const auto& output_defs = node.OutputDefs();
       std::vector<int64_t> output_shape;
       ORT_RETURN_IF_NOT(GetShape(*output_defs[0], output_shape, logger), "Cannot get output shape");
       std::vector<uint32_t> new_shape = GetNarrowedIntFromInt64<uint32_t>(output_shape);
       common_options.set("label", node.Name() + "_reshape_output");
-      output = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                                output,
-                                                                emscripten::val::array(new_shape),
-                                                                common_options);
+      output = model_builder.GetBuilder().call<emscripten::val>(
+          "reshape", output, emscripten::val::array(new_shape), common_options);
     }
   }
 
