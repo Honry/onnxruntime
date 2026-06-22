@@ -2,8 +2,6 @@
 // Copyright (c) Intel Corporation. All rights reserved.
 // Licensed under the MIT License.
 
-#include <set>
-
 #include "core/providers/common.h"
 #include "core/providers/shared/utils/utils.h"
 #include "core/providers/webnn/builders/helper.h"
@@ -12,7 +10,10 @@
 
 #include "core/optimizer/initializer.h"
 
+#include <set>
+
 #include "base_op_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -87,71 +88,75 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
   // Sort axes in ascending order.
   std::sort(axes_data.begin(), axes_data.end());
 
-  emscripten::val options = emscripten::val::object();
-  options.set("label", node.Name());
   emscripten::val output = emscripten::val::undefined();
+  const emscripten::val& wnn_limits = model_builder.GetOpSupportLimits();
+  const bool has_native_op = (op_type == "Squeeze")
+      ? !wnn_limits["squeeze"].isUndefined()
+      : !wnn_limits["unsqueeze"].isUndefined();
 
-  if (!HasDynamicShape(input_shape)) {
-    // === Static path: compute new_shape at build time and use WebNN reshape. ===
+  if (has_native_op) {
+    emscripten::val options = emscripten::val::object();
+    options.set("label", node.Name());
+    if (!axes_data.empty()) {
+      options.set("axes", emscripten::val::array(
+          std::vector<uint32_t>(axes_data.begin(), axes_data.end())));
+    }
+    if (op_type == "Squeeze") {
+      output = model_builder.GetBuilder().call<emscripten::val>("squeeze", input, options);
+    } else {
+      output = model_builder.GetBuilder().call<emscripten::val>("unsqueeze", input, options);
+    }
+  } else if (!HasDynamicShape(input_shape)) {
+    // Fallback: use static reshape when native op not available.
     std::vector<uint32_t> new_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
-
     if (op_type == "Squeeze") {
       if (!axes_data.empty()) {
         for (auto it = axes_data.rbegin(); it != axes_data.rend(); ++it) {
-          size_t index = *it;
-          new_shape.erase(new_shape.begin() + index);
+          new_shape.erase(new_shape.begin() + *it);
         }
       } else {
-        // Remove all dimensions that are 1.
         new_shape.erase(
-            std::remove_if(new_shape.begin(), new_shape.end(), [](uint32_t axis) { return axis == 1; }),
-            new_shape.end());
+            std::remove(new_shape.begin(), new_shape.end(), 1u), new_shape.end());
       }
-    } else if (op_type == "Unsqueeze") {
+    } else {
       for (const int32_t& axis : axes_data) {
         new_shape.insert(new_shape.begin() + axis, 1);
       }
-    } else {
-      return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
-                             "SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl, unknown op: ", op_type);
     }
-
-    output = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                              input,
-                                                              emscripten::val::array(new_shape),
-                                                              options);
+    emscripten::val options = emscripten::val::object();
+    options.set("label", node.Name());
+    output = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", input, emscripten::val::array(new_shape), options);
   } else {
-    // === Dynamic path: use static reshape() with input["shape"][i] for original dims. ===
-    // This preserves native dim descriptors for dynamic dims while keeping inserted "1" dims
-    // truly static — avoiding the issue where dynamicReshape makes ALL dims dynamic
-    // (which breaks downstream ops like ScatterND that require static last dim on indices).
-    emscripten::val input_shape_val = input["shape"];
-    emscripten::val new_shape = emscripten::val::array();
-
+    // Dynamic input without native op: use ComputeShape + dynamicReshape.
+    std::vector<int64_t> target_dims;
     if (op_type == "Squeeze") {
       std::set<int32_t> axes_set(axes_data.begin(), axes_data.end());
-      for (int32_t i = 0; i < static_cast<int32_t>(input_rank); ++i) {
-        if (axes_set.count(i) == 0) {
-          new_shape.call<void>("push", input_shape_val[i]);
+      for (size_t i = 0; i < input_rank; ++i) {
+        if (axes_set.count(static_cast<int32_t>(i)) == 0) {
+          target_dims.push_back(0);
         }
       }
     } else {  // Unsqueeze
-      int32_t input_dim = 0;
+      size_t input_dim = 0;
       size_t axes_idx = 0;
-      const auto output_rank = static_cast<int32_t>(rank);
-
-      for (int32_t i = 0; i < output_rank; ++i) {
-        if (axes_idx < axes_data.size() && axes_data[axes_idx] == i) {
-          new_shape.call<void>("push", 1u);
+      const auto output_rank = rank;
+      for (size_t i = 0; i < output_rank; ++i) {
+        if (axes_idx < axes_data.size() && axes_data[axes_idx] == static_cast<int32_t>(i)) {
+          target_dims.push_back(1);
           axes_idx++;
         } else {
-          new_shape.call<void>("push", input_shape_val[input_dim]);
+          target_dims.push_back(0);
           input_dim++;
         }
       }
     }
-
-    output = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, options);
+    emscripten::val shape_operand = shape_utils::ComputeShape(
+        model_builder, input, target_dims, node.Name());
+    emscripten::val options = emscripten::val::object();
+    options.set("label", node.Name());
+    output = model_builder.GetBuilder().call<emscripten::val>(
+        "dynamicReshape", input, shape_operand, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -172,33 +177,16 @@ bool SqueezeUnsqueezeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewe
     return false;
   }
 
-  bool has_explicit_axes = false;
-
   // Squeeze/Unsqueeze opset 13 uses input 1 as axes, it needs to be an initializer.
   if (node.SinceVersion() >= 13) {
     const std::string axes_name = GetTensorName(input_defs, 1);
     if (!axes_name.empty()) {
-      const auto* init = graph_viewer.GetConstantInitializer(axes_name);
-      if (!init) {
+      if (!graph_viewer.GetConstantInitializer(axes_name)) {
         LOGS(logger, ERROR) << "Input axes of " << op_type << " is not present and constant";
         return false;
       }
-      has_explicit_axes = true;
     } else if (op_type == "Unsqueeze") {
-      // The axes are optional for Squeeze, but not Unsqueeze.
       LOGS(logger, ERROR) << "Input axes of Unsqueeze must be provided";
-      return false;
-    }
-  } else {
-    NodeAttrHelper helper(node);
-    has_explicit_axes = helper.HasAttr("axes");
-  }
-
-  // Squeeze without explicit axes removes all dims that equal 1.
-  // With dynamic shapes, we don't know which dims are 1 at build time.
-  if (op_type == "Squeeze" && !has_explicit_axes) {
-    if (HasDynamicShape(*input_defs[0])) {
-      LOGS(logger, VERBOSE) << "Squeeze without explicit axes requires static input shape";
       return false;
     }
   }
