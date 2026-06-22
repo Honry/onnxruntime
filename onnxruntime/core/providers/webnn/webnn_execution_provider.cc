@@ -30,7 +30,6 @@ namespace onnxruntime {
 constexpr const char* WEBNN = "WEBNN";
 
 WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_flags,
-                         const webnn::FreeDimensionBounds& free_dimension_bounds,
                          bool enable_causal_lm)
     : IExecutionProvider{
           onnxruntime::kWebNNExecutionProvider,
@@ -41,7 +40,6 @@ WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_f
               OrtDevice::VendorIds::NONE,
               0)},
                   wnn_device_type_(webnn::DeviceTypeFromString(webnn_device_flags)),
-                  free_dimension_bounds_(free_dimension_bounds),
                   enable_causal_lm_(enable_causal_lm) {
   wnn_context_ = emscripten::val::module_property("currentContext");
   if (!wnn_context_.as<bool>()) {
@@ -177,7 +175,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
     const onnxruntime::GraphViewer& graph_viewer(fused_node_and_graph.filtered_graph);
 
     webnn::ModelBuilder builder(graph_viewer, *GetLogger(), wnn_context_, wnn_device_type_, wnn_limits_,
-                  free_dimension_bounds_, enable_causal_lm_);
+                  enable_causal_lm_);
     std::unique_ptr<webnn::Model> model;
     ORT_RETURN_IF_ERROR(builder.Compile(model));
 
@@ -227,21 +225,6 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       }
     }
 
-    // Build fixed symbolic dimension values from FreeDimensionBounds where min == max.
-    // These can safely be used as runtime allocation dimensions when a dim_param cannot
-    // be traced back to any fused-node input.
-    InlinedHashMap<std::string, int64_t> fixed_dim_param_values;
-    {
-      fixed_dim_param_values.reserve(free_dimension_bounds_.size());
-      for (const auto& kvp : free_dimension_bounds_) {
-        const auto& dim_name = kvp.first;
-        const auto& bound = kvp.second;
-        if (bound.max_size > 0 && bound.min_size == bound.max_size) {
-          fixed_dim_param_values.emplace(dim_name, static_cast<int64_t>(bound.max_size));
-        }
-      }
-    }
-
     // Record output shapes and symbolic dimensions in fused-node output order.
     std::vector<std::vector<int64_t>> fused_output_shapes;
     std::vector<std::vector<std::string>> output_dim_params;
@@ -281,7 +264,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       ORT_UNUSED_PARAMETER(state);
     };
 
-    compute_info.compute_func = [dim_param_to_input_dim, fixed_dim_param_values, fused_output_shapes, output_dim_params](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
+    compute_info.compute_func = [dim_param_to_input_dim, fused_output_shapes, output_dim_params](FunctionState state, const OrtApi* api, OrtKernelContext* context) {
       Ort::KernelContext ctx(context);
 
       const size_t num_inputs = ctx.GetInputCount();
@@ -408,13 +391,6 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                   continue;
                 }
 
-                // Fall back to fixed FreeDimensionBounds value if available.
-                auto fixed_it = fixed_dim_param_values.find(dim_param);
-                if (fixed_it != fixed_dim_param_values.end()) {
-                  output_shape[dim_idx] = fixed_it->second;
-                  continue;
-                }
-
                 // Try to parse expressions like "N*dim_param" or "dim_param*N" (e.g., "8*latent_height").
                 // These arise from symbolic shape inference simplification.
                 {
@@ -461,11 +437,6 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                             src_dim < runtime_input_shapes[src_idx].size()) {
                           output_shape[dim_idx] = factor * runtime_input_shapes[src_idx][src_dim];
                         }
-                      } else {
-                        auto fixed_base_it = fixed_dim_param_values.find(base_param);
-                        if (fixed_base_it != fixed_dim_param_values.end()) {
-                          output_shape[dim_idx] = factor * fixed_base_it->second;
-                        }
                       }
                     }
                   }
@@ -479,7 +450,7 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                     const std::string left = utils::TrimString(std::string_view(dim_param).substr(0, plus_pos));
                     const std::string right = utils::TrimString(std::string_view(dim_param).substr(plus_pos + 1));
 
-                    // Resolve each operand (from runtime inputs or fixed bounds).
+                    // Resolve each operand from runtime inputs.
                     auto resolve_operand = [&](const std::string& operand) -> int64_t {
                       auto it = dim_param_to_input_dim.find(operand);
                       if (it != dim_param_to_input_dim.end()) {
@@ -489,10 +460,6 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
                             src_dim < runtime_input_shapes[src_idx].size()) {
                           return runtime_input_shapes[src_idx][src_dim];
                         }
-                      }
-                      auto fixed_it = fixed_dim_param_values.find(operand);
-                      if (fixed_it != fixed_dim_param_values.end()) {
-                        return fixed_it->second;
                       }
                       return -1;  // unresolved
                     };
