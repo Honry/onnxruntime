@@ -153,17 +153,13 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
 
   const float scale_value = helper.Get("scale", 1 / sqrt(static_cast<float>(head_size)));
 
-  // Build reshape target shapes using operand dimensions (handles dynamic/symbolic dims).
   // query_input -> reshape(B,S,N,H) -> transpose(B,N,S,H) -> new_query
-  emscripten::val q_reshape_shape = emscripten::val::array();
-  q_reshape_shape.call<void>("push", query_input["shape"][0]);  // B
-  q_reshape_shape.call<void>("push", query_input["shape"][1]);  // S
-  q_reshape_shape.call<void>("push", num_heads);
-  q_reshape_shape.call<void>("push", head_size);
-
+  std::vector<int64_t> qkv_target{0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)};
+  emscripten::val q_shape_op = shape_utils::ComputeShape(
+      model_builder, query_input, qkv_target, node.Name() + "_/MHA/query/reshape");
   common_options.set("label", node.Name() + "_/MHA/query/reshape");
   emscripten::val reshaped_query = model_builder.GetBuilder().call<emscripten::val>(
-      "reshape", query_input, q_reshape_shape, common_options);
+      "dynamicReshape", query_input, q_shape_op, common_options);
 
   transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
   transpose_options.set("label", node.Name() + "_/MHA/query/transpose");
@@ -172,15 +168,11 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
 
   emscripten::val present_key, present_value;
   if (!k_reshape_skip) {
-    emscripten::val kv_reshape_shape = emscripten::val::array();
-    kv_reshape_shape.call<void>("push", key_input["shape"][0]);  // B
-    kv_reshape_shape.call<void>("push", key_input["shape"][1]);  // kv_S
-    kv_reshape_shape.call<void>("push", num_heads);
-    kv_reshape_shape.call<void>("push", head_size);
-
+    emscripten::val k_shape_op = shape_utils::ComputeShape(
+        model_builder, key_input, qkv_target, node.Name() + "_/MHA/key/reshape_1");
     common_options.set("label", node.Name() + "_/MHA/key/reshape_1");
     present_key = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", key_input, kv_reshape_shape, common_options);
+        "dynamicReshape", key_input, k_shape_op, common_options);
 
     transpose_options.set("label", node.Name() + "_/MHA/key/transpose");
     present_key = model_builder.GetBuilder().call<emscripten::val>("transpose", present_key, transpose_options);
@@ -203,15 +195,11 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
       model_builder.GetBuilder().call<emscripten::val>("transpose", present_key, transpose_options);
 
   if (!v_reshape_skip) {
-    emscripten::val v_reshape_shape = emscripten::val::array();
-    v_reshape_shape.call<void>("push", value_input["shape"][0]);  // B
-    v_reshape_shape.call<void>("push", value_input["shape"][1]);  // kv_S
-    v_reshape_shape.call<void>("push", num_heads);
-    v_reshape_shape.call<void>("push", head_size);
-
+    emscripten::val v_shape_op = shape_utils::ComputeShape(
+        model_builder, value_input, qkv_target, node.Name() + "_/MHA/value/reshape_1");
     common_options.set("label", node.Name() + "_/MHA/value/reshape_1");
     present_value = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", value_input, v_reshape_shape, common_options);
+        "dynamicReshape", value_input, v_shape_op, common_options);
 
     transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
     transpose_options.set("label", node.Name() + "_/MHA/value/transpose");
@@ -233,13 +221,12 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
   emscripten::val scale_constant =
       model_builder.CreateOrGetConstant<float>(input_query_type, scale_value, {1});
 
-  emscripten::val reshape_output_shape = emscripten::val::array();
-  reshape_output_shape.call<void>("push", new_query["shape"][0]);
-  reshape_output_shape.call<void>("push", new_query["shape"][2]);
-  reshape_output_shape.call<void>("push", hidden_size);
+  // Output reshape target: [B, S, hidden_size] applied after transpose to [B, S, N, H].
+  // Pass target_dims to ScaledDotProductAttention which builds ComputeShape on transposed output.
+  std::vector<int64_t> reshape_output_target{0, 0, static_cast<int64_t>(hidden_size)};
 
   emscripten::val output = ScaledDotProductAttention(model_builder, node, logger, new_query, new_key, present_value,
-                                                     scale_constant, attention_bias, reshape_output_shape);
+                                                     scale_constant, attention_bias, reshape_output_target);
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
 
   if (TensorExists(node.OutputDefs(), 1)) {

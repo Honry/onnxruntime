@@ -199,12 +199,17 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     // Compute S-1 dynamically from query sequence_length.
     emscripten::val pos_one_constant = model_builder.CreateOrGetConstant<int>(
         ONNX_NAMESPACE::TensorProto_DataType_INT32, 1, {1});
-    emscripten::val pos_s_shape = emscripten::val::array();
-    pos_s_shape.call<void>("push", query_input["shape"][1]);
+    // Get [S] shape from query_input dim 1 via shape() → slice.
+    emscripten::val pos_shape_opts = emscripten::val::object();
+    pos_shape_opts.set("label", node.Name() + "_/GQA/pos/query_shape");
+    emscripten::val pos_query_shape = model_builder.GetBuilder().call<emscripten::val>(
+        "shape", query_input, pos_shape_opts);
+    emscripten::val pos_s_shape = shape_utils::SliceShapeRange(
+        model_builder.GetBuilder(), pos_query_shape, 1, 1);
     emscripten::val pos_opts = emscripten::val::object();
     pos_opts.set("label", node.Name() + "_/GQA/pos/seq_ones");
     emscripten::val pos_seq_ones = model_builder.GetBuilder().call<emscripten::val>(
-        "expand", pos_one_constant, pos_s_shape, pos_opts);
+        "dynamicExpand", pos_one_constant, pos_s_shape, pos_opts);
     emscripten::val pos_reduce_opts = emscripten::val::object();
     pos_reduce_opts.set("keepDimensions", false);
     pos_reduce_opts.set("label", node.Name() + "_/GQA/pos/seq_length");
@@ -219,14 +224,12 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     emscripten::val corrected_seqlens_k = model_builder.GetBuilder().call<emscripten::val>(
         "sub", seqlens_k_input, pos_s_minus_1, pos_opts);
 
+    // Unsqueeze [B] → [B, 1] instead of dim-descriptor reshape.
     emscripten::val reshape_options = emscripten::val::object();
     reshape_options.set("label", node.Name() + "_/GQA/seqlens_k_reshape_for_position");
-
-    emscripten::val seqlens_k_shape = emscripten::val::array();
-    seqlens_k_shape.call<void>("push", query_input["shape"][0]);
-    seqlens_k_shape.call<void>("push", 1);
+    reshape_options.set("axes", emscripten::val::array(std::vector<uint32_t>{1}));
     emscripten::val reshaped_seqlens_k = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", corrected_seqlens_k, seqlens_k_shape, reshape_options);
+        "unsqueeze", corrected_seqlens_k, reshape_options);
 
     // seqlens_k is INT32, but position_ids_range in ApplyRotaryEmbedding may be INT64
     // if int64 is supported. We need to cast to match the expected type.
@@ -279,14 +282,15 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     const bool rotary_output_bnsh = true;
 
     // Reshape query to (batch_size, sequence_length, num_heads, head_size) for rotary embedding
-    emscripten::val query_reshape_for_rotary = emscripten::val::array();
-    query_reshape_for_rotary.call<void>("push", query_input["shape"][0]);
-    query_reshape_for_rotary.call<void>("push", query_input["shape"][1]);
-    query_reshape_for_rotary.call<void>("push", num_heads);
-    query_reshape_for_rotary.call<void>("push", head_size);
-    common_options.set("label", node.Name() + "_/GQA/query/reshape_for_rotary");
+    // Use ComputeShape: dims 0,1 from input, dims 2,3 static.
+    std::string query_rotary_label = node.Name() + "_/GQA/query/reshape_for_rotary";
+    emscripten::val query_reshape_for_rotary = shape_utils::ComputeShape(
+        model_builder, query_input,
+        {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
+        query_rotary_label);
+    common_options.set("label", query_rotary_label);
     emscripten::val reshaped_query_for_rotary = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", query_input, query_reshape_for_rotary, common_options);
+        "dynamicReshape", query_input, query_reshape_for_rotary, common_options);
 
     // Apply rotary embedding to query
     emscripten::val rotary_query_output;
@@ -308,14 +312,15 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
         rotary_query_output));
 
     // Reshape key to (batch_size, sequence_length, kv_num_heads, head_size) for rotary embedding
-    emscripten::val key_reshape_for_rotary = emscripten::val::array();
-    key_reshape_for_rotary.call<void>("push", key_input["shape"][0]);
-    key_reshape_for_rotary.call<void>("push", key_input["shape"][1]);
-    key_reshape_for_rotary.call<void>("push", kv_num_heads);
-    key_reshape_for_rotary.call<void>("push", head_size);
-    common_options.set("label", node.Name() + "_/GQA/key/reshape_for_rotary");
+    // Use ComputeShape: dims 0,1 from input, dims 2,3 static.
+    std::string key_rotary_label = node.Name() + "_/GQA/key/reshape_for_rotary";
+    emscripten::val key_reshape_for_rotary = shape_utils::ComputeShape(
+        model_builder, key_input,
+        {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
+        key_rotary_label);
+    common_options.set("label", key_rotary_label);
     emscripten::val reshaped_key_for_rotary = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", key_input, key_reshape_for_rotary, common_options);
+        "dynamicReshape", key_input, key_reshape_for_rotary, common_options);
 
     // Apply rotary embedding to key
     emscripten::val rotary_key_output;
@@ -356,56 +361,72 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     // form a pair with the internal RoPE transpose (breaking OV pattern matching).
 
     // For value (not rotary-embedded), reshape to BSNH.
-    emscripten::val reshape_kv_shape = emscripten::val::array();
-    reshape_kv_shape.call<void>("push", value_input["shape"][0]);
-    reshape_kv_shape.call<void>("push", value_input["shape"][1]);
-    reshape_kv_shape.call<void>("push", kv_num_heads);
-    reshape_kv_shape.call<void>("push", head_size);
-    common_options.set("label", node.Name() + "_/GQA/value/reshape_bsnh");
+    // Use ComputeShape: dims 0,1 from value_input, dims 2,3 static.
+    std::string value_bsnh_label = node.Name() + "_/GQA/value/reshape_bsnh";
+    emscripten::val value_bsnh_shape = shape_utils::ComputeShape(
+        model_builder, value_input,
+        {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
+        value_bsnh_label);
+    common_options.set("label", value_bsnh_label);
     value_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", value_input, reshape_kv_shape, common_options);
+        "dynamicReshape", value_input, value_bsnh_shape, common_options);
   } else {
     // Normal path: reshape query to 4D + transpose to BNSH.
-    emscripten::val reshape_tensor_shape = emscripten::val::array();
-    reshape_tensor_shape.call<void>("push", query_input["shape"][0]);
-    reshape_tensor_shape.call<void>("push", query_input["shape"][1]);
-    reshape_tensor_shape.call<void>("push", num_heads);
-    reshape_tensor_shape.call<void>("push", head_size);
-    common_options.set("label", node.Name() + "_/GQA/query/reshape");
+    // Use ComputeShape: dims 0,1 from query_input, dims 2,3 static.
+    std::string query_reshape_label = node.Name() + "_/GQA/query/reshape";
+    emscripten::val reshape_tensor_shape = shape_utils::ComputeShape(
+        model_builder, query_input,
+        {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
+        query_reshape_label);
+    common_options.set("label", query_reshape_label);
     emscripten::val reshaped_query = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", query_input, reshape_tensor_shape, common_options);
+        "dynamicReshape", query_input, reshape_tensor_shape, common_options);
 
     transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
     transpose_options.set("label", node.Name() + "_/GQA/query/transpose");
     new_query = model_builder.GetBuilder().call<emscripten::val>("transpose", reshaped_query, transpose_options);
 
     // Reshape key and value from BSW to BSNH: (B, S, kv_N*H) -> (B, S, kv_N, H)
-    emscripten::val reshape_kv_shape = emscripten::val::array();
-    reshape_kv_shape.call<void>("push", key_input["shape"][0]);
-    reshape_kv_shape.call<void>("push", key_input["shape"][1]);
-    reshape_kv_shape.call<void>("push", kv_num_heads);
-    reshape_kv_shape.call<void>("push", head_size);
-    common_options.set("label", node.Name() + "_/GQA/key/reshape_bsnh");
+    // Use ComputeShape: dims 0,1 from key_input, dims 2,3 static.
+    std::string key_bsnh_label = node.Name() + "_/GQA/key/reshape_bsnh";
+    emscripten::val reshape_kv_shape = shape_utils::ComputeShape(
+        model_builder, key_input,
+        {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
+        key_bsnh_label);
+    common_options.set("label", key_bsnh_label);
     key_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", key_input, reshape_kv_shape, common_options);
+        "dynamicReshape", key_input, reshape_kv_shape, common_options);
 
-    common_options.set("label", node.Name() + "_/GQA/value/reshape_bsnh");
+    // Value uses same target shape pattern but with value_input as source.
+    std::string val_bsnh_label = node.Name() + "_/GQA/value/reshape_bsnh";
+    emscripten::val reshape_val_shape = shape_utils::ComputeShape(
+        model_builder, value_input,
+        {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
+        val_bsnh_label);
+    common_options.set("label", val_bsnh_label);
     value_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", value_input, reshape_kv_shape, common_options);
+        "dynamicReshape", value_input, reshape_val_shape, common_options);
   }
 
   // Compute sequence_length (S) dynamically as a scalar INT32 value.
-  // WebNN doesn't have a "shape()" op, so we derive S by: expand([1], shape=[S]) → reduceSum → S.
+  // Derive S by: shape() → slice dim → dynamicExpand([1], [S]) → reduceSum → scalar S.
   // S-1 is used below to derive past_sequence_length from seqlens_k.
   emscripten::val value_one_constant =
       model_builder.CreateOrGetConstant<int>(ONNX_NAMESPACE::TensorProto_DataType_INT32, 1, {1});
 
-  emscripten::val seq_ones_shape = emscripten::val::array();
   // S is at dim 1 in BSNH (value_bsnh) or dim 2 in BNSH (new_query).
-  seq_ones_shape.call<void>("push", rotary_produced_bnsh ? new_query["shape"][2] : value_bsnh["shape"][1]);
+  // Get [S] shape via shape() → slice from the appropriate operand.
+  emscripten::val seq_source_operand = rotary_produced_bnsh ? new_query : value_bsnh;
+  uint32_t seq_dim_index = rotary_produced_bnsh ? 2 : 1;
+  emscripten::val seq_shape_opts = emscripten::val::object();
+  seq_shape_opts.set("label", node.Name() + "_/GQA/seq_source_shape");
+  emscripten::val seq_source_shape = model_builder.GetBuilder().call<emscripten::val>(
+      "shape", seq_source_operand, seq_shape_opts);
+  emscripten::val seq_ones_shape = shape_utils::SliceShapeRange(
+      model_builder.GetBuilder(), seq_source_shape, seq_dim_index, 1);
   common_options.set("label", node.Name() + "_/GQA/seq_ones");
   emscripten::val seq_ones = model_builder.GetBuilder().call<emscripten::val>(
-      "expand", value_one_constant, seq_ones_shape, common_options);
+      "dynamicExpand", value_one_constant, seq_ones_shape, common_options);
   emscripten::val seq_reduce_options = emscripten::val::object();
   seq_reduce_options.set("keepDimensions", false);
   seq_reduce_options.set("label", node.Name() + "_/GQA/seq_length");
@@ -494,14 +515,12 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       // dim_b=0 always, dim_s and dim_k swap between layouts.
       const uint32_t scatter_dim_s = rotary_produced_bnsh ? 2 : 1;
 
-      // scatter_pos_for_scatter: [B,1,1] = seqlens_k reshaped, offset-corrected
-      emscripten::val scatter_pos_reshape_shape = emscripten::val::array();
-      scatter_pos_reshape_shape.call<void>("push", key_for_scatter["shape"][0]);
-      scatter_pos_reshape_shape.call<void>("push", 1);
-      scatter_pos_reshape_shape.call<void>("push", 1);
+      // scatter_pos_for_scatter: [B] → [B,1,1] = unsqueeze(seqlens_k, axes=[1,2])
       common_options.set("label", node.Name() + "_/GQA/scatter/scatter_pos_reshape");
+      common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{1, 2}));
       emscripten::val scatter_pos_for_scatter = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", seqlens_k_input, scatter_pos_reshape_shape, common_options);
+          "unsqueeze", seqlens_k_input, common_options);
+      common_options.delete_("axes");
 
       // Correct scatter offset: seqlens_k - (S - 1) = past_sequence_length
       common_options.set("label", node.Name() + "_/GQA/scatter/scatter_pos_fix");
@@ -509,17 +528,20 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
           "sub", scatter_pos_for_scatter, s_minus_1, common_options);
 
       // expand_shape: [B, kv_N, S] (BNSH) or [B, S, kv_N] (BSNH)
-      emscripten::val expand_shape = emscripten::val::array();
-      expand_shape.call<void>("push", key_for_scatter["shape"][0]);
-      expand_shape.call<void>("push", key_for_scatter["shape"][1]);
-      expand_shape.call<void>("push", key_for_scatter["shape"][2]);
+      // Get first 3 dims of key_for_scatter via shape() → slice.
+      emscripten::val kfs_shape_opts = emscripten::val::object();
+      kfs_shape_opts.set("label", node.Name() + "_/GQA/scatter/key_for_scatter_shape");
+      emscripten::val kfs_shape = model_builder.GetBuilder().call<emscripten::val>(
+          "shape", key_for_scatter, kfs_shape_opts);
+      emscripten::val expand_shape = shape_utils::SliceShapeRange(
+          model_builder.GetBuilder(), kfs_shape, 0, 3);
 
-      // range_b: [B] → reshape [B,1,1] → expand to expand_shape
-      emscripten::val b_shape = emscripten::val::array();
-      b_shape.call<void>("push", key_for_scatter["shape"][0]);
+      // range_b: dynamicExpand([1], [B]) → cumsum → sub → unsqueeze [B,1,1] → dynamicExpand
+      emscripten::val b_shape = shape_utils::SliceShapeRange(
+          model_builder.GetBuilder(), kfs_shape, 0, 1);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_ones");
       emscripten::val range_b = model_builder.GetBuilder().call<emscripten::val>(
-          "expand", value_one_constant, b_shape, common_options);
+          "dynamicExpand", value_one_constant, b_shape, common_options);
       emscripten::val scatter_cumsum_options = emscripten::val::object();
       scatter_cumsum_options.set("label", node.Name() + "_/GQA/scatter/range_b_cumsum");
       scatter_cumsum_options.set("exclusive", false);
@@ -528,22 +550,21 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
           "cumulativeSum", range_b, gsl::narrow<uint32_t>(0), scatter_cumsum_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_sub");
       range_b = model_builder.GetBuilder().call<emscripten::val>("sub", range_b, value_one_constant, common_options);
-      emscripten::val range_b_reshape_shape = emscripten::val::array();
-      range_b_reshape_shape.call<void>("push", key_for_scatter["shape"][0]);
-      range_b_reshape_shape.call<void>("push", 1);
-      range_b_reshape_shape.call<void>("push", 1);
+      // [B] → [B,1,1] via unsqueeze
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_reshape");
+      common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{1, 2}));
       range_b = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", range_b, range_b_reshape_shape, common_options);
+          "unsqueeze", range_b, common_options);
+      common_options.delete_("axes");
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_expand");
-      range_b = model_builder.GetBuilder().call<emscripten::val>("expand", range_b, expand_shape, common_options);
+      range_b = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", range_b, expand_shape, common_options);
 
-      // range_s: [S] → reshape to [1,1,S] (BNSH) or [1,S,1] (BSNH) → expand, add offset
-      emscripten::val s_shape = emscripten::val::array();
-      s_shape.call<void>("push", key_for_scatter["shape"][scatter_dim_s]);
+      // range_s: dynamicExpand([1], [S]) → cumsum → sub → unsqueeze → dynamicExpand, add offset
+      emscripten::val s_shape = shape_utils::SliceShapeRange(
+          model_builder.GetBuilder(), kfs_shape, scatter_dim_s, 1);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_ones");
       emscripten::val range_s_plus_one = model_builder.GetBuilder().call<emscripten::val>(
-          "expand", value_one_constant, s_shape, common_options);
+          "dynamicExpand", value_one_constant, s_shape, common_options);
       scatter_cumsum_options = emscripten::val::object();
       scatter_cumsum_options.set("label", node.Name() + "_/GQA/scatter/range_s_cumsum");
       scatter_cumsum_options.set("exclusive", false);
@@ -553,31 +574,32 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_sub");
       emscripten::val range_s = model_builder.GetBuilder().call<emscripten::val>(
           "sub", range_s_plus_one, value_one_constant, common_options);
-      emscripten::val range_s_reshape_shape = emscripten::val::array();
+      // [S] → [1,1,S] (BNSH) or [1,S,1] (BSNH) via unsqueeze
       if (rotary_produced_bnsh) {
-        // BNSH: S is dim 2 → reshape to [1,1,S]
-        range_s_reshape_shape.call<void>("push", 1);
-        range_s_reshape_shape.call<void>("push", 1);
-        range_s_reshape_shape.call<void>("push", key_for_scatter["shape"][scatter_dim_s]);
+        // BNSH: S is dim 2 → unsqueeze axes=[0,1] gives [1,1,S]
+        common_options.set("label", node.Name() + "_/GQA/scatter/range_s_reshape");
+        common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0, 1}));
+        range_s = model_builder.GetBuilder().call<emscripten::val>(
+            "unsqueeze", range_s, common_options);
+        common_options.delete_("axes");
       } else {
-        // BSNH: S is dim 1 → reshape to [1,S,1]
-        range_s_reshape_shape.call<void>("push", 1);
-        range_s_reshape_shape.call<void>("push", key_for_scatter["shape"][scatter_dim_s]);
-        range_s_reshape_shape.call<void>("push", 1);
+        // BSNH: S is dim 1 → unsqueeze axes=[0,2] gives [1,S,1]
+        common_options.set("label", node.Name() + "_/GQA/scatter/range_s_reshape");
+        common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0, 2}));
+        range_s = model_builder.GetBuilder().call<emscripten::val>(
+            "unsqueeze", range_s, common_options);
+        common_options.delete_("axes");
       }
-      common_options.set("label", node.Name() + "_/GQA/scatter/range_s_reshape");
-      range_s = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", range_s, range_s_reshape_shape, common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_expand");
-      range_s = model_builder.GetBuilder().call<emscripten::val>("expand", range_s, expand_shape, common_options);
+      range_s = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", range_s, expand_shape, common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/scatter_pos_expand");
-      scatter_pos_for_scatter = model_builder.GetBuilder().call<emscripten::val>("expand", scatter_pos_for_scatter,
+      scatter_pos_for_scatter = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", scatter_pos_for_scatter,
                                                                                  expand_shape, common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_add_offset");
       range_s = model_builder.GetBuilder().call<emscripten::val>(
           "add", range_s, scatter_pos_for_scatter, common_options);
 
-      // range_k: [kv_N] → reshape to [1,kv_N,1] (BNSH) or [1,1,kv_N] (BSNH) → expand
+      // range_k: [kv_N] → reshape to [1,kv_N,1] (BNSH) or [1,1,kv_N] (BSNH) → dynamicExpand
       std::vector<int32_t> range_k_data(kv_num_heads);
       std::iota(range_k_data.begin(), range_k_data.end(), 0);
       std::string range_k_name = "webnn_GQA_range_k_" + std::to_string(kv_num_heads);
@@ -586,23 +608,21 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
           rotary_produced_bnsh ? std::vector<uint32_t>({1, kv_num_heads, 1})
                                : std::vector<uint32_t>({1, 1, kv_num_heads}));
       common_options.set("label", node.Name() + "_/GQA/scatter/range_k_expand");
-      range_k = model_builder.GetBuilder().call<emscripten::val>("expand", range_k, expand_shape, common_options);
+      range_k = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", range_k, expand_shape, common_options);
 
-      // Reshape all index components to [B,kv_N,S,1] or [B,S,kv_N,1] and concat to [...,3]
-      emscripten::val index_last_dim_shape = emscripten::val::array();
-      index_last_dim_shape.call<void>("push", key_for_scatter["shape"][0]);
-      index_last_dim_shape.call<void>("push", key_for_scatter["shape"][1]);
-      index_last_dim_shape.call<void>("push", key_for_scatter["shape"][2]);
-      index_last_dim_shape.call<void>("push", 1);
+      // Reshape all index components from [B,kv_N,S] or [B,S,kv_N] to [...,1] via unsqueeze(axes=[3])
+      // then concat on axis 3 to get [...,3]
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_reshape_last");
+      common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{3}));
       range_b = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", range_b, index_last_dim_shape, common_options);
+          "unsqueeze", range_b, common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_k_reshape_last");
       range_k = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", range_k, index_last_dim_shape, common_options);
+          "unsqueeze", range_k, common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_reshape_last");
       range_s = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", range_s, index_last_dim_shape, common_options);
+          "unsqueeze", range_s, common_options);
+      common_options.delete_("axes");
 
       common_options.set("label", node.Name() + "_/GQA/scatter/concat_for_scatter_indices");
       emscripten::val scatter_inputs = emscripten::val::array();
@@ -643,52 +663,99 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   emscripten::val true_present_value;
 
   if (group_size != 1) {
-    // Broadcast key and value for group query by reshape, expand and reshape.
+    // Broadcast key and value for group query by unsqueeze, expand, and dynamicReshape.
     // present kv shape (B,kv_N,P,H)
     //   B: batch size
     //   N: total number of attention heads (query heads)
     //   kv_N: number of key/value heads
     //   P: cache sequence axis used by attention (present/past kv length dimension)
     //   H: head size
-    // -> (B,kv_N,1,P,H) -> (B,kv_N,N/kv_N,P,H) -> (B,N,P,H) broadcasted kv shape
-    emscripten::val group_broadcast_tensor_shape_1 = emscripten::val::array();
-    group_broadcast_tensor_shape_1.call<void>("push", present_key["shape"][0]);
-    group_broadcast_tensor_shape_1.call<void>("push", present_key["shape"][1]);
-    group_broadcast_tensor_shape_1.call<void>("push", 1);
-    group_broadcast_tensor_shape_1.call<void>("push", present_key["shape"][2]);
-    group_broadcast_tensor_shape_1.call<void>("push", present_key["shape"][3]);
+    // -> unsqueeze(axes=[2]) -> (B,kv_N,1,P,H)
+    // -> dynamicExpand -> (B,kv_N,G,P,H)
+    // -> dynamicReshape -> (B,N,P,H) broadcasted kv shape
 
-    emscripten::val group_broadcast_tensor_shape_2 = emscripten::val::array();
-    group_broadcast_tensor_shape_2.call<void>("push", present_key["shape"][0]);
-    group_broadcast_tensor_shape_2.call<void>("push", present_key["shape"][1]);
-    group_broadcast_tensor_shape_2.call<void>("push", group_size);
-    group_broadcast_tensor_shape_2.call<void>("push", present_key["shape"][2]);
-    group_broadcast_tensor_shape_2.call<void>("push", present_key["shape"][3]);
-
-    emscripten::val group_broadcast_tensor_shape_3 = emscripten::val::array();
-    group_broadcast_tensor_shape_3.call<void>("push", present_key["shape"][0]);
-    group_broadcast_tensor_shape_3.call<void>("push", num_heads);
-    group_broadcast_tensor_shape_3.call<void>("push", present_key["shape"][2]);
-    group_broadcast_tensor_shape_3.call<void>("push", present_key["shape"][3]);
+    // Step 1: unsqueeze [B,kv_N,P,H] → [B,kv_N,1,P,H]
     common_options.set("label", node.Name() + "_/GQA/true_present_key/reshape_1");
+    common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{2}));
     true_present_key = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", present_key, group_broadcast_tensor_shape_1, common_options);
-    common_options.set("label", node.Name() + "_/GQA/true_present_key/expand");
-    true_present_key = model_builder.GetBuilder().call<emscripten::val>(
-        "expand", true_present_key, group_broadcast_tensor_shape_2, common_options);
-    common_options.set("label", node.Name() + "_/GQA/true_present_key/reshape_2");
-    true_present_key = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", true_present_key, group_broadcast_tensor_shape_3, common_options);
+        "unsqueeze", present_key, common_options);
+    common_options.delete_("axes");
 
+    // Step 2: dynamicExpand [B,kv_N,1,P,H] → [B,kv_N,G,P,H]
+    // Build expand shape [B,kv_N,G,P,H] from the 5D unsqueezed tensor with dim 2 = group_size.
+    // dynamicExpand needs uint32 shape, so build from shape() directly (not ComputeShape which casts).
+    std::string expand_5d_label = node.Name() + "_/GQA/true_present_key/expand";
+    emscripten::val expand_5d_shape_opts = emscripten::val::object();
+    expand_5d_shape_opts.set("label", expand_5d_label + "_shape");
+    emscripten::val expand_5d_shape_raw = model_builder.GetBuilder().call<emscripten::val>(
+        "shape", true_present_key, expand_5d_shape_opts);
+    // Replace dim 2 (which is 1) with group_size by building: [dim0, dim1, G, dim3, dim4]
+    emscripten::val expand_5d_segments = emscripten::val::array();
+    expand_5d_segments.call<void>("push", shape_utils::SliceShapeRange(
+        model_builder.GetBuilder(), expand_5d_shape_raw, 0, 2));
+    expand_5d_segments.call<void>("push", model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, static_cast<uint32_t>(group_size), {1}));
+    expand_5d_segments.call<void>("push", shape_utils::SliceShapeRange(
+        model_builder.GetBuilder(), expand_5d_shape_raw, 3, 2));
+    emscripten::val expand_5d_concat_opts = emscripten::val::object();
+    expand_5d_concat_opts.set("label", expand_5d_label + "_shape_concat");
+    emscripten::val expand_5d_target = model_builder.GetBuilder().call<emscripten::val>(
+        "concat", expand_5d_segments, 0, expand_5d_concat_opts);
+    common_options.set("label", expand_5d_label);
+    true_present_key = model_builder.GetBuilder().call<emscripten::val>(
+        "dynamicExpand", true_present_key, expand_5d_target, common_options);
+
+    // Step 3: dynamicReshape [B,kv_N,G,P,H] → [B,N,P,H]
+    // Use ComputeShape from present_key (original 4D [B,kv_N,P,H]): {0, num_heads, 0, 0}
+    // where dim 0=B from present_key, dim 1=N (static), dim 2=P from present_key, dim 3=H from present_key.
+    std::string reshape_4d_label = node.Name() + "_/GQA/true_present_key/reshape_2";
+    emscripten::val group_broadcast_tensor_shape_3 = shape_utils::ComputeShape(
+        model_builder, present_key,
+        {0, static_cast<int64_t>(num_heads), 0, 0},
+        reshape_4d_label);
+    common_options.set("label", reshape_4d_label);
+    true_present_key = model_builder.GetBuilder().call<emscripten::val>(
+        "dynamicReshape", true_present_key, group_broadcast_tensor_shape_3, common_options);
+
+    // Same for value:
+    // Step 1: unsqueeze [B,kv_N,P,H] → [B,kv_N,1,P,H]
     common_options.set("label", node.Name() + "_/GQA/true_present_value/reshape_1");
+    common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{2}));
     true_present_value = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", present_value, group_broadcast_tensor_shape_1, common_options);
+        "unsqueeze", present_value, common_options);
+    common_options.delete_("axes");
+
+    // Step 2: dynamicExpand [B,kv_N,1,P,H] → [B,kv_N,G,P,H]
+    // Reuse the same expand target shape (same dims apply to value).
+    emscripten::val expand_5d_val_shape_opts = emscripten::val::object();
+    expand_5d_val_shape_opts.set("label", node.Name() + "_/GQA/true_present_value/expand_shape");
+    emscripten::val expand_5d_val_shape_raw = model_builder.GetBuilder().call<emscripten::val>(
+        "shape", true_present_value, expand_5d_val_shape_opts);
+    emscripten::val expand_5d_val_segments = emscripten::val::array();
+    expand_5d_val_segments.call<void>("push", shape_utils::SliceShapeRange(
+        model_builder.GetBuilder(), expand_5d_val_shape_raw, 0, 2));
+    expand_5d_val_segments.call<void>("push", model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, static_cast<uint32_t>(group_size), {1}));
+    expand_5d_val_segments.call<void>("push", shape_utils::SliceShapeRange(
+        model_builder.GetBuilder(), expand_5d_val_shape_raw, 3, 2));
+    emscripten::val expand_5d_val_concat_opts = emscripten::val::object();
+    expand_5d_val_concat_opts.set("label", node.Name() + "_/GQA/true_present_value/expand_shape_concat");
+    emscripten::val expand_5d_val_target = model_builder.GetBuilder().call<emscripten::val>(
+        "concat", expand_5d_val_segments, 0, expand_5d_val_concat_opts);
     common_options.set("label", node.Name() + "_/GQA/true_present_value/expand");
     true_present_value = model_builder.GetBuilder().call<emscripten::val>(
-        "expand", true_present_value, group_broadcast_tensor_shape_2, common_options);
-    common_options.set("label", node.Name() + "_/GQA/true_present_value/reshape_2");
+        "dynamicExpand", true_present_value, expand_5d_val_target, common_options);
+
+    // Step 3: dynamicReshape [B,kv_N,G,P,H] → [B,N,P,H]
+    // Reuse same target shape from present_value (same structure as present_key).
+    std::string reshape_4d_val_label = node.Name() + "_/GQA/true_present_value/reshape_2";
+    emscripten::val group_broadcast_val_shape_3 = shape_utils::ComputeShape(
+        model_builder, present_value,
+        {0, static_cast<int64_t>(num_heads), 0, 0},
+        reshape_4d_val_label);
+    common_options.set("label", reshape_4d_val_label);
     true_present_value = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", true_present_value, group_broadcast_tensor_shape_3, common_options);
+        "dynamicReshape", true_present_value, group_broadcast_val_shape_3, common_options);
   } else {  // no need for broadcast
     true_present_key = present_key;
     true_present_value = present_value;
@@ -721,14 +788,29 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   emscripten::val value_int_one_constant =
       model_builder.CreateOrGetConstant<int>(ONNX_NAMESPACE::TensorProto_DataType_INT32, 1, {1});
 
-  emscripten::val mask_shape_ones_shape = emscripten::val::array();
-  mask_shape_ones_shape.call<void>("push", new_query["shape"][0]);
-  mask_shape_ones_shape.call<void>("push", new_query["shape"][1]);
-  mask_shape_ones_shape.call<void>("push", new_query["shape"][2]);
-  mask_shape_ones_shape.call<void>("push", true_present_value["shape"][2]);
+  // Build mask shape [B, N, S, P] from two operands:
+  // B, N, S from new_query [B,N,S,H] (dims 0,1,2); P from true_present_value [B,N,P,H] (dim 2).
+  emscripten::val mask_nq_shape_opts = emscripten::val::object();
+  mask_nq_shape_opts.set("label", node.Name() + "_/GQA/mask/new_query_shape");
+  emscripten::val mask_nq_shape = model_builder.GetBuilder().call<emscripten::val>(
+      "shape", new_query, mask_nq_shape_opts);
+  emscripten::val mask_tpv_shape_opts = emscripten::val::object();
+  mask_tpv_shape_opts.set("label", node.Name() + "_/GQA/mask/true_present_value_shape");
+  emscripten::val mask_tpv_shape = model_builder.GetBuilder().call<emscripten::val>(
+      "shape", true_present_value, mask_tpv_shape_opts);
+  // Concat: [B,N,S] from new_query dims 0..2, [P] from true_present_value dim 2
+  emscripten::val mask_shape_segments = emscripten::val::array();
+  mask_shape_segments.call<void>("push", shape_utils::SliceShapeRange(
+      model_builder.GetBuilder(), mask_nq_shape, 0, 3));
+  mask_shape_segments.call<void>("push", shape_utils::SliceShapeRange(
+      model_builder.GetBuilder(), mask_tpv_shape, 2, 1));
+  emscripten::val mask_shape_concat_opts = emscripten::val::object();
+  mask_shape_concat_opts.set("label", node.Name() + "_/GQA/mask/shape_concat");
+  emscripten::val mask_shape_ones_shape = model_builder.GetBuilder().call<emscripten::val>(
+      "concat", mask_shape_segments, 0, mask_shape_concat_opts);
   common_options.set("label", node.Name() + "_/GQA/GQA_mask_shape_ones/expand");
   emscripten::val mask_shape_ones_shape_constant = model_builder.GetBuilder().call<emscripten::val>(
-      "expand", value_int_one_constant, mask_shape_ones_shape, common_options);
+      "dynamicExpand", value_int_one_constant, mask_shape_ones_shape, common_options);
 
   emscripten::val cumsum_options = emscripten::val::object();
   cumsum_options.set("label", node.Name() + "_range_of_mask_shape");
@@ -738,11 +820,16 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       "cumulativeSum", mask_shape_ones_shape_constant, gsl::narrow<uint32_t>(3), cumsum_options);
 
   // Build range [1..S] for the query token positions.
-  emscripten::val range_s_ones_shape = emscripten::val::array();
-  range_s_ones_shape.call<void>("push", value_bsnh["shape"][1]);
+  // Get [S] from value_bsnh dim 1 via shape() → slice.
+  emscripten::val mask_vbsnh_shape_opts = emscripten::val::object();
+  mask_vbsnh_shape_opts.set("label", node.Name() + "_/GQA/mask/value_bsnh_shape");
+  emscripten::val mask_vbsnh_shape = model_builder.GetBuilder().call<emscripten::val>(
+      "shape", value_bsnh, mask_vbsnh_shape_opts);
+  emscripten::val range_s_ones_shape = shape_utils::SliceShapeRange(
+      model_builder.GetBuilder(), mask_vbsnh_shape, 1, 1);
   common_options.set("label", node.Name() + "_/GQA/mask/range_s_ones");
   emscripten::val range_s_plus_one = model_builder.GetBuilder().call<emscripten::val>(
-      "expand", value_int_one_constant, range_s_ones_shape, common_options);
+      "dynamicExpand", value_int_one_constant, range_s_ones_shape, common_options);
   emscripten::val range_cumsum_options = emscripten::val::object();
   range_cumsum_options.set("label", node.Name() + "_/GQA/mask/range_s_cumsum");
   range_cumsum_options.set("exclusive", false);
@@ -773,13 +860,20 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       "add", range_s_plus_one, scatter_pos_for_mask, common_options);
 
   // Expand to [total_seq, S] then transpose to [S, total_seq] for broadcasting with neq_left.
-  emscripten::val reshape_pre_neq_right = emscripten::val::array();
-  reshape_pre_neq_right.call<void>("push", true_present_value["shape"][2]);
-  reshape_pre_neq_right.call<void>("push", value_bsnh["shape"][1]);
+  // Build [P, S] shape from two operands: P from true_present_value dim 2, S from value_bsnh dim 1.
+  emscripten::val neq_expand_segments = emscripten::val::array();
+  neq_expand_segments.call<void>("push", shape_utils::SliceShapeRange(
+      model_builder.GetBuilder(), mask_tpv_shape, 2, 1));
+  neq_expand_segments.call<void>("push", shape_utils::SliceShapeRange(
+      model_builder.GetBuilder(), mask_vbsnh_shape, 1, 1));
+  emscripten::val neq_expand_concat_opts = emscripten::val::object();
+  neq_expand_concat_opts.set("label", node.Name() + "_/GQA/neq_right/expand_shape_concat");
+  emscripten::val reshape_pre_neq_right = model_builder.GetBuilder().call<emscripten::val>(
+      "concat", neq_expand_segments, 0, neq_expand_concat_opts);
 
   common_options.set("label", node.Name() + "_/GQA/expand_neq_right");
   emscripten::val expanded_neq_right = model_builder.GetBuilder().call<emscripten::val>(
-      "expand", pre_neq_right, reshape_pre_neq_right, common_options);
+      "dynamicExpand", pre_neq_right, reshape_pre_neq_right, common_options);
 
   transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({1, 0})));
   transpose_options.set("label", node.Name() + "_/GQA/neq_right/transpose");
@@ -837,16 +931,15 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   emscripten::val attn_mask = model_builder.GetBuilder().call<emscripten::val>(
       "where", condition, value_zero_constant_float, finfo_min_constant, common_options);
 
-  // Output shape: (B, S, N*H) — reshape from BNSH after attention
-  emscripten::val reshape_output_shape = emscripten::val::array();
-  reshape_output_shape.call<void>("push", new_query["shape"][0]);
-  reshape_output_shape.call<void>("push", new_query["shape"][2]);
-  reshape_output_shape.call<void>("push", qkv_hidden_size);
+  // Output shape: (B, S, N*H) — reshape from BNSH after attention.
+  // new_query is [B, N, S, H]; after SDPA transpose output is [B, S, N, H].
+  // ComputeShape on that with {0, 0, hidden} gives [B, S, hidden].
+  std::vector<int64_t> reshape_output_target{0, 0, static_cast<int64_t>(qkv_hidden_size)};
 
   // Execute ScaledDotProductAttention
   emscripten::val output =
       ScaledDotProductAttention(model_builder, node, logger, new_query, true_present_key, true_present_value,
-                                scale_constant, attn_mask, reshape_output_shape);
+                                scale_constant, attn_mask, reshape_output_target);
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   model_builder.AddOperand(node.OutputDefs()[1]->Name(), std::move(present_key));
