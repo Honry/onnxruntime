@@ -196,10 +196,9 @@ inline Status ApplyRotaryEmbedding(
 
     // Reshape [S] → [1, S] using unsqueeze.
     emscripten::val unsqueeze_options = emscripten::val::object();
-    unsqueeze_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0}));
     unsqueeze_options.set("label", node_name + "_rotary_position_ids_range_reshape");
     position_ids_range = wnn_builder.call<emscripten::val>(
-        "unsqueeze", position_ids_range, unsqueeze_options);
+        "unsqueeze", position_ids_range, emscripten::val::array(std::vector<uint32_t>{0}), unsqueeze_options);
 
     emscripten::val position_ids_add_range_options = emscripten::val::object();
     position_ids_add_range_options.set("label", node_name + "_rotary_position_ids_add_range");
@@ -224,14 +223,14 @@ inline Status ApplyRotaryEmbedding(
   emscripten::val cos_4d, sin_4d;
 
   // Reshape cos/sin cache [max_seq, half_dim] → [1, 1, max_seq, half_dim] via unsqueeze.
+  emscripten::val cache_axes = emscripten::val::array(std::vector<uint32_t>{0, 1});
   emscripten::val unsqueeze_cache_options = emscripten::val::object();
-  unsqueeze_cache_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0, 1}));
   unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_cos_cache");
   emscripten::val reshaped_cos = wnn_builder.call<emscripten::val>(
-      "unsqueeze", cos_cache, unsqueeze_cache_options);
+      "unsqueeze", cos_cache, cache_axes, unsqueeze_cache_options);
   unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_sin_cache");
   emscripten::val reshaped_sin = wnn_builder.call<emscripten::val>(
-      "unsqueeze", sin_cache, unsqueeze_cache_options);
+      "unsqueeze", sin_cache, cache_axes, unsqueeze_cache_options);
 
   // Get 1D position indices for gathering on axis=2.
   emscripten::val gather_indices_1d;

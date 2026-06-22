@@ -149,41 +149,49 @@ inline emscripten::val ComputeShape(ModelBuilder& model_builder,
         "reduceProduct", shape_op, reduce_options);
 
     // known_product = product of all other target dims (built from their segments).
-    // Build segments for all non-(-1) dims first, concat, then reduceProduct.
-    emscripten::val known_segments = emscripten::val::array();
-    for (size_t i = 0; i < target_dims.size(); ++i) {
-      if (target_dims[i] == -1) continue;
-      if (target_dims[i] == 0) {
-        const emscripten::val& idx = is_int64
-            ? model_builder.CreateOrGetConstant<int64_t>(data_type, static_cast<int64_t>(i), {})
-            : model_builder.CreateOrGetConstant<uint32_t>(data_type, static_cast<uint32_t>(i), {});
-        common_options.set("label", label + "_known_gather_" + std::to_string(i));
-        emscripten::val dim_scalar = wnn_builder.call<emscripten::val>(
-            "gather", shape_op, idx, common_options);
-        emscripten::val unsqueeze_options = emscripten::val::object();
-        unsqueeze_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0}));
-        unsqueeze_options.set("label", label + "_known_unsqueeze_" + std::to_string(i));
-        emscripten::val dim_1d = wnn_builder.call<emscripten::val>(
-            "unsqueeze", dim_scalar, unsqueeze_options);
-        known_segments.call<void>("push", dim_1d);
-      } else {
-        const emscripten::val& c = is_int64
-            ? model_builder.CreateOrGetConstant<int64_t>(data_type, target_dims[i], {1})
-            : model_builder.CreateOrGetConstant<uint32_t>(data_type, static_cast<uint32_t>(target_dims[i]), {1});
-        known_segments.call<void>("push", c);
+    // If there are no other dims (target is just [-1]), inferred_dim = total directly.
+    size_t non_infer_count = std::count_if(target_dims.begin(), target_dims.end(),
+                                           [](int64_t d) { return d != -1; });
+    if (non_infer_count == 0) {
+      // Only -1 in target: inferred_dim = total_elements (known_product = 1).
+      inferred_dim = total;
+    } else {
+      emscripten::val known_segments = emscripten::val::array();
+      for (size_t i = 0; i < target_dims.size(); ++i) {
+        if (target_dims[i] == -1) continue;
+        if (target_dims[i] == 0) {
+          const emscripten::val& idx = is_int64
+              ? model_builder.CreateOrGetConstant<int64_t>(data_type, static_cast<int64_t>(i), {})
+              : model_builder.CreateOrGetConstant<uint32_t>(data_type, static_cast<uint32_t>(i), {});
+          common_options.set("label", label + "_known_gather_" + std::to_string(i));
+          emscripten::val dim_scalar = wnn_builder.call<emscripten::val>(
+              "gather", shape_op, idx, common_options);
+          emscripten::val unsqueeze_options = emscripten::val::object();
+          unsqueeze_options.set("label", label + "_known_unsqueeze_" + std::to_string(i));
+          emscripten::val axes_arr = emscripten::val::array();
+          axes_arr.call<void>("push", 0u);
+          emscripten::val dim_1d = wnn_builder.call<emscripten::val>(
+              "unsqueeze", dim_scalar, axes_arr, unsqueeze_options);
+          known_segments.call<void>("push", dim_1d);
+        } else {
+          const emscripten::val& c = is_int64
+              ? model_builder.CreateOrGetConstant<int64_t>(data_type, target_dims[i], {1})
+              : model_builder.CreateOrGetConstant<uint32_t>(data_type, static_cast<uint32_t>(target_dims[i]), {1});
+          known_segments.call<void>("push", c);
+        }
       }
+      common_options.set("label", label + "_known_concat");
+      emscripten::val known_shape = wnn_builder.call<emscripten::val>(
+          "concat", known_segments, 0, common_options);
+
+      reduce_options.set("label", label + "_known_reduce");
+      emscripten::val known_product = wnn_builder.call<emscripten::val>(
+          "reduceProduct", known_shape, reduce_options);
+
+      // inferred_dim = total / known_product (scalar [1]-shaped)
+      common_options.set("label", label + "_infer_div");
+      inferred_dim = wnn_builder.call<emscripten::val>("div", total, known_product, common_options);
     }
-    common_options.set("label", label + "_known_concat");
-    emscripten::val known_shape = wnn_builder.call<emscripten::val>(
-        "concat", known_segments, 0, common_options);
-
-    reduce_options.set("label", label + "_known_reduce");
-    emscripten::val known_product = wnn_builder.call<emscripten::val>(
-        "reduceProduct", known_shape, reduce_options);
-
-    // inferred_dim = total / known_product (scalar [1]-shaped)
-    common_options.set("label", label + "_infer_div");
-    inferred_dim = wnn_builder.call<emscripten::val>("div", total, known_product, common_options);
   }
 
   // Step 3: Build per-dim segments for the final shape operand.
@@ -201,10 +209,11 @@ inline emscripten::val ComputeShape(ModelBuilder& model_builder,
           "gather", shape_op, idx, common_options);
 
       emscripten::val unsqueeze_options = emscripten::val::object();
-      unsqueeze_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0}));
       unsqueeze_options.set("label", label + "_unsqueeze_" + i_str);
+      emscripten::val axes_arr = emscripten::val::array();
+      axes_arr.call<void>("push", 0u);
       emscripten::val dim_1d = wnn_builder.call<emscripten::val>(
-          "unsqueeze", dim_scalar, unsqueeze_options);
+          "unsqueeze", dim_scalar, axes_arr, unsqueeze_options);
       segments.call<void>("push", dim_1d);
     } else if (target_dims[i] == -1) {
       // Div(total, known_product) already computed → [1]-shaped, push directly.

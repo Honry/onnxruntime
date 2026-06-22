@@ -227,9 +227,8 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     // Unsqueeze [B] → [B, 1] instead of dim-descriptor reshape.
     emscripten::val reshape_options = emscripten::val::object();
     reshape_options.set("label", node.Name() + "_/GQA/seqlens_k_reshape_for_position");
-    reshape_options.set("axes", emscripten::val::array(std::vector<uint32_t>{1}));
     emscripten::val reshaped_seqlens_k = model_builder.GetBuilder().call<emscripten::val>(
-        "unsqueeze", corrected_seqlens_k, reshape_options);
+        "unsqueeze", corrected_seqlens_k, emscripten::val::array(std::vector<uint32_t>{1}), reshape_options);
 
     // seqlens_k is INT32, but position_ids_range in ApplyRotaryEmbedding may be INT64
     // if int64 is supported. We need to cast to match the expected type.
@@ -517,10 +516,8 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
 
       // scatter_pos_for_scatter: [B] → [B,1,1] = unsqueeze(seqlens_k, axes=[1,2])
       common_options.set("label", node.Name() + "_/GQA/scatter/scatter_pos_reshape");
-      common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{1, 2}));
       emscripten::val scatter_pos_for_scatter = model_builder.GetBuilder().call<emscripten::val>(
-          "unsqueeze", seqlens_k_input, common_options);
-      common_options.delete_("axes");
+          "unsqueeze", seqlens_k_input, emscripten::val::array(std::vector<uint32_t>{1, 2}), common_options);
 
       // Correct scatter offset: seqlens_k - (S - 1) = past_sequence_length
       common_options.set("label", node.Name() + "_/GQA/scatter/scatter_pos_fix");
@@ -552,10 +549,8 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       range_b = model_builder.GetBuilder().call<emscripten::val>("sub", range_b, value_one_constant, common_options);
       // [B] → [B,1,1] via unsqueeze
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_reshape");
-      common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{1, 2}));
       range_b = model_builder.GetBuilder().call<emscripten::val>(
-          "unsqueeze", range_b, common_options);
-      common_options.delete_("axes");
+          "unsqueeze", range_b, emscripten::val::array(std::vector<uint32_t>{1, 2}), common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_expand");
       range_b = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", range_b, expand_shape, common_options);
 
@@ -578,17 +573,13 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       if (rotary_produced_bnsh) {
         // BNSH: S is dim 2 → unsqueeze axes=[0,1] gives [1,1,S]
         common_options.set("label", node.Name() + "_/GQA/scatter/range_s_reshape");
-        common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0, 1}));
         range_s = model_builder.GetBuilder().call<emscripten::val>(
-            "unsqueeze", range_s, common_options);
-        common_options.delete_("axes");
+            "unsqueeze", range_s, emscripten::val::array(std::vector<uint32_t>{0, 1}), common_options);
       } else {
         // BSNH: S is dim 1 → unsqueeze axes=[0,2] gives [1,S,1]
         common_options.set("label", node.Name() + "_/GQA/scatter/range_s_reshape");
-        common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0, 2}));
         range_s = model_builder.GetBuilder().call<emscripten::val>(
-            "unsqueeze", range_s, common_options);
-        common_options.delete_("axes");
+            "unsqueeze", range_s, emscripten::val::array(std::vector<uint32_t>{0, 2}), common_options);
       }
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_expand");
       range_s = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", range_s, expand_shape, common_options);
@@ -613,16 +604,14 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       // Reshape all index components from [B,kv_N,S] or [B,S,kv_N] to [...,1] via unsqueeze(axes=[3])
       // then concat on axis 3 to get [...,3]
       common_options.set("label", node.Name() + "_/GQA/scatter/range_b_reshape_last");
-      common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{3}));
       range_b = model_builder.GetBuilder().call<emscripten::val>(
-          "unsqueeze", range_b, common_options);
+          "unsqueeze", range_b, emscripten::val::array(std::vector<uint32_t>{3}), common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_k_reshape_last");
       range_k = model_builder.GetBuilder().call<emscripten::val>(
-          "unsqueeze", range_k, common_options);
+          "unsqueeze", range_k, emscripten::val::array(std::vector<uint32_t>{3}), common_options);
       common_options.set("label", node.Name() + "_/GQA/scatter/range_s_reshape_last");
       range_s = model_builder.GetBuilder().call<emscripten::val>(
-          "unsqueeze", range_s, common_options);
-      common_options.delete_("axes");
+          "unsqueeze", range_s, emscripten::val::array(std::vector<uint32_t>{3}), common_options);
 
       common_options.set("label", node.Name() + "_/GQA/scatter/concat_for_scatter_indices");
       emscripten::val scatter_inputs = emscripten::val::array();
@@ -676,10 +665,8 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
 
     // Step 1: unsqueeze [B,kv_N,P,H] → [B,kv_N,1,P,H]
     common_options.set("label", node.Name() + "_/GQA/true_present_key/reshape_1");
-    common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{2}));
     true_present_key = model_builder.GetBuilder().call<emscripten::val>(
-        "unsqueeze", present_key, common_options);
-    common_options.delete_("axes");
+        "unsqueeze", present_key, emscripten::val::array(std::vector<uint32_t>{2}), common_options);
 
     // Step 2: dynamicExpand [B,kv_N,1,P,H] → [B,kv_N,G,P,H]
     // Build expand shape [B,kv_N,G,P,H] from the 5D unsqueezed tensor with dim 2 = group_size.
@@ -720,10 +707,8 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     // Same for value:
     // Step 1: unsqueeze [B,kv_N,P,H] → [B,kv_N,1,P,H]
     common_options.set("label", node.Name() + "_/GQA/true_present_value/reshape_1");
-    common_options.set("axes", emscripten::val::array(std::vector<uint32_t>{2}));
     true_present_value = model_builder.GetBuilder().call<emscripten::val>(
-        "unsqueeze", present_value, common_options);
-    common_options.delete_("axes");
+        "unsqueeze", present_value, emscripten::val::array(std::vector<uint32_t>{2}), common_options);
 
     // Step 2: dynamicExpand [B,kv_N,1,P,H] → [B,kv_N,G,P,H]
     // Reuse the same expand target shape (same dims apply to value).

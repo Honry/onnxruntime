@@ -28,6 +28,8 @@ class SqueezeUnsqueezeOpBuilder : public BaseOpBuilder {
  private:
   bool IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node& node,
                          const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+  std::string_view GetEffectiveWebNNOpType(const Node& node,
+                                           const emscripten::val& wnn_limits) const override;
 };
 
 // Add operator related.
@@ -54,11 +56,10 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
   const auto input_rank = input_shape.size();
 
   // Resolve axes (always static — from attribute or constant initializer).
-  std::vector<int32_t> axes_data;
+  std::vector<uint32_t> axes_data;
   auto rank = input_rank;
 
   if (node.SinceVersion() >= 13 && !GetTensorName(input_defs, 1).empty()) {
-    // Input axes is provided, use axes initializer data.
     const auto& initializers = model_builder.GetInitializerTensors();
     const auto& axes_tensor = *initializers.at(input_defs[1]->Name());
     Initializer axes_initializer(axes_tensor);
@@ -68,7 +69,7 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
     }
     std::transform(
         axes_data_span.begin(), axes_data_span.end(), std::back_inserter(axes_data),
-        [rank](int64_t axis) -> int32_t { return SafeInt<int32_t>(HandleNegativeAxis(axis, rank)); });
+        [rank](int64_t axis) -> uint32_t { return SafeInt<uint32_t>(HandleNegativeAxis(axis, rank)); });
   } else {
     NodeAttrHelper helper(node);
     if (helper.HasAttr("axes")) {
@@ -78,43 +79,53 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
       }
       std::transform(
           axes.begin(), axes.end(), std::back_inserter(axes_data),
-          [rank](int64_t axis) -> int32_t { return SafeInt<int32_t>(HandleNegativeAxis(axis, rank)); });
+          [rank](int64_t axis) -> uint32_t { return SafeInt<uint32_t>(HandleNegativeAxis(axis, rank)); });
     }
   }
 
   // Sort axes in ascending order.
   std::sort(axes_data.begin(), axes_data.end());
 
+  ORT_RETURN_IF(op_type == "Unsqueeze" && axes_data.empty(),
+                "Unsqueeze requires axes to be specified.");
+
   emscripten::val options = emscripten::val::object();
   options.set("label", node.Name());
-  if (!axes_data.empty()) {
-    options.set("axes", emscripten::val::array(
-        std::vector<uint32_t>(axes_data.begin(), axes_data.end())));
-  }
 
   emscripten::val output = emscripten::val::undefined();
 
   if (HasDynamicShape(input_shape)) {
-    // Dynamic input: native ops are always available (introduced with dynamic shape support).
+    // Dynamic input: squeeze/unsqueeze are always available (introduced with dynamic shape support).
     if (op_type == "Squeeze") {
+      if (!axes_data.empty()) {
+        options.set("axes", emscripten::val::array(axes_data));
+      }
       output = model_builder.GetBuilder().call<emscripten::val>("squeeze", input, options);
     } else {
-      output = model_builder.GetBuilder().call<emscripten::val>("unsqueeze", input, options);
+      // WebNN: unsqueeze(input, axes, options)
+      output = model_builder.GetBuilder().call<emscripten::val>(
+          "unsqueeze", input, emscripten::val::array(axes_data), options);
     }
   } else {
-    // Static input: use native op if available, otherwise fall back to reshape.
+    // Static input: use squeeze/unsqueeze if supported, otherwise fall back to reshape.
     const emscripten::val& wnn_limits = model_builder.GetOpSupportLimits();
-    const bool has_native_op = (op_type == "Squeeze")
+    const bool has_op = (op_type == "Squeeze")
         ? !wnn_limits["squeeze"].isUndefined()
         : !wnn_limits["unsqueeze"].isUndefined();
 
-    if (has_native_op) {
+    if (has_op) {
       if (op_type == "Squeeze") {
+        if (!axes_data.empty()) {
+          options.set("axes", emscripten::val::array(axes_data));
+        }
         output = model_builder.GetBuilder().call<emscripten::val>("squeeze", input, options);
       } else {
-        output = model_builder.GetBuilder().call<emscripten::val>("unsqueeze", input, options);
+        // WebNN: unsqueeze(input, axes, options)
+        output = model_builder.GetBuilder().call<emscripten::val>(
+            "unsqueeze", input, emscripten::val::array(axes_data), options);
       }
     } else {
+      // Fallback: static reshape.
       std::vector<uint32_t> new_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
       if (op_type == "Squeeze") {
         if (!axes_data.empty()) {
@@ -126,14 +137,12 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
               std::remove(new_shape.begin(), new_shape.end(), 1u), new_shape.end());
         }
       } else {
-        for (const int32_t& axis : axes_data) {
+        for (const uint32_t& axis : axes_data) {
           new_shape.insert(new_shape.begin() + axis, 1);
         }
       }
-      emscripten::val reshape_options = emscripten::val::object();
-      reshape_options.set("label", node.Name());
       output = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", input, emscripten::val::array(new_shape), reshape_options);
+          "reshape", input, emscripten::val::array(new_shape), options);
     }
   }
 
@@ -170,6 +179,16 @@ bool SqueezeUnsqueezeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewe
   }
 
   return true;
+}
+
+std::string_view SqueezeUnsqueezeOpBuilder::GetEffectiveWebNNOpType(
+    const Node& node, const emscripten::val& wnn_limits) const {
+  const auto& op_type = node.OpType();
+  const std::string_view webnn_op = (op_type == "Squeeze") ? "squeeze" : "unsqueeze";
+  if (wnn_limits[std::string(webnn_op)].isUndefined()) {
+    return "reshape";
+  }
+  return webnn_op;
 }
 
 void CreateSqueezeUnsqueezeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {

@@ -46,6 +46,12 @@ class BaseOpBuilder : public IOpBuilder {
   virtual bool HasSupportedOutputsImpl(const Node& node, const emscripten::val& wnn_limits,
                                        const logging::Logger& logger) const;
 
+  // Returns the effective WebNN op type to check against wnn_limits.
+  // Default: returns the mapped op type from map_info.h.
+  // Override for ops with fallback (e.g., squeeze→reshape when native squeeze unavailable).
+  virtual std::string_view GetEffectiveWebNNOpType(const Node& node,
+                                                   const emscripten::val& wnn_limits) const;
+
   // ONNX Runtime only *guarantees* support for models stamped
   // with opset version 7 or above for opset domain 'ai.onnx'.
   // WebNN EP ignores node support for opset less than 7 by
