@@ -10,6 +10,7 @@
 
 #include "base_op_builder.h"
 #include "attention_helper.h"
+#include "shape_utils.h"
 
 // WebNN doesn't provide a dedicated op for RotaryEmbedding. Instead, we implement it by using a
 // combination of WebNN ops. The decomposition follows the OpenVINO RoPE fusion pattern
@@ -173,16 +174,14 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
     transpose_options.set("permutation", emscripten::val::array(permutation));
     input = wnn_builder.call<emscripten::val>("transpose", input, transpose_options);
   } else {
-    emscripten::val new_shape = emscripten::val::array();
-    // Use input.shape to avoid passing literal 0 for dynamic dimensions.
-    new_shape.call<void>("push", input["shape"][0]);
-    new_shape.call<void>("push", input["shape"][1]);
-    new_shape.call<void>("push", num_heads);
-    new_shape.call<void>("push", head_size);
+    // Reshape [B, S, hidden] → [B, S, num_heads, head_size]
+    std::vector<int64_t> target_dims{0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)};
+    emscripten::val shape_operand = shape_utils::ComputeShape(
+        model_builder, input, target_dims, node_name + "_reshape_input");
     emscripten::val reshape_input_options = emscripten::val::object();
     reshape_input_options.set("label", node_name + "_reshape_input");
     input = wnn_builder.call<emscripten::val>(
-        "reshape", input, new_shape, reshape_input_options);
+        "dynamicReshape", input, shape_operand, reshape_input_options);
   }
 
   // Apply rotary embedding using the helper function.
@@ -211,16 +210,14 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
     // The external Transpose(BNSH→BSNH) at input + internal Transpose(BSNH→BNSH) cancel each other,
     // and without a back-transpose, the optimizer has nothing to push through.
   } else {
-    // The output is in 3D shape, we need to reshape it back to the original shape.
-    // The output shape is same as the input shape.
-    emscripten::val output_shape = emscripten::val::array();
-    output_shape.call<void>("push", original_input["shape"][0]);
-    output_shape.call<void>("push", original_input["shape"][1]);
-    output_shape.call<void>("push", original_input["shape"][2]);
+    // Reshape [B, S, num_heads, head_size] → [B, S, hidden_size]
+    std::vector<int64_t> output_dims{0, 0, -1};
+    emscripten::val output_shape_op = shape_utils::ComputeShape(
+        model_builder, output, output_dims, node_name + "_reshape_output");
     emscripten::val reshape_output_options = emscripten::val::object();
     reshape_output_options.set("label", node_name + "_reshape_output");
     output = wnn_builder.call<emscripten::val>(
-      "reshape", output, output_shape, reshape_output_options);
+      "dynamicReshape", output, output_shape_op, reshape_output_options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
