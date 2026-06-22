@@ -27,13 +27,6 @@ class Logger;
 
 namespace webnn {
 
-struct FreeDimensionBound {
-  int32_t min_size{1};
-  int32_t max_size{0};
-};
-
-using FreeDimensionBounds = InlinedHashMap<std::string, FreeDimensionBound>;
-
 enum class WebnnDeviceType {
   CPU,
   GPU,
