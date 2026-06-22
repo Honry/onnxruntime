@@ -145,9 +145,9 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
     if (has_dynamic_spatial) {
       // Dynamic input: use unsqueeze (available with dynamic shape support).
       emscripten::val unsqueeze_input_options = emscripten::val::object();
-      unsqueeze_input_options.set("axes", emscripten::val::array(std::vector<uint32_t>{3}));
       unsqueeze_input_options.set("label", node.Name() + "_reshape_input");
-      input = model_builder.GetBuilder().call<emscripten::val>("unsqueeze", input, unsqueeze_input_options);
+      input = model_builder.GetBuilder().call<emscripten::val>(
+          "unsqueeze", input, emscripten::val::array(std::vector<uint32_t>{3}), unsqueeze_input_options);
     } else {
       // Static input: use reshape with concrete values.
       std::vector<uint32_t> new_input_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);

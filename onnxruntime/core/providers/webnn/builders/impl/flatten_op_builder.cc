@@ -18,7 +18,8 @@ class FlattenOpBuilder : public BaseOpBuilder {
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
-
+  std::string_view GetEffectiveWebNNOpType(const Node& node,
+                                           const emscripten::val& wnn_limits) const override;
 };
 
 // Add operator related.
@@ -43,13 +44,13 @@ Status FlattenOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   emscripten::val output = emscripten::val::undefined();
 
   if (HasDynamicShape(input_shape)) {
-    // Dynamic input: native flatten is always available (introduced with dynamic shape support).
+    // Dynamic input: flatten op is always available (introduced with dynamic shape support).
     emscripten::val flatten_options = emscripten::val::object();
     flatten_options.set("axis", axis);
     flatten_options.set("label", node.Name());
     output = model_builder.GetBuilder().call<emscripten::val>("flatten", input, flatten_options);
   } else {
-    // Static input: use native op if available, otherwise fall back to reshape.
+    // Static input: use flatten if supported, otherwise fall back to reshape.
     const emscripten::val& wnn_limits = model_builder.GetOpSupportLimits();
     if (!wnn_limits["flatten"].isUndefined()) {
       emscripten::val flatten_options = emscripten::val::object();
@@ -71,6 +72,14 @@ Status FlattenOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   return Status::OK();
+}
+
+std::string_view FlattenOpBuilder::GetEffectiveWebNNOpType(
+    const Node& /*node*/, const emscripten::val& wnn_limits) const {
+  if (wnn_limits["flatten"].isUndefined()) {
+    return "reshape";
+  }
+  return "flatten";
 }
 
 void CreateFlattenOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {

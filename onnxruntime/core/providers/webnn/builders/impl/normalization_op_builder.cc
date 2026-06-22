@@ -167,9 +167,9 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
             axes.push_back(static_cast<uint32_t>(i));
           }
           emscripten::val unsqueeze_options = emscripten::val::object();
-          unsqueeze_options.set("axes", emscripten::val::array(axes));
           unsqueeze_options.set("label", node.Name() + "_reshape_input");
-          input = model_builder.GetBuilder().call<emscripten::val>("unsqueeze", input, unsqueeze_options);
+          input = model_builder.GetBuilder().call<emscripten::val>(
+              "unsqueeze", input, emscripten::val::array(axes), unsqueeze_options);
         } else {
           // Static: use reshape with concrete values.
           std::vector<int64_t> new_shape(input_shape);
