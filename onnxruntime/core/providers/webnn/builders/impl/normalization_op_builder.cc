@@ -10,6 +10,7 @@
 #include "core/providers/webnn/builders/op_builder_factory.h"
 
 #include "base_op_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -157,37 +158,30 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
     // For models with dimensions greater than 4, the trailing dims are folded into one.
     constexpr size_t webnn_shape_rank = 4;
     if (input_shape.size() != webnn_shape_rank) {
-      // Build the 4D reshape target as a JS array. For dynamic dims (input_shape[i] == kDynamicDim)
-      // we copy the original dim descriptor object from the input operand's shape; for
-      // static dims we push the concrete unsigned value. This preserves the native dim
-      // descriptors required by WebNN for downstream ops like conv2d.
-      emscripten::val input_operand_shape = input["shape"];
-      emscripten::val new_shape = emscripten::val::array();
-
-      auto push_input_dim = [&](size_t i) {
-        if (input_shape[i] > 0) {
-          uint32_t dim_value = SafeInt<uint32_t>(input_shape[i]);
-          new_shape.call<void>("push", dim_value);
-        } else {
-          // Dynamic dim: copy the native descriptor from the input operand.
-          new_shape.call<void>("push", input_operand_shape[static_cast<uint32_t>(i)]);
-        }
-      };
-
       if (input_shape.size() < webnn_shape_rank) {
-        // Copy original dims, then pad with 1's at the tail to reach 4D.
-        for (size_t i = 0; i < input_shape.size(); ++i) {
-          push_input_dim(i);
-        }
-        for (size_t i = input_shape.size(); i < webnn_shape_rank; ++i) {
-          new_shape.call<void>("push", 1u);
+        // 3D → 4D: pad with size-1 dims at the tail.
+        if (HasDynamicShape(input_shape)) {
+          // Dynamic: use unsqueeze (available with dynamic shape support).
+          std::vector<uint32_t> axes;
+          for (size_t i = input_shape.size(); i < webnn_shape_rank; ++i) {
+            axes.push_back(static_cast<uint32_t>(i));
+          }
+          emscripten::val unsqueeze_options = emscripten::val::object();
+          unsqueeze_options.set("axes", emscripten::val::array(axes));
+          unsqueeze_options.set("label", node.Name() + "_reshape_input");
+          input = model_builder.GetBuilder().call<emscripten::val>("unsqueeze", input, unsqueeze_options);
+        } else {
+          // Static: use reshape with concrete values.
+          std::vector<int64_t> new_shape(input_shape);
+          while (new_shape.size() < webnn_shape_rank) new_shape.push_back(1);
+          std::vector<uint32_t> new_shape_u32 = GetNarrowedIntFromInt64<uint32_t>(new_shape);
+          emscripten::val reshape_options = emscripten::val::object();
+          reshape_options.set("label", node.Name() + "_reshape_input");
+          input = model_builder.GetBuilder().call<emscripten::val>(
+              "reshape", input, emscripten::val::array(new_shape_u32), reshape_options);
         }
       } else {
-        // 5D+: copy first 3 dims, then fold dims [3..end] into a single dim.
-        // Folding requires concrete (static) values for the folded range.
-        for (size_t i = 0; i < 3; ++i) {
-          push_input_dim(i);
-        }
+        // 5D+: fold dims [3..end] into a single dim. Folded dims must be static.
         uint32_t folded = 1;
         for (size_t i = 3; i < input_shape.size(); ++i) {
           ORT_RETURN_IF(input_shape[i] == kDynamicDim,
@@ -195,14 +189,15 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
                         " cannot be folded into 4D for WebNN.");
           folded *= SafeInt<uint32_t>(input_shape[i]);
         }
-        new_shape.call<void>("push", folded);
+        // Target: [dim0, dim1, dim2, folded] — first 3 dims may be dynamic.
+        std::vector<int64_t> target_dims{0, 0, 0, static_cast<int64_t>(folded)};
+        emscripten::val shape_operand = shape_utils::ComputeShape(
+            model_builder, input, target_dims, node.Name() + "_reshape_input");
+        emscripten::val reshape_input_options = emscripten::val::object();
+        reshape_input_options.set("label", node.Name() + "_reshape_input");
+        input = model_builder.GetBuilder().call<emscripten::val>(
+            "dynamicReshape", input, shape_operand, reshape_input_options);
       }
-      emscripten::val reshape_input_options = emscripten::val::object();
-      reshape_input_options.set("label", node.Name() + "_reshape_input");
-      input = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                               input,
-                                                               new_shape,
-                                                               reshape_input_options);
     }
 
     output = model_builder.GetBuilder().call<emscripten::val>("instanceNormalization", input, options);
@@ -210,25 +205,39 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
     // operand's shape descriptors so that dynamic dims preserve their native descriptors
     // and downstream consumers (Mul, Add, Conv2d) see the correct static channel dim.
     if (input_shape.size() != webnn_shape_rank) {
-      const NodeArg* original_input_def = input_defs[0];
-      // Re-fetch the original input operand (input variable was reassigned above).
-      const emscripten::val& original_input = model_builder.GetOperand(original_input_def->Name());
-      emscripten::val original_shape = original_input["shape"];
-      emscripten::val output_shape = emscripten::val::array();
-      for (size_t i = 0; i < input_shape.size(); ++i) {
-        if (input_shape[i] > 0) {
-          uint32_t dim_value = SafeInt<uint32_t>(input_shape[i]);
-          output_shape.call<void>("push", dim_value);
+      if (input_shape.size() < webnn_shape_rank) {
+        // 4D → 3D: remove the padded tail dims.
+        if (HasDynamicShape(input_shape)) {
+          // Dynamic: use squeeze (available with dynamic shape support).
+          std::vector<uint32_t> squeeze_axes;
+          for (size_t i = input_shape.size(); i < webnn_shape_rank; ++i) {
+            squeeze_axes.push_back(static_cast<uint32_t>(i));
+          }
+          emscripten::val squeeze_options = emscripten::val::object();
+          squeeze_options.set("axes", emscripten::val::array(squeeze_axes));
+          squeeze_options.set("label", node.Name() + "_reshape_output");
+          output = model_builder.GetBuilder().call<emscripten::val>("squeeze", output, squeeze_options);
         } else {
-          output_shape.call<void>("push", original_shape[static_cast<uint32_t>(i)]);
+          // Static: reshape back to original shape.
+          std::vector<uint32_t> orig_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
+          emscripten::val reshape_options = emscripten::val::object();
+          reshape_options.set("label", node.Name() + "_reshape_output");
+          output = model_builder.GetBuilder().call<emscripten::val>(
+              "reshape", output, emscripten::val::array(orig_shape), reshape_options);
         }
+      } else {
+        // 4D → 5D+: unfold the last dim back to original trailing dims.
+        // Use ComputeShape on the original input to get the original shape, then dynamicReshape.
+        const emscripten::val& original_input = model_builder.GetOperand(input_defs[0]->Name());
+        // target_dims: all 0 (gather every dim from original input's shape).
+        std::vector<int64_t> target_dims(input_shape.size(), 0);
+        emscripten::val shape_operand = shape_utils::ComputeShape(
+            model_builder, original_input, target_dims, node.Name() + "_reshape_output");
+        emscripten::val reshape_output_options = emscripten::val::object();
+        reshape_output_options.set("label", node.Name() + "_reshape_output");
+        output = model_builder.GetBuilder().call<emscripten::val>(
+            "dynamicReshape", output, shape_operand, reshape_output_options);
       }
-      emscripten::val reshape_output_options = emscripten::val::object();
-      reshape_output_options.set("label", node.Name() + "_reshape_output");
-      output = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                                output,
-                                                                output_shape,
-                                                                reshape_output_options);
     }
   } else {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT, "Unsupported normalization op: ", op_type);

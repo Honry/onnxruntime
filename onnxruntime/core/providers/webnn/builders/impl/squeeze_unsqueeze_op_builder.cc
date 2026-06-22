@@ -10,10 +10,7 @@
 
 #include "core/optimizer/initializer.h"
 
-#include <set>
-
 #include "base_op_builder.h"
-#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -88,75 +85,56 @@ Status SqueezeUnsqueezeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_buil
   // Sort axes in ascending order.
   std::sort(axes_data.begin(), axes_data.end());
 
-  emscripten::val output = emscripten::val::undefined();
-  const emscripten::val& wnn_limits = model_builder.GetOpSupportLimits();
-  const bool has_native_op = (op_type == "Squeeze")
-      ? !wnn_limits["squeeze"].isUndefined()
-      : !wnn_limits["unsqueeze"].isUndefined();
+  emscripten::val options = emscripten::val::object();
+  options.set("label", node.Name());
+  if (!axes_data.empty()) {
+    options.set("axes", emscripten::val::array(
+        std::vector<uint32_t>(axes_data.begin(), axes_data.end())));
+  }
 
-  if (has_native_op) {
-    emscripten::val options = emscripten::val::object();
-    options.set("label", node.Name());
-    if (!axes_data.empty()) {
-      options.set("axes", emscripten::val::array(
-          std::vector<uint32_t>(axes_data.begin(), axes_data.end())));
-    }
+  emscripten::val output = emscripten::val::undefined();
+
+  if (HasDynamicShape(input_shape)) {
+    // Dynamic input: native ops are always available (introduced with dynamic shape support).
     if (op_type == "Squeeze") {
       output = model_builder.GetBuilder().call<emscripten::val>("squeeze", input, options);
     } else {
       output = model_builder.GetBuilder().call<emscripten::val>("unsqueeze", input, options);
     }
-  } else if (!HasDynamicShape(input_shape)) {
-    // Fallback: use static reshape when native op not available.
-    std::vector<uint32_t> new_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
-    if (op_type == "Squeeze") {
-      if (!axes_data.empty()) {
-        for (auto it = axes_data.rbegin(); it != axes_data.rend(); ++it) {
-          new_shape.erase(new_shape.begin() + *it);
-        }
+  } else {
+    // Static input: use native op if available, otherwise fall back to reshape.
+    const emscripten::val& wnn_limits = model_builder.GetOpSupportLimits();
+    const bool has_native_op = (op_type == "Squeeze")
+        ? !wnn_limits["squeeze"].isUndefined()
+        : !wnn_limits["unsqueeze"].isUndefined();
+
+    if (has_native_op) {
+      if (op_type == "Squeeze") {
+        output = model_builder.GetBuilder().call<emscripten::val>("squeeze", input, options);
       } else {
-        new_shape.erase(
-            std::remove(new_shape.begin(), new_shape.end(), 1u), new_shape.end());
+        output = model_builder.GetBuilder().call<emscripten::val>("unsqueeze", input, options);
       }
     } else {
-      for (const int32_t& axis : axes_data) {
-        new_shape.insert(new_shape.begin() + axis, 1);
-      }
-    }
-    emscripten::val options = emscripten::val::object();
-    options.set("label", node.Name());
-    output = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", input, emscripten::val::array(new_shape), options);
-  } else {
-    // Dynamic input without native op: use ComputeShape + dynamicReshape.
-    std::vector<int64_t> target_dims;
-    if (op_type == "Squeeze") {
-      std::set<int32_t> axes_set(axes_data.begin(), axes_data.end());
-      for (size_t i = 0; i < input_rank; ++i) {
-        if (axes_set.count(static_cast<int32_t>(i)) == 0) {
-          target_dims.push_back(0);
-        }
-      }
-    } else {  // Unsqueeze
-      size_t input_dim = 0;
-      size_t axes_idx = 0;
-      const auto output_rank = rank;
-      for (size_t i = 0; i < output_rank; ++i) {
-        if (axes_idx < axes_data.size() && axes_data[axes_idx] == static_cast<int32_t>(i)) {
-          target_dims.push_back(1);
-          axes_idx++;
+      std::vector<uint32_t> new_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
+      if (op_type == "Squeeze") {
+        if (!axes_data.empty()) {
+          for (auto it = axes_data.rbegin(); it != axes_data.rend(); ++it) {
+            new_shape.erase(new_shape.begin() + *it);
+          }
         } else {
-          target_dims.push_back(0);
-          input_dim++;
+          new_shape.erase(
+              std::remove(new_shape.begin(), new_shape.end(), 1u), new_shape.end());
+        }
+      } else {
+        for (const int32_t& axis : axes_data) {
+          new_shape.insert(new_shape.begin() + axis, 1);
         }
       }
+      emscripten::val reshape_options = emscripten::val::object();
+      reshape_options.set("label", node.Name());
+      output = model_builder.GetBuilder().call<emscripten::val>(
+          "reshape", input, emscripten::val::array(new_shape), reshape_options);
     }
-    emscripten::val shape_operand = shape_utils::ComputeShape(
-        model_builder, input, target_dims, node.Name());
-    emscripten::val options = emscripten::val::object();
-    options.set("label", node.Name());
-    output = model_builder.GetBuilder().call<emscripten::val>(
-        "dynamicReshape", input, shape_operand, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));

@@ -90,36 +90,26 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   // We need to reshape them to make them broadcastable with the input tensor.
   if (scale_shape.size() == 1 && input_rank > 1 &&
       block_size == 0) {
-    // Insert ones before and after the axis dimension for broadcasting of scale tensor.
-    // Use emscripten::val::array() to support dynamic axis dim via input["shape"][axis].
-    emscripten::val target_shape = emscripten::val::array();
-    for (size_t i = 0; i < input_rank; ++i) {
-      if (static_cast<int32_t>(i) == axis) {
-        target_shape.call<void>("push", input["shape"][axis]);
-      } else {
-        target_shape.call<void>("push", 1u);
-      }
-    }
-    // zero_point has the same shape as the scale tensor.
-    // For zero_point_shape (used when creating default zero_point), we still need uint32_t values.
-    // If axis dim is dynamic, set it to 0 as placeholder (won't be used if has_zero_point is true).
+    // Insert ones before and after the axis dimension for broadcasting.
     zero_point_shape.resize(input_rank, 1);
     if (input_shape[axis] > 0) {
       zero_point_shape[axis] = SafeInt<uint32_t>(input_shape[axis]);
     }
-    common_options.set("label", node.Name() + "_reshape_scale");
-    scale = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                             scale,
-                                                             target_shape,
-                                                             common_options);
 
+    // Scale/zero_point are always static (constants). Use reshape with concrete values.
+    std::vector<uint32_t> target_shape(input_rank, 1);
+    if (input_shape[axis] > 0) {
+      target_shape[axis] = SafeInt<uint32_t>(input_shape[axis]);
+    } else {
+      target_shape[axis] = SafeInt<uint32_t>(scale_shape[0]);
+    }
+    common_options.set("label", node.Name() + "_reshape_scale");
+    scale = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", scale, emscripten::val::array(target_shape), common_options);
     if (has_zero_point) {
-      // Reshape the zero_point tensor too.
       common_options.set("label", node.Name() + "_reshape_zero_point");
-      zero_point = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                                    zero_point,
-                                                                    target_shape,
-                                                                    common_options);
+      zero_point = model_builder.GetBuilder().call<emscripten::val>(
+          "reshape", zero_point, emscripten::val::array(target_shape), common_options);
     }
   }
 
