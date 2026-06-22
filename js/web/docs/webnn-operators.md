@@ -41,7 +41,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Erf | ai.onnx(7-9, 10-12, 13+) | erf | |
 | Exp | ai.onnx(7-12, 13+) | exp | |
 | Expand | ai.onnx(8-12, 13+) | expand, dynamicExpand | |
-| Flatten | ai.onnx(7-8, 9-10, 11-12, 13-20, 21+) | reshape | |
+| Flatten | ai.onnx(7-8, 9-10, 11-12, 13-20, 21+) | flatten | |
 | Floor | ai.onnx(7-12, 13+) | floor | |
 | Gather | ai.onnx(7-10, 11-12, 13+) | gather | |
 | GatherBlockQuantized | com.microsoft(1+) | dequantizeLinear, gather | |
@@ -118,13 +118,13 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Softmax | ai.onnx(7-10, 11-12, 13+) | softmax | |
 | Split | ai.onnx(7-10, 11-12, 13-17, 18+) | split, dynamicSplit | |
 | Sqrt | ai.onnx(7-12, 13+) | sqrt | |
-| Squeeze | ai.onnx(7-10, 11-12, 13-20, 21+) | reshape, dynamicReshape, shape, slice, concat | Input 'axes' if present should be a constant. Squeeze without explicit axes requires static input shape |
+| Squeeze | ai.onnx(7-10, 11-12, 13-20, 21+) | squeeze | Input 'axes' if present should be a constant |
 | Sub | ai.onnx(7-12, 13, 14+) | sub | |
 | Tan | ai.onnx(7+) | tan | |
 | Tanh | ai.onnx(7-12, 13+) | tanh | |
 | Tile | ai.onnx(7-12, 13+) | tile, dynamicTile | |
 | Transpose | ai.onnx(7-12, 13-20, 21+) | transpose | |
 | Trilu | ai.onnx(14+) | triangular | Input 'k' (option 'diagonal' for WebNN) if present should be a constant |
-| Unsqueeze | ai.onnx(7-10, 11-12, 13-20, 21+) | reshape, dynamicReshape, shape, slice, concat | Input 'axes' if present should be a constant |
+| Unsqueeze | ai.onnx(7-10, 11-12, 13-20, 21+) | unsqueeze | Input 'axes' if present should be a constant |
 | Where | ai.onnx(7-8, 9-15, 16+) | where | |
 | Xor | ai.onnx(7+) | logicalXor | |
