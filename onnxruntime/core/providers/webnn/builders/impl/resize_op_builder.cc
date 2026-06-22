@@ -231,8 +231,8 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     }
 
     output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, sizes_operand, options);
-  } else {
-    // Constant path: resolve scales/sizes at build time and use WebNN resample2d.
+  } else if (!HasDynamicShape(input_shape)) {
+    // Static path: input is all-static, use WebNN resample2d.
     if (is_constant_sizes) {
       std::vector<int64_t> sizes;
       ORT_RETURN_IF_NOT(GetResizeSizesAndAxes(model_builder.GetGraphViewer(), node, sizes, axes, input_shape, logger),
@@ -250,6 +250,23 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     options.set("axes", emscripten::val::array(webnn_axes));
 
     output = model_builder.GetBuilder().call<emscripten::val>("resample2d", input, options);
+  } else {
+    // Dynamic input with constant sizes: use dynamicResample2d with constant sizes operand.
+    if (axes.empty()) {
+      axes = {2, 3};
+    }
+    std::vector<int64_t> sizes;
+    ORT_RETURN_IF_NOT(GetResizeSizesAndAxes(model_builder.GetGraphViewer(), node, sizes, axes, input_shape, logger),
+                      "Error getting Resize sizes");
+    std::vector<uint32_t> webnn_sizes = GetNarrowedIntFromInt64<uint32_t>(sizes);
+    const emscripten::val& sizes_operand = model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_sizes",
+        webnn_sizes, {static_cast<uint32_t>(webnn_sizes.size())});
+
+    std::vector<uint32_t> webnn_axes = GetNarrowedIntFromInt64<uint32_t>(axes);
+    options.set("axes", emscripten::val::array(webnn_axes));
+
+    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, sizes_operand, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));

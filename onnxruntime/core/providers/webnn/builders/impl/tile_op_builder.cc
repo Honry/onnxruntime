@@ -54,9 +54,12 @@ Status TileOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   const auto& initializers(model_builder.GetInitializerTensors());
   const bool is_constant_repetitions = initializers.count(input_defs[1]->Name()) > 0;
 
+  std::vector<int64_t> input_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
+
   emscripten::val output = emscripten::val::undefined();
-  if (is_constant_repetitions) {
-    // Static path: read repetitions at build time and use WebNN tile.
+  if (is_constant_repetitions && !HasDynamicShape(input_shape)) {
+    // Static path: input is all-static and repetitions are constant.
     const auto& repetitions_initializer = *initializers.at(input_defs[1]->Name());
     const int64_t* raw_repetitions_data = repetitions_initializer.int64_data().empty()
                                               ? reinterpret_cast<const int64_t*>(repetitions_initializer.raw_data().data())
@@ -71,8 +74,23 @@ Status TileOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                                               input,
                                                               emscripten::val::array(repetitions),
                                                               options);
+  } else if (is_constant_repetitions) {
+    // Constant repetitions but dynamic input: create operand from constant data for dynamicTile.
+    const auto& repetitions_initializer = *initializers.at(input_defs[1]->Name());
+    const int64_t* raw_repetitions_data = repetitions_initializer.int64_data().empty()
+                                              ? reinterpret_cast<const int64_t*>(repetitions_initializer.raw_data().data())
+                                              : repetitions_initializer.int64_data().data();
+    const auto size = repetitions_initializer.dims()[0];
+    std::vector<uint32_t> repetitions;
+    for (int64_t i = 0; i < size; ++i) {
+      repetitions.push_back(SafeInt<uint32_t>(raw_repetitions_data[i]));
+    }
+    const emscripten::val& repetitions_operand = model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_repetitions",
+        repetitions, {static_cast<uint32_t>(size)});
+    output = model_builder.GetBuilder().call<emscripten::val>("dynamicTile", input, repetitions_operand, options);
   } else {
-    // Dynamic path: pass repetitions as MLOperand to dynamicTile.
+    // Non-constant repetitions: use operand directly for dynamicTile.
     emscripten::val repetitions_operand = model_builder.GetOperand(input_defs[1]->Name());
     output = model_builder.GetBuilder().call<emscripten::val>("dynamicTile", input, repetitions_operand, options);
   }

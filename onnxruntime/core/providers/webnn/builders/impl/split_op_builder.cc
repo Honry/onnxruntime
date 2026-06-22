@@ -88,21 +88,36 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       split_count = node.OutputDefs().size();
     }
 
-    // Check that the splits evenly divide.
-    // When axis dim is dynamic (0 from GetShape), skip uneven-split computation;
-    // WebNN split with split_count will handle even division at runtime.
-    if (split_count > 0 && splits.empty() && input_shape[axis] > 0 && input_shape[axis] % split_count != 0) {
-      // Divide inputs into variable size outputs:
-      splits.insert(splits.end(), split_count - 1, SafeInt<uint32_t>(input_shape[axis]) / split_count);
-      splits.insert(splits.end(), SafeInt<uint32_t>(input_shape[axis]) % split_count);
-    }
+    if (!HasDynamicShape(input_shape)) {
+      // Static input: use WebNN static split.
+      if (split_count > 0 && splits.empty() && input_shape[axis] % split_count != 0) {
+        splits.insert(splits.end(), split_count - 1, SafeInt<uint32_t>(input_shape[axis]) / split_count);
+        splits.insert(splits.end(), SafeInt<uint32_t>(input_shape[axis]) % split_count);
+      }
 
-    if (splits.empty()) {
-      output_array = model_builder.GetBuilder().call<emscripten::val>(
-          "split", input, split_count, options);
+      if (splits.empty()) {
+        output_array = model_builder.GetBuilder().call<emscripten::val>(
+            "split", input, split_count, options);
+      } else {
+        output_array = model_builder.GetBuilder().call<emscripten::val>(
+            "split", input, emscripten::val::array(splits), options);
+      }
     } else {
-      output_array = model_builder.GetBuilder().call<emscripten::val>(
-          "split", input, emscripten::val::array(splits), options);
+      // Dynamic input with constant splits: use dynamicSplit with a constant operand.
+      if (split_count > 0 && splits.empty()) {
+        // Even split: each output gets axis_dim / split_count.
+        // Create a splits operand with split_count equal values — but we don't know axis dim.
+        // dynamicSplit with split_count should work the same as static split.
+        output_array = model_builder.GetBuilder().call<emscripten::val>(
+            "dynamicSplit", input, split_count, options);
+      } else {
+        // Explicit splits: create a constant operand.
+        const emscripten::val& splits_operand = model_builder.CreateOrGetConstant<uint32_t>(
+            ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_splits",
+            splits, {static_cast<uint32_t>(splits.size())});
+        output_array = model_builder.GetBuilder().call<emscripten::val>(
+            "dynamicSplit", input, splits_operand, options);
+      }
     }
   }
 
