@@ -12,6 +12,7 @@
 #include "core/providers/webnn/builders/op_builder_factory.h"
 
 #include "base_op_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -58,7 +59,7 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   emscripten::val output = emscripten::val::undefined();
   if (is_constant_shape) {
-    // Constant shape path: resolve the target shape at build time and use WebNN reshape.
+    // Constant shape path: resolve the target shape at build time.
     const auto& target_shape_tensor = *initializers.at(input_defs[1]->Name());
     const auto& target_shape_tensor_dims = target_shape_tensor.dims();
 
@@ -67,161 +68,50 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                             ? reinterpret_cast<const int64_t*>(target_shape_tensor.raw_data().data())
                                             : target_shape_tensor.int64_data().data();
 
-      const auto size = target_shape_tensor_dims[0];
+      const size_t size = static_cast<size_t>(target_shape_tensor_dims[0]);
       TensorShapeVector target_shape{raw_target_shape, raw_target_shape + size};
       std::vector<int64_t> input_shape;
       ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get shape");
 
       if (!HasDynamicShape(input_shape)) {
-        // ReshapeHelper validates the reshape and resolves -1 to a concrete value.
+        // STATIC PATH: all input dims are known, resolve 0/-1 to concrete values.
         ReshapeHelper helper(TensorShape(input_shape), target_shape);
-      }
-
-      // Build the new shape array. input["shape"][i] returns the dim descriptor object
-      // for dynamic dims and a plain integer for static dims, so it works in both cases.
-      emscripten::val new_shape = emscripten::val::array();
-      for (size_t i = 0; i < static_cast<size_t>(size); ++i) {
-        if (target_shape[i] == 0) {
-          // ONNX allowzero=0 semantics: copy from input at the same axis.
-          new_shape.call<void>("push", input["shape"][static_cast<uint32_t>(i)]);
-        } else if (target_shape[i] == -1) {
-          // Only reached when has_dynamic_input (ReshapeHelper resolves -1 otherwise).
-          //
-          // Try to reuse an input dim descriptor instead of creating a new one.
-          // When reshape merely splits/merges static dimensions (e.g., [B, S, 3840] → [B, S, 30, 128]),
-          // the -1 dim is mathematically equal to an existing input dimension. Reusing that input's
-          // dim descriptor preserves static dim info.
-          bool reused_dim = false;
-
-          // Find the single unclaimed dynamic input dim and compute static products.
-          std::vector<bool> claimed(input_shape.size(), false);
-          for (size_t t = 0; t < static_cast<size_t>(size); ++t) {
-            if (target_shape[t] == 0 && t < input_shape.size()) {
-              claimed[t] = true;
-            }
-          }
-
-          int64_t static_target_product = 1;
-          for (size_t t = 0; t < static_cast<size_t>(size); ++t) {
-            if (target_shape[t] > 0) {
-              static_target_product *= target_shape[t];
-            }
-          }
-
-          int64_t static_input_product = 1;
-          int unclaimed_dynamic_count = 0;
-          int unclaimed_dynamic_idx = -1;
-          for (size_t j = 0; j < input_shape.size(); ++j) {
-            if (claimed[j]) continue;
-            if (input_shape[j] == kDynamicDim) {
-              unclaimed_dynamic_count++;
-              unclaimed_dynamic_idx = static_cast<int>(j);
-            } else {
-              static_input_product *= input_shape[j];
-            }
-          }
-
-          if (unclaimed_dynamic_count == 1) {
-            if (static_input_product == static_target_product) {
-              // Direct case: -1 equals the single unclaimed dynamic input dim. Reuse its descriptor.
-              new_shape.call<void>("push", input["shape"][static_cast<uint32_t>(unclaimed_dynamic_idx)]);
-              reused_dim = true;
-            } else if (static_input_product > 0 && static_target_product > 0) {
-              // Check provenance: the input's dynamic dim may itself be a scaled version of an
-              // original dim. If this reshape inverts the scaling (merge-then-split pattern),
-              // we can reuse the original source descriptor.
-              emscripten::val input_dim_val = input["shape"][static_cast<uint32_t>(unclaimed_dynamic_idx)];
-              if (input_dim_val.typeOf().as<std::string>() == "object" &&
-                  !input_dim_val["name"].isUndefined()) {
-                std::string dim_name = input_dim_val["name"].as<std::string>();
-                const auto* prov = model_builder.GetDimProvenance(dim_name);
-                if (prov != nullptr) {
-                  int64_t new_factor_num = prov->factor_num * static_input_product;
-                  int64_t new_factor_den = prov->factor_den * static_target_product;
-                  if (new_factor_num == new_factor_den) {
-                    // Factor is 1: -1 equals the original source dim. Reuse its descriptor.
-                    const emscripten::val& source_operand =
-                        model_builder.GetOperand(prov->source_operand_name);
-                    new_shape.call<void>("push",
-                                         source_operand["shape"][prov->source_dim_index]);
-                    reused_dim = true;
-                  }
-                }
-              }
-            }
-          }
-
-          if (!reused_dim) {
-            // Fall back: use the output shape proto's dim_param/dim_value if available so that all
-            // Reshape nodes inferring the same symbolic dimension share the same dim descriptor name.
-            const auto* output_shape_proto = node.OutputDefs()[0]->Shape();
-            std::string new_dim_name;
-            if (output_shape_proto && static_cast<int>(i) < output_shape_proto->dim_size()) {
-              const auto& dim = output_shape_proto->dim(static_cast<int>(i));
-              if (dim.has_dim_value()) {
-                uint32_t dim_value = SafeInt<uint32_t>(dim.dim_value());
-                new_shape.call<void>("push", dim_value);
-              } else {
-                new_dim_name = dim.has_dim_param() ? dim.dim_param()
-                                                   : node.Name() + "_inferred";
-                emscripten::val dim_desc = emscripten::val::object();
-                dim_desc.set("name", emscripten::val(new_dim_name));
-                new_shape.call<void>("push", dim_desc);
-              }
-            } else {
-              new_dim_name = node.Name() + "_inferred";
-              emscripten::val dim_desc = emscripten::val::object();
-              dim_desc.set("name", emscripten::val(new_dim_name));
-              new_shape.call<void>("push", dim_desc);
-            }
-
-            // Record provenance for this new dim descriptor so future reshapes can trace back.
-            if (!new_dim_name.empty() && unclaimed_dynamic_count == 1 &&
-                static_input_product > 0 && static_target_product > 0) {
-              emscripten::val input_dim_val = input["shape"][static_cast<uint32_t>(unclaimed_dynamic_idx)];
-              if (input_dim_val.typeOf().as<std::string>() == "object" &&
-                  !input_dim_val["name"].isUndefined()) {
-                std::string input_dim_name = input_dim_val["name"].as<std::string>();
-                const auto* prov = model_builder.GetDimProvenance(input_dim_name);
-                if (prov != nullptr) {
-                  // Chain: new = source * (old_factor * P_in / P_out)
-                  model_builder.RecordDimProvenance(new_dim_name, {
-                      prov->source_operand_name,
-                      prov->source_dim_index,
-                      prov->factor_num * static_input_product,
-                      prov->factor_den * static_target_product,
-                  });
-                } else {
-                  model_builder.RecordDimProvenance(new_dim_name, {
-                      input_defs[0]->Name(),
-                      static_cast<uint32_t>(unclaimed_dynamic_idx),
-                      static_input_product,
-                      static_target_product,
-                  });
-                }
-              } else {
-                model_builder.RecordDimProvenance(new_dim_name, {
-                    input_defs[0]->Name(),
-                    static_cast<uint32_t>(unclaimed_dynamic_idx),
-                    static_input_product,
-                    static_target_product,
-                });
-              }
-            }
-          }
-        } else {
-          uint32_t dim_value = SafeInt<uint32_t>(target_shape[i]);
-          new_shape.call<void>("push", dim_value);
+        // After ReshapeHelper, target_shape has all concrete positive values.
+        // Replace any remaining 0 with input_shape[i] (ReshapeHelper already does this).
+        std::vector<uint32_t> new_shape;
+        new_shape.reserve(size);
+        for (size_t i = 0; i < size; ++i) {
+          new_shape.push_back(SafeInt<uint32_t>(target_shape[i]));
         }
+        output = model_builder.GetBuilder().call<emscripten::val>(
+            "reshape", input, emscripten::val::array(new_shape), options);
+      } else {
+        // DYNAMIC PATH: input has dynamic dims. Build shape via ComputeShape.
+        // Resolve ONNX 0 at static positions to concrete values, keep 0/-1 for dynamic.
+        std::vector<int64_t> target_dims;
+        target_dims.reserve(size);
+        for (size_t i = 0; i < size; ++i) {
+          if (target_shape[i] == 0 &&
+              i < input_shape.size() &&
+              input_shape[i] != kDynamicDim) {
+            target_dims.push_back(input_shape[i]);
+          } else {
+            target_dims.push_back(target_shape[i]);
+          }
+        }
+
+        emscripten::val shape_operand = shape_utils::ComputeShape(
+            model_builder, input, target_dims, node.Name());
+        output = model_builder.GetBuilder().call<emscripten::val>(
+            "dynamicReshape", input, shape_operand, options);
       }
-      output = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, options);
     } else {
       // Empty target shape → converting to a scalar.
       emscripten::val new_shape = emscripten::val::array();
       output = model_builder.GetBuilder().call<emscripten::val>("reshape", input, new_shape, options);
     }
   } else {
-    // Operand shape path: shape is a non-constant operand. Use dynamicReshape.
+    // Operand shape path: shape is a non-constant operand. Use dynamicReshape directly.
     emscripten::val shape_operand = model_builder.GetOperand(input_defs[1]->Name());
     output = model_builder.GetBuilder().call<emscripten::val>(
         "dynamicReshape", input, shape_operand, options);

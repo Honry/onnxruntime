@@ -91,6 +91,138 @@ inline emscripten::val DynamicReshapeWithSegments(ModelBuilder& model_builder,
 }
 
 
+// Builds a 1-D shape operand for dynamicReshape from a target shape specification
+// that may include 0 (copy from input) and -1 (infer).
+//
+// Emitted sub-op patterns per dimension (matching reshapeFusion's recognized patterns):
+//   target_dims[i] == 0:   Shape → Gather(i) → Unsqueeze([0])          → fuses to 0
+//   target_dims[i] == -1:  Div(total_elements, known_product) → Unsqueeze([0])  → fuses to -1
+//   target_dims[i] > 0:    Constant([value])                            → fuses to value
+//
+// reshapeFusion recognizes:
+//   Pattern 1: Shape → Gather(i) → Unsqueeze(axes=0) → Concat  →  fused as 0
+//   Pattern 2: one-element subgraph with Div/Mul → Unsqueeze(axes=0) → Concat  →  fused as -1
+//   Constant: literal value in concat input  →  fused as the value
+//
+// Data type:
+//   WebNN shape() always returns uint32.
+//   - IsInt64Supported: cast shape to int64, all constants int64.
+//   - !IsInt64Supported: keep everything uint32, no cast.
+//
+// Parameters:
+//   input:       the WebNN operand whose shape is queried (the reshape input).
+//   target_dims: 0 = copy from input at same position,
+//                -1 = infer (one per shape),
+//                positive = static dim value.
+//   label:       node name for labeling intermediate ops.
+inline emscripten::val ComputeShape(ModelBuilder& model_builder,
+                                    const emscripten::val& input,
+                                    const std::vector<int64_t>& target_dims,
+                                    const std::string& label) {
+  emscripten::val wnn_builder = model_builder.GetBuilder();
+  const bool is_int64 = model_builder.IsInt64Supported();
+  const int32_t data_type = is_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
+                                     : ONNX_NAMESPACE::TensorProto_DataType_UINT32;
+
+  // Step 1: Get runtime shape of input (uint32), cast to int64 if needed.
+  emscripten::val common_options = emscripten::val::object();
+  common_options.set("label", label + "_shape");
+  emscripten::val shape_op = wnn_builder.call<emscripten::val>("shape", input, common_options);
+  if (is_int64) {
+    common_options.set("label", label + "_cast");
+    shape_op = wnn_builder.call<emscripten::val>(
+        "cast", shape_op, emscripten::val("int64"), common_options);
+  }
+
+  // Step 2: If -1 is present, precompute total_elements and known_product for inference.
+  //   inferred_dim = total_elements / known_product
+  //   where known_product = product of all non-(-1) target dims at runtime.
+  emscripten::val inferred_dim = emscripten::val::undefined();
+  bool has_infer = std::find(target_dims.begin(), target_dims.end(), -1) != target_dims.end();
+  if (has_infer) {
+    // total_elements = reduceProduct(shape(input))
+    emscripten::val reduce_options = emscripten::val::object();
+    reduce_options.set("label", label + "_total_reduce");
+    reduce_options.set("keepDimensions", true);
+    reduce_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0}));
+    emscripten::val total = wnn_builder.call<emscripten::val>(
+        "reduceProduct", shape_op, reduce_options);
+
+    // known_product = product of all other target dims (built from their segments).
+    // Build segments for all non-(-1) dims first, concat, then reduceProduct.
+    emscripten::val known_segments = emscripten::val::array();
+    for (size_t i = 0; i < target_dims.size(); ++i) {
+      if (target_dims[i] == -1) continue;
+      if (target_dims[i] == 0) {
+        const emscripten::val& idx = is_int64
+            ? model_builder.CreateOrGetConstant<int64_t>(data_type, static_cast<int64_t>(i), {})
+            : model_builder.CreateOrGetConstant<uint32_t>(data_type, static_cast<uint32_t>(i), {});
+        common_options.set("label", label + "_known_gather_" + std::to_string(i));
+        emscripten::val dim_scalar = wnn_builder.call<emscripten::val>(
+            "gather", shape_op, idx, common_options);
+        emscripten::val unsqueeze_options = emscripten::val::object();
+        unsqueeze_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0}));
+        unsqueeze_options.set("label", label + "_known_unsqueeze_" + std::to_string(i));
+        emscripten::val dim_1d = wnn_builder.call<emscripten::val>(
+            "unsqueeze", dim_scalar, unsqueeze_options);
+        known_segments.call<void>("push", dim_1d);
+      } else {
+        const emscripten::val& c = is_int64
+            ? model_builder.CreateOrGetConstant<int64_t>(data_type, target_dims[i], {1})
+            : model_builder.CreateOrGetConstant<uint32_t>(data_type, static_cast<uint32_t>(target_dims[i]), {1});
+        known_segments.call<void>("push", c);
+      }
+    }
+    common_options.set("label", label + "_known_concat");
+    emscripten::val known_shape = wnn_builder.call<emscripten::val>(
+        "concat", known_segments, 0, common_options);
+
+    reduce_options.set("label", label + "_known_reduce");
+    emscripten::val known_product = wnn_builder.call<emscripten::val>(
+        "reduceProduct", known_shape, reduce_options);
+
+    // inferred_dim = total / known_product (scalar [1]-shaped)
+    common_options.set("label", label + "_infer_div");
+    inferred_dim = wnn_builder.call<emscripten::val>("div", total, known_product, common_options);
+  }
+
+  // Step 3: Build per-dim segments for the final shape operand.
+  emscripten::val segments = emscripten::val::array();
+  for (size_t i = 0; i < target_dims.size(); ++i) {
+    if (target_dims[i] == 0) {
+      // Shape → Gather(i) → Unsqueeze([0])
+      const std::string i_str = std::to_string(i);
+      const emscripten::val& idx = is_int64
+          ? model_builder.CreateOrGetConstant<int64_t>(data_type, static_cast<int64_t>(i), {})
+          : model_builder.CreateOrGetConstant<uint32_t>(data_type, static_cast<uint32_t>(i), {});
+
+      common_options.set("label", label + "_gather_" + i_str);
+      emscripten::val dim_scalar = wnn_builder.call<emscripten::val>(
+          "gather", shape_op, idx, common_options);
+
+      emscripten::val unsqueeze_options = emscripten::val::object();
+      unsqueeze_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0}));
+      unsqueeze_options.set("label", label + "_unsqueeze_" + i_str);
+      emscripten::val dim_1d = wnn_builder.call<emscripten::val>(
+          "unsqueeze", dim_scalar, unsqueeze_options);
+      segments.call<void>("push", dim_1d);
+    } else if (target_dims[i] == -1) {
+      // Div(total, known_product) already computed → [1]-shaped, push directly.
+      segments.call<void>("push", inferred_dim);
+    } else {
+      // Static constant [value].
+      const emscripten::val& c = is_int64
+          ? model_builder.CreateOrGetConstant<int64_t>(data_type, target_dims[i], {1})
+          : model_builder.CreateOrGetConstant<uint32_t>(data_type, static_cast<uint32_t>(target_dims[i]), {1});
+      segments.call<void>("push", c);
+    }
+  }
+
+  // Step 4: Concat all segments into final 1-D shape operand.
+  common_options.set("label", label + "_concat");
+  return wnn_builder.call<emscripten::val>("concat", segments, 0, common_options);
+}
+
 }  // namespace shape_utils
 }  // namespace webnn
 }  // namespace onnxruntime
