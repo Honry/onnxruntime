@@ -280,10 +280,7 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
           dim_name = name + "_dim_" + std::to_string(shape_array["length"].as<uint32_t>());
         }
 
-        emscripten::val dim_obj = emscripten::val::object();
-        dim_obj.set("name", emscripten::val(dim_name));
-
-        shape_array.call<void>("push", dim_obj);
+        shape_array.call<void>("push", emscripten::val(dim_name));
       }
     }
   }

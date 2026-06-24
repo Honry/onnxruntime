@@ -290,23 +290,10 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     const bool rotary_output_bnsh = true;
 
     // Reshape query to (batch_size, sequence_length, num_heads, head_size) for rotary embedding
-    // Use ComputeShape: dims 0,1 from input, dims 2,3 static.
-    std::string query_rotary_label = node.Name() + "_/GQA/query/reshape_for_rotary";
-    common_options.set("label", query_rotary_label);
-    emscripten::val reshaped_query_for_rotary;
-    if (!HasDynamicShape(input_q_shape)) {
-      std::vector<uint32_t> query_rotary_shape_4d{
-          SafeInt<uint32_t>(input_q_shape[0]), SafeInt<uint32_t>(input_q_shape[1]), num_heads, head_size};
-      reshaped_query_for_rotary = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", query_input, emscripten::val::array(query_rotary_shape_4d), common_options);
-    } else {
-      emscripten::val query_reshape_for_rotary = shape_utils::ComputeShape(
-          model_builder, query_input,
-          {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
-          query_rotary_label);
-      reshaped_query_for_rotary = model_builder.GetBuilder().call<emscripten::val>(
-          "dynamicReshape", query_input, query_reshape_for_rotary, common_options);
-    }
+    emscripten::val reshaped_query_for_rotary = shape_utils::Reshape(
+        model_builder, query_input, input_q_shape,
+        {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
+        node.Name() + "_/GQA/query/reshape_for_rotary");
 
     // Apply rotary embedding to query
     emscripten::val rotary_query_output;
@@ -329,23 +316,10 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
         rotary_query_output));
 
     // Reshape key to (batch_size, sequence_length, kv_num_heads, head_size) for rotary embedding
-    // Use ComputeShape: dims 0,1 from input, dims 2,3 static.
-    std::string key_rotary_label = node.Name() + "_/GQA/key/reshape_for_rotary";
-    common_options.set("label", key_rotary_label);
-    emscripten::val reshaped_key_for_rotary;
-    if (!HasDynamicShape(input_k_shape)) {
-      std::vector<uint32_t> key_rotary_shape_4d{
-          SafeInt<uint32_t>(input_k_shape[0]), SafeInt<uint32_t>(input_k_shape[1]), kv_num_heads, head_size};
-      reshaped_key_for_rotary = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", key_input, emscripten::val::array(key_rotary_shape_4d), common_options);
-    } else {
-      emscripten::val key_reshape_for_rotary = shape_utils::ComputeShape(
-          model_builder, key_input,
-          {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
-          key_rotary_label);
-      reshaped_key_for_rotary = model_builder.GetBuilder().call<emscripten::val>(
-          "dynamicReshape", key_input, key_reshape_for_rotary, common_options);
-    }
+    emscripten::val reshaped_key_for_rotary = shape_utils::Reshape(
+        model_builder, key_input, input_k_shape,
+        {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
+        node.Name() + "_/GQA/key/reshape_for_rotary");
 
     // Apply rotary embedding to key
     emscripten::val rotary_key_output;
@@ -387,80 +361,32 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     // form a pair with the internal RoPE transpose (breaking OV pattern matching).
 
     // For value (not rotary-embedded), reshape to BSNH.
-    // Use ComputeShape: dims 0,1 from value_input, dims 2,3 static.
-    std::string value_bsnh_label = node.Name() + "_/GQA/value/reshape_bsnh";
-    common_options.set("label", value_bsnh_label);
-    if (!HasDynamicShape(input_v_shape)) {
-      std::vector<uint32_t> value_bsnh_shape_4d{
-          SafeInt<uint32_t>(input_v_shape[0]), SafeInt<uint32_t>(input_v_shape[1]), kv_num_heads, head_size};
-      value_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", value_input, emscripten::val::array(value_bsnh_shape_4d), common_options);
-    } else {
-      emscripten::val value_bsnh_shape = shape_utils::ComputeShape(
-          model_builder, value_input,
-          {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
-          value_bsnh_label);
-      value_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-          "dynamicReshape", value_input, value_bsnh_shape, common_options);
-    }
+    value_bsnh = shape_utils::Reshape(
+        model_builder, value_input, input_v_shape,
+        {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
+        node.Name() + "_/GQA/value/reshape_bsnh");
   } else {
     // Normal path: reshape query to 4D + transpose to BNSH.
-    // Use ComputeShape: dims 0,1 from query_input, dims 2,3 static.
-    std::string query_reshape_label = node.Name() + "_/GQA/query/reshape";
-    common_options.set("label", query_reshape_label);
-    emscripten::val reshaped_query;
-    if (!HasDynamicShape(input_q_shape)) {
-      std::vector<uint32_t> query_shape_4d{
-          SafeInt<uint32_t>(input_q_shape[0]), SafeInt<uint32_t>(input_q_shape[1]), num_heads, head_size};
-      reshaped_query = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", query_input, emscripten::val::array(query_shape_4d), common_options);
-    } else {
-      emscripten::val reshape_tensor_shape = shape_utils::ComputeShape(
-          model_builder, query_input,
-          {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
-          query_reshape_label);
-      reshaped_query = model_builder.GetBuilder().call<emscripten::val>(
-          "dynamicReshape", query_input, reshape_tensor_shape, common_options);
-    }
+    emscripten::val reshaped_query = shape_utils::Reshape(
+        model_builder, query_input, input_q_shape,
+        {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
+        node.Name() + "_/GQA/query/reshape");
 
     transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
     transpose_options.set("label", node.Name() + "_/GQA/query/transpose");
     new_query = model_builder.GetBuilder().call<emscripten::val>("transpose", reshaped_query, transpose_options);
 
     // Reshape key and value from BSW to BSNH: (B, S, kv_N*H) -> (B, S, kv_N, H)
-    // Use ComputeShape: dims 0,1 from key_input, dims 2,3 static.
-    std::string key_bsnh_label = node.Name() + "_/GQA/key/reshape_bsnh";
-    common_options.set("label", key_bsnh_label);
-    if (!HasDynamicShape(input_k_shape)) {
-      std::vector<uint32_t> key_bsnh_shape_4d{
-          SafeInt<uint32_t>(input_k_shape[0]), SafeInt<uint32_t>(input_k_shape[1]), kv_num_heads, head_size};
-      key_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", key_input, emscripten::val::array(key_bsnh_shape_4d), common_options);
-    } else {
-      emscripten::val reshape_kv_shape = shape_utils::ComputeShape(
-          model_builder, key_input,
-          {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
-          key_bsnh_label);
-      key_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-          "dynamicReshape", key_input, reshape_kv_shape, common_options);
-    }
+    key_bsnh = shape_utils::Reshape(
+        model_builder, key_input, input_k_shape,
+        {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
+        node.Name() + "_/GQA/key/reshape_bsnh");
 
     // Value uses same target shape pattern but with value_input as source.
-    std::string val_bsnh_label = node.Name() + "_/GQA/value/reshape_bsnh";
-    common_options.set("label", val_bsnh_label);
-    if (!HasDynamicShape(input_v_shape)) {
-      std::vector<uint32_t> val_bsnh_shape_4d{
-          SafeInt<uint32_t>(input_v_shape[0]), SafeInt<uint32_t>(input_v_shape[1]), kv_num_heads, head_size};
-      value_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-          "reshape", value_input, emscripten::val::array(val_bsnh_shape_4d), common_options);
-    } else {
-      emscripten::val reshape_val_shape = shape_utils::ComputeShape(
-          model_builder, value_input,
-          {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
-          val_bsnh_label);
-      value_bsnh = model_builder.GetBuilder().call<emscripten::val>(
-          "dynamicReshape", value_input, reshape_val_shape, common_options);
-    }
+    value_bsnh = shape_utils::Reshape(
+        model_builder, value_input, input_v_shape,
+        {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
+        node.Name() + "_/GQA/value/reshape_bsnh");
   }
 
   // Compute sequence_length (S) dynamically as a scalar INT32 value.

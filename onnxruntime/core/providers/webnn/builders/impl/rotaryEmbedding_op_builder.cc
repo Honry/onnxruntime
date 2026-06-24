@@ -175,21 +175,10 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
     input = wnn_builder.call<emscripten::val>("transpose", input, transpose_options);
   } else {
     // Reshape [B, S, hidden] → [B, S, num_heads, head_size]
-    emscripten::val reshape_input_options = emscripten::val::object();
-    reshape_input_options.set("label", node_name + "_reshape_input");
-    if (!HasDynamicShape(input_shape)) {
-      std::vector<uint32_t> shape_4d{
-          SafeInt<uint32_t>(input_shape[0]), SafeInt<uint32_t>(input_shape[1]),
-          num_heads, head_size};
-      input = wnn_builder.call<emscripten::val>(
-          "reshape", input, emscripten::val::array(shape_4d), reshape_input_options);
-    } else {
-      std::vector<int64_t> target_dims{0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)};
-      emscripten::val shape_operand = shape_utils::ComputeShape(
-          model_builder, input, target_dims, node_name + "_reshape_input");
-      input = wnn_builder.call<emscripten::val>(
-          "dynamicReshape", input, shape_operand, reshape_input_options);
-    }
+    input = shape_utils::Reshape(
+        model_builder, input, input_shape,
+        {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
+        node_name + "_reshape_input");
   }
 
   // Apply rotary embedding using the helper function.
@@ -220,21 +209,10 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
     // and without a back-transpose, the optimizer has nothing to push through.
   } else {
     // Reshape [B, S, num_heads, head_size] → [B, S, hidden_size]
-    emscripten::val reshape_output_options = emscripten::val::object();
-    reshape_output_options.set("label", node_name + "_reshape_output");
-    if (!HasDynamicShape(input_shape)) {
-      std::vector<uint32_t> shape_3d{
-          SafeInt<uint32_t>(input_shape[0]), SafeInt<uint32_t>(input_shape[1]),
-          hidden_size};
-      output = wnn_builder.call<emscripten::val>(
-          "reshape", output, emscripten::val::array(shape_3d), reshape_output_options);
-    } else {
-      std::vector<int64_t> output_dims{0, 0, -1};
-      emscripten::val output_shape_op = shape_utils::ComputeShape(
-          model_builder, output, output_dims, node_name + "_reshape_output");
-      output = wnn_builder.call<emscripten::val>(
-          "dynamicReshape", output, output_shape_op, reshape_output_options);
-    }
+    output = shape_utils::Reshape(
+        model_builder, output, input_shape,
+        {0, 0, -1},
+        node_name + "_reshape_output");
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
