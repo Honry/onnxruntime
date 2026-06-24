@@ -232,6 +232,55 @@ inline emscripten::val ComputeShape(ModelBuilder& model_builder,
   return wnn_builder.call<emscripten::val>("concat", segments, 0, common_options);
 }
 
+// Reshape with automatic static/dynamic dispatch.
+// If input_shape is all-static, resolves target_dims to concrete values and calls reshape.
+// If input_shape has dynamic dims, calls ComputeShape + dynamicReshape.
+//
+// target_dims convention: 0 = copy from input at same position, -1 = infer, >0 = static value.
+inline emscripten::val Reshape(ModelBuilder& model_builder,
+                               const emscripten::val& input,
+                               const std::vector<int64_t>& input_shape,
+                               const std::vector<int64_t>& target_dims,
+                               const std::string& label) {
+  emscripten::val wnn_builder = model_builder.GetBuilder();
+  emscripten::val options = emscripten::val::object();
+  options.set("label", label);
+
+  if (!HasDynamicShape(input_shape)) {
+    // Static path: resolve 0/-1 to concrete values.
+    std::vector<uint32_t> concrete_shape;
+    concrete_shape.reserve(target_dims.size());
+    int64_t product_known = 1;
+    int64_t total_elements = 1;
+    for (auto d : input_shape) total_elements *= d;
+    for (auto d : target_dims) {
+      if (d > 0) product_known *= d;
+    }
+    for (size_t i = 0; i < target_dims.size(); ++i) {
+      if (target_dims[i] == 0) {
+        concrete_shape.push_back(SafeInt<uint32_t>(input_shape[i]));
+      } else if (target_dims[i] == -1) {
+        // Compute inferred dim: for 0-positions, multiply their known input values into product.
+        int64_t product_with_zeros = product_known;
+        for (size_t j = 0; j < target_dims.size(); ++j) {
+          if (target_dims[j] == 0 && j < input_shape.size()) {
+            product_with_zeros *= input_shape[j];
+          }
+        }
+        concrete_shape.push_back(SafeInt<uint32_t>(total_elements / product_with_zeros));
+      } else {
+        concrete_shape.push_back(SafeInt<uint32_t>(target_dims[i]));
+      }
+    }
+    return wnn_builder.call<emscripten::val>(
+        "reshape", input, emscripten::val::array(concrete_shape), options);
+  } else {
+    // Dynamic path: ComputeShape + dynamicReshape.
+    emscripten::val shape_operand = ComputeShape(model_builder, input, target_dims, label);
+    return wnn_builder.call<emscripten::val>("dynamicReshape", input, shape_operand, options);
+  }
+}
+
 }  // namespace shape_utils
 }  // namespace webnn
 }  // namespace onnxruntime
