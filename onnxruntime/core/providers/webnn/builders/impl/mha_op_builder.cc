@@ -164,13 +164,27 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
 
   const float scale_value = helper.Get("scale", 1 / sqrt(static_cast<float>(head_size)));
 
+  // Helper: reshape input to [B, S, N, H] — static or dynamic path.
+  auto reshape_to_4d = [&](emscripten::val& operand, const std::vector<int64_t>& operand_shape,
+                           const std::string& label) {
+    common_options.set("label", label);
+    if (!HasDynamicShape(operand_shape)) {
+      std::vector<uint32_t> shape_4d{
+          SafeInt<uint32_t>(operand_shape[0]), SafeInt<uint32_t>(operand_shape[1]),
+          num_heads, head_size};
+      operand = model_builder.GetBuilder().call<emscripten::val>(
+          "reshape", operand, emscripten::val::array(shape_4d), common_options);
+    } else {
+      std::vector<int64_t> target{0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)};
+      emscripten::val shape_op = shape_utils::ComputeShape(model_builder, operand, target, label);
+      operand = model_builder.GetBuilder().call<emscripten::val>(
+          "dynamicReshape", operand, shape_op, common_options);
+    }
+  };
+
   // query_input -> reshape(B,S,N,H) -> transpose(B,N,S,H) -> new_query
-  std::vector<int64_t> qkv_target{0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)};
-  emscripten::val q_shape_op = shape_utils::ComputeShape(
-      model_builder, query_input, qkv_target, node.Name() + "_/MHA/query/reshape");
-  common_options.set("label", node.Name() + "_/MHA/query/reshape");
-  emscripten::val reshaped_query = model_builder.GetBuilder().call<emscripten::val>(
-      "dynamicReshape", query_input, q_shape_op, common_options);
+  reshape_to_4d(query_input, q_input_shape, node.Name() + "_/MHA/query/reshape");
+  emscripten::val reshaped_query = query_input;
 
   transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
   transpose_options.set("label", node.Name() + "_/MHA/query/transpose");
@@ -179,11 +193,8 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
 
   emscripten::val present_key, present_value;
   if (!k_reshape_skip) {
-    emscripten::val k_shape_op = shape_utils::ComputeShape(
-        model_builder, key_input, qkv_target, node.Name() + "_/MHA/key/reshape_1");
-    common_options.set("label", node.Name() + "_/MHA/key/reshape_1");
-    present_key = model_builder.GetBuilder().call<emscripten::val>(
-        "dynamicReshape", key_input, k_shape_op, common_options);
+    reshape_to_4d(key_input, k_input_shape, node.Name() + "_/MHA/key/reshape_1");
+    present_key = key_input;
 
     transpose_options.set("label", node.Name() + "_/MHA/key/transpose");
     present_key = model_builder.GetBuilder().call<emscripten::val>("transpose", present_key, transpose_options);
@@ -206,11 +217,10 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
       model_builder.GetBuilder().call<emscripten::val>("transpose", present_key, transpose_options);
 
   if (!v_reshape_skip) {
-    emscripten::val v_shape_op = shape_utils::ComputeShape(
-        model_builder, value_input, qkv_target, node.Name() + "_/MHA/value/reshape_1");
-    common_options.set("label", node.Name() + "_/MHA/value/reshape_1");
-    present_value = model_builder.GetBuilder().call<emscripten::val>(
-        "dynamicReshape", value_input, v_shape_op, common_options);
+    std::vector<int64_t> v_input_shape_for_reshape;
+    ORT_RETURN_IF_NOT(GetShape(*input_defs[2], v_input_shape_for_reshape, logger), "Cannot get value shape");
+    reshape_to_4d(value_input, v_input_shape_for_reshape, node.Name() + "_/MHA/value/reshape_1");
+    present_value = value_input;
 
     transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
     transpose_options.set("label", node.Name() + "_/MHA/value/transpose");
