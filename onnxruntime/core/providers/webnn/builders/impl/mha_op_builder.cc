@@ -247,7 +247,8 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
   std::vector<int64_t> reshape_output_target{0, 0, static_cast<int64_t>(hidden_size)};
 
   emscripten::val output = ScaledDotProductAttention(model_builder, node, logger, new_query, new_key, present_value,
-                                                     scale_constant, attention_bias, reshape_output_target);
+                                                     scale_constant, attention_bias, reshape_output_target,
+                                                     HasDynamicShape(q_input_shape));
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
 
   if (TensorExists(node.OutputDefs(), 1)) {
