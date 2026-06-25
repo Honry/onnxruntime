@@ -13,6 +13,7 @@
 #include "core/providers/webnn/builders/op_builder_factory.h"
 
 #include "base_op_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -201,60 +202,57 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   }
 
   std::vector<int64_t> axes = GetResolvedAxes(helper, 4);  // We already checked input shape is 4D in IsOpSupportedImpl.
+  if (axes.empty()) {
+    axes = {2, 3};
+  }
+  std::vector<uint32_t> webnn_axes = GetNarrowedIntFromInt64<uint32_t>(axes);
+  options.set("axes", emscripten::val::array(webnn_axes));
+
   std::string sizes_name = GetTensorName(input_defs, 3);
   const bool is_constant_sizes = !sizes_name.empty() && Contains(initializers, sizes_name);
 
   emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
   emscripten::val output = emscripten::val::undefined();
+  emscripten::val common_options = emscripten::val::object();
 
   if (!sizes_name.empty() && !is_constant_sizes) {
-    // Dynamic sizes path: use dynamicResample2d with the sizes operand.
-    // When axes is not specified (pre-opset 18), sizes has 4 elements [N, C, H, W].
-    // WebNN dynamicResample2d expects sizes length to match the number of axes (2 for spatial).
-    // Default to spatial axes and slice the sizes operand to extract spatial dims.
-    if (axes.empty()) {
-      axes = {2, 3};
-    }
-    std::vector<uint32_t> webnn_axes = GetNarrowedIntFromInt64<uint32_t>(axes);
-    options.set("axes", emscripten::val::array(webnn_axes));
-
+    // Dynamic sizes operand path: slice spatial dims + cast to uint32.
     emscripten::val sizes_operand = model_builder.GetOperand(input_defs[3]->Name());
 
-    // Slice sizes operand to extract only the spatial dimensions when the original has 4 elements.
+    // When sizes has 4 elements [N,C,H,W], extract only spatial dims for WebNN.
     std::vector<int64_t> sizes_shape;
     if (GetShape(*input_defs[3], sizes_shape, logger) && !sizes_shape.empty() && sizes_shape[0] == 4) {
-      emscripten::val wnn_builder = model_builder.GetBuilder();
-      sizes_operand = wnn_builder.call<emscripten::val>(
+      common_options.set("label", node.Name() + "_sizes_slice");
+      sizes_operand = model_builder.GetBuilder().call<emscripten::val>(
           "slice", sizes_operand,
           emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(axes[0])}),
-          emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(webnn_axes.size())}));
+          emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(webnn_axes.size())}),
+          common_options);
     }
 
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, sizes_operand, options);
+    // Cast to uint32 (ONNX sizes is int64, dynamicResample2d requires uint32).
+    common_options.set("label", node.Name() + "_cast_sizes_uint32");
+    sizes_operand = model_builder.GetBuilder().call<emscripten::val>(
+        "cast", sizes_operand, emscripten::val("uint32"), common_options);
+
+    options.set("sizes", sizes_operand);
+    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, options);
   } else if (!HasDynamicShape(input_shape)) {
-    // Static path: input is all-static, use WebNN resample2d.
+    // Static path: use WebNN resample2d with sizes or scales.
     if (is_constant_sizes) {
       std::vector<int64_t> sizes;
       ORT_RETURN_IF_NOT(GetResizeSizesAndAxes(model_builder.GetGraphViewer(), node, sizes, axes, input_shape, logger),
                         "Error getting Resize sizes");
-      std::vector<uint32_t> webnn_sizes = GetNarrowedIntFromInt64<uint32_t>(sizes);
-      options.set("sizes", emscripten::val::array(webnn_sizes));
+      options.set("sizes", emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(sizes)));
     } else {
       std::vector<float> scales;
       ORT_RETURN_IF_NOT(GetResizeScalesAndAxes(model_builder.GetGraphViewer(), node, scales, axes, logger),
                         "Error getting Resize scales");
       options.set("scales", emscripten::val::array(scales));
     }
-
-    std::vector<uint32_t> webnn_axes = GetNarrowedIntFromInt64<uint32_t>(axes);
-    options.set("axes", emscripten::val::array(webnn_axes));
-
     output = model_builder.GetBuilder().call<emscripten::val>("resample2d", input, options);
-  } else {
-    // Dynamic input with constant sizes: use dynamicResample2d with constant sizes operand.
-    if (axes.empty()) {
-      axes = {2, 3};
-    }
+  } else if (is_constant_sizes) {
+    // Dynamic input + constant sizes: create uint32 constant for dynamicResample2d.
     std::vector<int64_t> sizes;
     ORT_RETURN_IF_NOT(GetResizeSizesAndAxes(model_builder.GetGraphViewer(), node, sizes, axes, input_shape, logger),
                       "Error getting Resize sizes");
@@ -262,11 +260,50 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     const emscripten::val& sizes_operand = model_builder.CreateOrGetConstant<uint32_t>(
         ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_sizes",
         webnn_sizes, {static_cast<uint32_t>(webnn_sizes.size())});
+    options.set("sizes", sizes_operand);
+    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, options);
+  } else {
+    // Dynamic input + constant scales: compute sizes at runtime via shape sub-ops.
+    // Read scales directly from the initializer and extract spatial axes.
+    const auto& scales_tensor = *initializers.at(input_defs[2]->Name());
+    std::vector<uint8_t> unpacked_scales;
+    ORT_RETURN_IF_NOT(UnpackInitializerData(scales_tensor, unpacked_scales,
+                                            model_builder.GetGraphViewer(), logger),
+                      "Error unpacking scales tensor");
+    const float* all_scales = reinterpret_cast<const float*>(unpacked_scales.data());
+    std::vector<float> scales;
+    for (int64_t axis : axes) {
+      scales.push_back(all_scales[static_cast<size_t>(axis)]);
+    }
 
-    std::vector<uint32_t> webnn_axes = GetNarrowedIntFromInt64<uint32_t>(axes);
-    options.set("axes", emscripten::val::array(webnn_axes));
+    emscripten::val wnn_builder = model_builder.GetBuilder();
+    common_options.set("label", node.Name() + "_input_shape");
+    emscripten::val input_shape_op = wnn_builder.call<emscripten::val>("shape", input, common_options);
 
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, sizes_operand, options);
+    emscripten::val spatial_shape = shape_utils::SliceShapeRange(
+        wnn_builder, input_shape_op, static_cast<int32_t>(axes[0]),
+        static_cast<int32_t>(axes.size()), node.Name() + "_spatial_slice");
+
+    // shape(uint32) → float32 → mul(scales) → floor → uint32
+    common_options.set("label", node.Name() + "_shape_to_float");
+    emscripten::val spatial_float = wnn_builder.call<emscripten::val>(
+        "cast", spatial_shape, emscripten::val("float32"), common_options);
+
+    const emscripten::val& scales_const = model_builder.CreateOrGetConstant<float>(
+        ONNX_NAMESPACE::TensorProto_DataType_FLOAT, node.Name() + "_scales",
+        scales, {static_cast<uint32_t>(scales.size())});
+    common_options.set("label", node.Name() + "_sizes_mul");
+    emscripten::val sizes_float = wnn_builder.call<emscripten::val>(
+        "mul", spatial_float, scales_const, common_options);
+
+    common_options.set("label", node.Name() + "_sizes_floor");
+    sizes_float = wnn_builder.call<emscripten::val>("floor", sizes_float, common_options);
+    common_options.set("label", node.Name() + "_sizes_to_uint32");
+    emscripten::val sizes_operand = wnn_builder.call<emscripten::val>(
+        "cast", sizes_float, emscripten::val("uint32"), common_options);
+
+    options.set("sizes", sizes_operand);
+    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -410,15 +447,8 @@ bool ResizeOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // Check input 3 (sizes operand) against dynamicResample2d's "sizes" parameter.
-  int32_t sizes_type;
-  if (!GetType(*input_defs[3], sizes_type, logger)) {
-    return false;
-  }
-  if (!IsDataTypeSupportedByWebNNOp("Resize", webnn_op_type, sizes_type, wnn_limits,
-                                    "sizes", "sizes", logger)) {
-    return false;
-  }
+  // dynamicResample2d's sizes is always uint32 (we cast at build time).
+  // Skip type check — ONNX sizes input is int64 but we handle the conversion.
 
   return true;
 }

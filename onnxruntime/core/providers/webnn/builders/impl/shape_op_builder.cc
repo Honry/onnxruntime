@@ -18,6 +18,12 @@ class ShapeOpBuilder : public BaseOpBuilder {
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
+  // WebNN shape() outputs uint32 regardless of ONNX's int64 output type declaration.
+  // Skip output type validation to avoid rejecting the node.
+  bool HasSupportedOutputsImpl(const Node& /*node*/, const emscripten::val& /*wnn_limits*/,
+                               const logging::Logger& /*logger*/) const override {
+    return true;
+  }
 };
 
 Status ShapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,

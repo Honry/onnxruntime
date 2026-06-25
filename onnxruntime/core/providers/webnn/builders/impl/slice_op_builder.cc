@@ -222,12 +222,13 @@ Status BuildConstantSlice(ModelBuilder& model_builder, const Node& node,
 }
 
 // Dynamic path: at least one of starts/ends is a runtime operand.
-// WebNN dynamicSlice accepts starts/ends as operands with native support for negative
-// indices and clamping. The preprocessing subgraph only needs to:
+// WebNN dynamicSlice accepts starts/sizes as uint32 operands.
+// The preprocessing subgraph:
 //   1. Reverse negative-step axes on input (constant decision)
 //   2. Transform starts/ends for reversed axes: new_val = -1 - old_val
 //   3. Expand partial axes to full rank (if axes ⊂ all dims)
-//   4. Call dynamicSlice(input, starts, ends, {strides})
+//   4. Compute sizes = ceil((ends - starts) / strides), cast to uint32
+//   5. Call dynamicSlice(input, starts, sizes, {strides})
 Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
                          emscripten::val input, const std::vector<int64_t>& input_shape,
                          emscripten::val& output, const logging::Logger& logger) {
@@ -377,13 +378,19 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
       gather_indices[d] = static_cast<int32_t>(i);
       mask[d] = 1;
     }
-    // Non-sliced axes: start=0, end=dim (full range).
-    // For dynamic dims (-1 placeholder), use INT32_MAX so dynamicSlice clamps to actual size.
+    // Non-sliced axes: start=0, sizes=dim (full range).
+    // For dynamic dims, we'll use shape(input) to get actual sizes after the where/gather.
     std::vector<int64_t> starts_default(rank, 0);
     std::vector<int64_t> ends_default(rank);
+    bool has_dynamic_non_sliced = false;
     for (size_t d = 0; d < rank; ++d) {
-      ends_default[d] = input_shape[d] > 0 ? input_shape[d]
-                                           : static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+      if (input_shape[d] > 0) {
+        ends_default[d] = input_shape[d];
+      } else {
+        // Placeholder — will be fixed below using shape(input).
+        ends_default[d] = 0;
+        if (mask[d] == 0) has_dynamic_non_sliced = true;
+      }
     }
 
     emscripten::val gather_idx_const = model_builder.CreateOrGetConstant<int32_t>(
@@ -411,26 +418,92 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
     options.set("label", label + "_ends_select");
     ends_full = builder.call<emscripten::val>(
         "where", mask_const, ends_expanded, ends_default_const, options);
+
+    // For dynamic non-sliced axes, ends_default was 0 (placeholder).
+    // Replace with actual dim sizes from shape(input).
+    if (has_dynamic_non_sliced) {
+      options.set("label", label + "_input_shape");
+      emscripten::val input_shape_op = builder.call<emscripten::val>("shape", input, options);
+      // Cast shape (uint32) to match ends_full data type.
+      if (use_int64) {
+        options.set("label", label + "_shape_cast_int64");
+        input_shape_op = builder.call<emscripten::val>(
+            "cast", input_shape_op, emscripten::val("int64"), options);
+      } else {
+        options.set("label", label + "_shape_cast_int32");
+        input_shape_op = builder.call<emscripten::val>(
+            "cast", input_shape_op, emscripten::val("int32"), options);
+      }
+      // Use max(ends_full, shape) for non-sliced axes: where mask=1 keep sliced ends,
+      // where mask=0 use shape(input) dim. Since starts_default=0 for non-sliced,
+      // ends = dim_size gives the correct span.
+      options.set("label", label + "_ends_fix_dynamic");
+      ends_full = builder.call<emscripten::val>(
+          "where", mask_const, ends_full, input_shape_op, options);
+    }
   }
 
-  // Step 4: Build full-rank strides and call dynamicSlice.
-  // dynamicSlice requires uint32 starts/ends operands — cast if needed.
+  // Step 4: Compute sizes and call dynamicSlice(input, starts, sizes, options).
+  // sizes[i] = ceil((ends[i] - starts[i]) / strides[i])
+  // Since strides are constants, compute: span = ends - starts, then div by strides constant.
   std::vector<uint32_t> strides_full(rank, 1);
   for (size_t i = 0; i < num_axes; ++i) {
     strides_full[SafeInt<size_t>(axes[i])] = SafeInt<uint32_t>(steps[i]);
   }
 
-  emscripten::val cast_options = emscripten::val::object();
-  cast_options.set("label", label + "_cast_starts_uint32");
-  starts_full = builder.call<emscripten::val>("cast", starts_full, emscripten::val("uint32"), cast_options);
-  cast_options.set("label", label + "_cast_ends_uint32");
-  ends_full = builder.call<emscripten::val>("cast", ends_full, emscripten::val("uint32"), cast_options);
+  emscripten::val common_options = emscripten::val::object();
+  common_options.set("label", label + "_span");
+  emscripten::val span = builder.call<emscripten::val>("sub", ends_full, starts_full, common_options);
+
+  // Compute ceil division: sizes = (span + strides - 1) / strides
+  // Use the same data type as span for the strides constant.
+  int32_t span_type;
+  ORT_RETURN_IF_NOT(GetType(*input_defs[1], span_type, logger), "Cannot get starts type");
+  const bool use_int64 = span_type == ONNX_NAMESPACE::TensorProto_DataType_INT64 &&
+                         model_builder.IsInt64Supported();
+  const int32_t index_data_type = use_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
+                                            : ONNX_NAMESPACE::TensorProto_DataType_INT32;
+
+  emscripten::val sizes_full = span;
+  bool has_non_unit_stride = std::any_of(strides_full.begin(), strides_full.end(),
+                                         [](uint32_t s) { return s != 1; });
+  if (has_non_unit_stride) {
+    // strides_minus_1 for ceil: (span + strides - 1) / strides
+    std::vector<int64_t> strides_i64(strides_full.begin(), strides_full.end());
+    std::vector<int64_t> strides_minus_1(rank);
+    for (size_t i = 0; i < rank; ++i) strides_minus_1[i] = strides_i64[i] - 1;
+
+    const emscripten::val& strides_const = use_int64
+        ? model_builder.CreateOrGetConstant<int64_t>(index_data_type, label + "_strides",
+              strides_i64, {static_cast<uint32_t>(rank)})
+        : model_builder.CreateOrGetConstant<int32_t>(index_data_type, label + "_strides",
+              std::vector<int32_t>(strides_i64.begin(), strides_i64.end()),
+              {static_cast<uint32_t>(rank)});
+    const emscripten::val& strides_m1_const = use_int64
+        ? model_builder.CreateOrGetConstant<int64_t>(index_data_type, label + "_strides_m1",
+              strides_minus_1, {static_cast<uint32_t>(rank)})
+        : model_builder.CreateOrGetConstant<int32_t>(index_data_type, label + "_strides_m1",
+              std::vector<int32_t>(strides_minus_1.begin(), strides_minus_1.end()),
+              {static_cast<uint32_t>(rank)});
+
+    common_options.set("label", label + "_span_plus");
+    emscripten::val span_adjusted = builder.call<emscripten::val>(
+        "add", span, strides_m1_const, common_options);
+    common_options.set("label", label + "_sizes_div");
+    sizes_full = builder.call<emscripten::val>("div", span_adjusted, strides_const, common_options);
+  }
+
+  // dynamicSlice requires uint32 operands.
+  common_options.set("label", label + "_cast_starts_uint32");
+  starts_full = builder.call<emscripten::val>("cast", starts_full, emscripten::val("uint32"), common_options);
+  common_options.set("label", label + "_cast_sizes_uint32");
+  sizes_full = builder.call<emscripten::val>("cast", sizes_full, emscripten::val("uint32"), common_options);
 
   emscripten::val slice_options = emscripten::val::object();
   slice_options.set("strides", emscripten::val::array(strides_full));
   slice_options.set("label", label);
   output = builder.call<emscripten::val>(
-      "dynamicSlice", input, starts_full, ends_full, slice_options);
+      "dynamicSlice", input, starts_full, sizes_full, slice_options);
 
   return Status::OK();
 }
@@ -694,17 +767,8 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
     return false;
   }
 
-  // Check that dynamicSlice supports the type for starts/ends.
-  int32_t starts_type;
-  if (!GetType(*input_defs[1], starts_type, logger)) {
-    return false;
-  }
-  if (!IsDataTypeSupportedByWebNNOp("Slice", webnn_op_type, starts_type, wnn_limits,
-                                    "starts", "starts", logger) ||
-      !IsDataTypeSupportedByWebNNOp("Slice", webnn_op_type, starts_type, wnn_limits,
-                                    "ends", "ends", logger)) {
-    return false;
-  }
+  // dynamicSlice starts/sizes are always uint32 (we cast at build time).
+  // Skip type check — ONNX declares starts/ends as int64 but we handle the conversion.
 
   // If any steps are negative, reverse is also needed — check its limits.
   if (TensorExists(input_defs, 4)) {

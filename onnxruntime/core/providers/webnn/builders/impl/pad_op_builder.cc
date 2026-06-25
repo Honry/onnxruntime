@@ -243,6 +243,7 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
     }
 
     // Split ONNX pads [begin0..beginR, end0..endR] into two operands for dynamicPad.
+    // Cast to uint32 (ONNX pads is int64, dynamicPad requires uint32).
     emscripten::val slice_options = emscripten::val::object();
     slice_options.set("label", label + "_pads_begin_slice");
     emscripten::val beginning_pads = builder.call<emscripten::val>(
@@ -256,6 +257,11 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
         emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
         emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
         slice_options);
+    emscripten::val cast_options = emscripten::val::object();
+    cast_options.set("label", label + "_cast_begin_uint32");
+    beginning_pads = builder.call<emscripten::val>("cast", beginning_pads, emscripten::val("uint32"), cast_options);
+    cast_options.set("label", label + "_cast_end_uint32");
+    ending_pads = builder.call<emscripten::val>("cast", ending_pads, emscripten::val("uint32"), cast_options);
     output = builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, options);
   }
 
@@ -337,15 +343,8 @@ bool PadOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, const
     return false;
   }
 
-  // Check pads operand type against dynamicPad's "beginningPadding" parameter.
-  int32_t pads_type;
-  if (!GetType(*input_defs[1], pads_type, logger)) {
-    return false;
-  }
-  if (!IsDataTypeSupportedByWebNNOp("Pad", webnn_op_type, pads_type, wnn_limits,
-                                    "beginningPadding", "pads", logger)) {
-    return false;
-  }
+  // dynamicPad's beginningPadding/endingPadding are always uint32 (we cast at build time).
+  // Skip type check — ONNX pads input is int64 but we handle the conversion.
 
   return true;
 }
