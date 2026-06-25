@@ -380,9 +380,11 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
       emscripten::val shape_a = wnn_builder.call<emscripten::val>("shape", input_a);
       emscripten::val segments_a = emscripten::val::array();
       if (a1_count > 0) {
-        segments_a.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_a, 0, a1_count));
+        segments_a.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_a, 0, a1_count,
+                                                                  node.Name() + "_slice_a1"));
       }
-      segments_a.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_a, a1_count, a2_count));
+      segments_a.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_a, a1_count, a2_count,
+                                                                 node.Name() + "_slice_a2"));
       segments_a.call<void>("push", shape_utils::ReduceShapeRange(
           model_builder, shape_a, a1_count + a2_count, a3_count, node.Name() + "_a3_product"));
       input_a = shape_utils::DynamicReshapeWithSegments(
@@ -397,11 +399,13 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
       emscripten::val shape_b = wnn_builder.call<emscripten::val>("shape", input_b);
       emscripten::val segments_b = emscripten::val::array();
       if (b1_count > 0) {
-        segments_b.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_b, 0, b1_count));
+        segments_b.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_b, 0, b1_count,
+                                                                  node.Name() + "_slice_b1"));
       }
       segments_b.call<void>("push", shape_utils::ReduceShapeRange(
           model_builder, shape_b, b1_count, b2_count, node.Name() + "_b2_product"));
-      segments_b.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_b, b1_count + b2_count, b3_count));
+      segments_b.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_b, b1_count + b2_count, b3_count,
+                                                                 node.Name() + "_slice_b3"));
       input_b = shape_utils::DynamicReshapeWithSegments(
           model_builder, input_b, segments_b, node.Name() + "_reshape_b_flatten");
     } else {

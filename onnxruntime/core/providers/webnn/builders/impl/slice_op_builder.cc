@@ -309,17 +309,17 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
                                         ? model_builder.CreateOrGetConstant<int64_t>(index_data_type, int64_t{-1}, shape_1d(num_axes))
                                         : model_builder.CreateOrGetConstant<int32_t>(index_data_type, int32_t{-1}, shape_1d(num_axes));
 
-    emscripten::val opts = emscripten::val::object();
+    emscripten::val options = emscripten::val::object();
 
     // Check if all specified axes have negative steps (no mixing).
     const bool all_neg = std::all_of(is_neg_step.begin(), is_neg_step.end(), [](bool b) { return b; });
 
     if (all_neg) {
       // All axes have negative steps — transform all directly.
-      opts.set("label", label + "_starts_transform");
-      starts_op = builder.call<emscripten::val>("sub", neg_one_const, starts_op, opts);
-      opts.set("label", label + "_ends_transform");
-      ends_op = builder.call<emscripten::val>("sub", neg_one_const, ends_op, opts);
+      options.set("label", label + "_starts_transform");
+      starts_op = builder.call<emscripten::val>("sub", neg_one_const, starts_op, options);
+      options.set("label", label + "_ends_transform");
+      ends_op = builder.call<emscripten::val>("sub", neg_one_const, ends_op, options);
     } else {
       // Mixed positive/negative steps — use where to select per axis.
       std::vector<uint8_t> neg_mask(num_axes, 0);
@@ -330,19 +330,19 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
           ONNX_NAMESPACE::TensorProto_DataType_UINT8, label + "_neg_mask", neg_mask,
           {static_cast<uint32_t>(num_axes)});
 
-      opts.set("label", label + "_starts_transform");
+      options.set("label", label + "_starts_transform");
       emscripten::val starts_transformed = builder.call<emscripten::val>(
-          "sub", neg_one_const, starts_op, opts);
-      opts.set("label", label + "_starts_select_neg");
+          "sub", neg_one_const, starts_op, options);
+      options.set("label", label + "_starts_select_neg");
       starts_op = builder.call<emscripten::val>(
-          "where", neg_mask_const, starts_transformed, starts_op, opts);
+          "where", neg_mask_const, starts_transformed, starts_op, options);
 
-      opts.set("label", label + "_ends_transform");
+      options.set("label", label + "_ends_transform");
       emscripten::val ends_transformed = builder.call<emscripten::val>(
-          "sub", neg_one_const, ends_op, opts);
-      opts.set("label", label + "_ends_select_neg");
+          "sub", neg_one_const, ends_op, options);
+      options.set("label", label + "_ends_select_neg");
       ends_op = builder.call<emscripten::val>(
-          "where", neg_mask_const, ends_transformed, ends_op, opts);
+          "where", neg_mask_const, ends_transformed, ends_op, options);
     }
   }
 
@@ -398,26 +398,33 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
     emscripten::val ends_default_const = CreateIndexConstant(
         label + "_ends_default", ends_default, rank);
 
-    emscripten::val opts = emscripten::val::object();
-    opts.set("label", label + "_starts_gather");
+    emscripten::val options = emscripten::val::object();
+    options.set("label", label + "_starts_gather");
     emscripten::val starts_expanded = builder.call<emscripten::val>(
-        "gather", starts_op, gather_idx_const, opts);
-    opts.set("label", label + "_ends_gather");
+        "gather", starts_op, gather_idx_const, options);
+    options.set("label", label + "_ends_gather");
     emscripten::val ends_expanded = builder.call<emscripten::val>(
-        "gather", ends_op, gather_idx_const, opts);
-    opts.set("label", label + "_starts_select");
+        "gather", ends_op, gather_idx_const, options);
+    options.set("label", label + "_starts_select");
     starts_full = builder.call<emscripten::val>(
-        "where", mask_const, starts_expanded, starts_default_const, opts);
-    opts.set("label", label + "_ends_select");
+        "where", mask_const, starts_expanded, starts_default_const, options);
+    options.set("label", label + "_ends_select");
     ends_full = builder.call<emscripten::val>(
-        "where", mask_const, ends_expanded, ends_default_const, opts);
+        "where", mask_const, ends_expanded, ends_default_const, options);
   }
 
   // Step 4: Build full-rank strides and call dynamicSlice.
+  // dynamicSlice requires uint32 starts/ends operands — cast if needed.
   std::vector<uint32_t> strides_full(rank, 1);
   for (size_t i = 0; i < num_axes; ++i) {
     strides_full[SafeInt<size_t>(axes[i])] = SafeInt<uint32_t>(steps[i]);
   }
+
+  emscripten::val cast_options = emscripten::val::object();
+  cast_options.set("label", label + "_cast_starts_uint32");
+  starts_full = builder.call<emscripten::val>("cast", starts_full, emscripten::val("uint32"), cast_options);
+  cast_options.set("label", label + "_cast_ends_uint32");
+  ends_full = builder.call<emscripten::val>("cast", ends_full, emscripten::val("uint32"), cast_options);
 
   emscripten::val slice_options = emscripten::val::object();
   slice_options.set("strides", emscripten::val::array(strides_full));

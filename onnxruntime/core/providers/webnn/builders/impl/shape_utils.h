@@ -34,12 +34,17 @@ inline emscripten::val GetShapeConstantOne(ModelBuilder& model_builder) {
 // The shape_operand is typically the output of builder.shape(input).
 inline emscripten::val SliceShapeRange(const emscripten::val& wnn_builder,
                                        const emscripten::val& shape_operand,
-                                       int32_t start, int32_t size) {
+                                       int32_t start, int32_t size,
+                                       const std::string& label) {
   emscripten::val starts = emscripten::val::array();
   starts.call<void>("push", start);
   emscripten::val sizes = emscripten::val::array();
   sizes.call<void>("push", size);
-  return wnn_builder.call<emscripten::val>("slice", shape_operand, starts, sizes);
+  emscripten::val options = emscripten::val::object();
+  if (!label.empty()) {
+    options.set("label", label);
+  }
+  return wnn_builder.call<emscripten::val>("slice", shape_operand, starts, sizes, options);
 }
 
 // Compute the product of a contiguous range of dims from a shape operand.
@@ -57,10 +62,10 @@ inline emscripten::val ReduceShapeRange(ModelBuilder& model_builder,
     return GetShapeConstantOne(model_builder);
   }
   if (size == 1) {
-    return SliceShapeRange(wnn_builder, shape_operand, start, 1);
+    return SliceShapeRange(wnn_builder, shape_operand, start, 1, label + "_slice");
   }
   // Multiple dims — slice then reduce with product.
-  emscripten::val segment = SliceShapeRange(wnn_builder, shape_operand, start, size);
+  emscripten::val segment = SliceShapeRange(wnn_builder, shape_operand, start, size, label + "_slice");
 
   emscripten::val reduce_options = emscripten::val::object();
   reduce_options.set("label", label);
@@ -125,6 +130,7 @@ inline emscripten::val ComputeShape(ModelBuilder& model_builder,
                                      : ONNX_NAMESPACE::TensorProto_DataType_UINT32;
 
   // Step 1: Get runtime shape of input (uint32), cast to int64 if needed.
+  // The int64 chain enables reshapeFusion in the ORT backend.
   emscripten::val common_options = emscripten::val::object();
   common_options.set("label", label + "_shape");
   emscripten::val shape_op = wnn_builder.call<emscripten::val>("shape", input, common_options);
@@ -229,7 +235,15 @@ inline emscripten::val ComputeShape(ModelBuilder& model_builder,
 
   // Step 4: Concat all segments into final 1-D shape operand.
   common_options.set("label", label + "_concat");
-  return wnn_builder.call<emscripten::val>("concat", segments, 0, common_options);
+  emscripten::val result = wnn_builder.call<emscripten::val>("concat", segments, 0, common_options);
+
+  // Step 5: Cast back to uint32 for dynamicReshape (requires uint32 shape operand).
+  if (is_int64) {
+    common_options.set("label", label + "_cast_uint32");
+    result = wnn_builder.call<emscripten::val>(
+        "cast", result, emscripten::val("uint32"), common_options);
+  }
+  return result;
 }
 
 // Reshape with automatic static/dynamic dispatch.

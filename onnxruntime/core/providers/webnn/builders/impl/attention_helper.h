@@ -9,6 +9,57 @@
 
 namespace onnxruntime {
 namespace webnn {
+
+// Build a 1-D integer range [0, 1, ..., N-1] where N is dynamic (from a shape dim).
+// dim_shape: a 1-D uint32 operand of length 1 representing N (e.g., from SliceShapeRange).
+// Returns: 1-D int32 operand of shape [N].
+// Uses WebNN range op when available, otherwise decomposes to expand→cumulativeSum→sub.
+inline emscripten::val BuildRange(ModelBuilder& model_builder,
+                                  const emscripten::val& dim_shape,
+                                  const std::string& label) {
+  emscripten::val wnn_builder = model_builder.GetBuilder();
+  const emscripten::val& wnn_limits = model_builder.GetOpSupportLimits();
+
+  if (!wnn_limits["range"].isUndefined()) {
+    // range(start=0, limit=N, delta=1)
+    // dim_shape is [1]-shaped uint32; cast to int32 scalar for range's limit input.
+    emscripten::val zero_scalar = model_builder.CreateOrGetConstant<int>(
+        ONNX_NAMESPACE::TensorProto_DataType_INT32, 0, {});
+    emscripten::val one_scalar = model_builder.CreateOrGetConstant<int>(
+        ONNX_NAMESPACE::TensorProto_DataType_INT32, 1, {});
+    // Cast dim_shape from uint32 [1] to int32 scalar for range limit.
+    emscripten::val cast_options = emscripten::val::object();
+    cast_options.set("label", label + "_cast_limit");
+    emscripten::val limit = wnn_builder.call<emscripten::val>(
+        "cast", dim_shape, emscripten::val("int32"), cast_options);
+    emscripten::val reshape_options = emscripten::val::object();
+    reshape_options.set("label", label + "_reshape_limit");
+    limit = wnn_builder.call<emscripten::val>(
+        "reshape", limit, emscripten::val::array(std::vector<uint32_t>{}), reshape_options);
+
+    emscripten::val range_options = emscripten::val::object();
+    range_options.set("label", label);
+    return wnn_builder.call<emscripten::val>("range", zero_scalar, limit, one_scalar, range_options);
+  }
+
+  // Fallback: dynamicExpand([1], dim_shape) → cumulativeSum(axis=0) → sub(1)
+  emscripten::val one_constant =
+      model_builder.CreateOrGetConstant<int>(ONNX_NAMESPACE::TensorProto_DataType_INT32, 1, {1});
+
+  emscripten::val options = emscripten::val::object();
+  options.set("label", label + "_expand");
+  emscripten::val ones = wnn_builder.call<emscripten::val>("dynamicExpand", one_constant, dim_shape, options);
+
+  emscripten::val cumsum_options = emscripten::val::object();
+  cumsum_options.set("label", label + "_cumsum");
+  cumsum_options.set("exclusive", false);
+  cumsum_options.set("reversed", false);
+  ones = wnn_builder.call<emscripten::val>("cumulativeSum", ones, gsl::narrow<uint32_t>(0), cumsum_options);
+
+  options.set("label", label + "_sub");
+  return wnn_builder.call<emscripten::val>("sub", ones, one_constant, options);
+}
+
 /*
     RotaryEmbedding Helper: Apply rotary positional embedding to input tensor.
     Reused by both RotaryEmbedding and GQA ops.
@@ -185,40 +236,20 @@ inline Status ApplyRotaryEmbedding(
 
   // Helper: generate a 1D range [0, 1, ..., sequence_length-1] with dynamic or static sequence_length.
   auto build_sequence_range = [&](const std::string& label_suffix) -> emscripten::val {
-    emscripten::val value_one_constant = shape_utils::GetShapeConstantOne(model_builder);
-
-    emscripten::val range = emscripten::val::undefined();
-    if (!has_dynamic_input) {
-      // Static path: expand [1] → [S] using expand with concrete shape.
-      emscripten::val input_desc = wnn_builder.call<emscripten::val>("describe", input);
-      uint32_t seq_len = input_desc["shape"][1].as<uint32_t>();
-      emscripten::val expand_options = emscripten::val::object();
-      expand_options.set("label", node_name + "_rotary_range_expand" + label_suffix);
-      range = wnn_builder.call<emscripten::val>(
-          "expand", value_one_constant, emscripten::val::array(std::vector<uint32_t>{seq_len}), expand_options);
-    } else {
-      // Dynamic path: expand [1] → [S] using dynamicExpand with shape from input dim 1.
-      emscripten::val shape_options = emscripten::val::object();
-      shape_options.set("label", node_name + "_rotary_range_shape" + label_suffix);
-      emscripten::val input_shape_op = wnn_builder.call<emscripten::val>("shape", input, shape_options);
-      if (model_builder.IsInt64Supported()) {
-        shape_options.set("label", node_name + "_rotary_range_cast" + label_suffix);
-        input_shape_op = wnn_builder.call<emscripten::val>(
-            "cast", input_shape_op, emscripten::val("int64"), shape_options);
-      }
-      emscripten::val s_dim = shape_utils::SliceShapeRange(wnn_builder, input_shape_op, 1, 1);
-
-      shape_options.set("label", node_name + "_rotary_range_expand" + label_suffix);
-      range = wnn_builder.call<emscripten::val>(
-          "dynamicExpand", value_one_constant, s_dim, shape_options);
+    // Get [S] shape from input dim 1 via shape() → slice, then use BuildRange.
+    emscripten::val shape_options = emscripten::val::object();
+    shape_options.set("label", node_name + "_rotary_range_shape" + label_suffix);
+    emscripten::val input_shape_op = wnn_builder.call<emscripten::val>("shape", input, shape_options);
+    emscripten::val s_dim = shape_utils::SliceShapeRange(wnn_builder, input_shape_op, 1, 1,
+                                                         node_name + "_rotary_range_slice_s");
+    emscripten::val range = BuildRange(
+        model_builder, s_dim, node_name + "_rotary_range" + label_suffix);
+    // BuildRange returns INT32; cast to INT64 if needed for downstream add with position_ids.
+    if (model_builder.IsInt64Supported()) {
+      emscripten::val cast_options = emscripten::val::object();
+      cast_options.set("label", node_name + "_rotary_range_cast" + label_suffix);
+      range = wnn_builder.call<emscripten::val>("cast", range, emscripten::val("int64"), cast_options);
     }
-
-    emscripten::val cumsum_options = emscripten::val::object();
-    cumsum_options.set("label", node_name + "_rotary_position_ids_range_cumsum" + label_suffix);
-    cumsum_options.set("exclusive", false);
-    cumsum_options.set("reversed", false);
-    range = wnn_builder.call<emscripten::val>("cumulativeSum", range, gsl::narrow<uint32_t>(0), cumsum_options);
-    range = wnn_builder.call<emscripten::val>("sub", range, value_one_constant);
     return range;
   };
 

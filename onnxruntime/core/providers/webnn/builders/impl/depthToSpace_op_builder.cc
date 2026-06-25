@@ -71,13 +71,14 @@ Status DepthToSpaceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     // Note: ComputeShape gathers dim at same index — but here target dim 4 should get input dim 2.
     // ComputeShape can't handle cross-index gathering. Build manually using SliceShapeRange.
     emscripten::val wnn_builder = model_builder.GetBuilder();
-    emscripten::val shape_opts = emscripten::val::object();
-    shape_opts.set("label", node.Name() + "_shape1_shape");
-    emscripten::val input_shape_op = wnn_builder.call<emscripten::val>("shape", input, shape_opts);
+    emscripten::val shape_options = emscripten::val::object();
+    shape_options.set("label", node.Name() + "_shape1_shape");
+    emscripten::val input_shape_op = wnn_builder.call<emscripten::val>("shape", input, shape_options);
 
     emscripten::val shape1_segments = emscripten::val::array();
     // B from input dim 0
-    shape1_segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, input_shape_op, 0, 1));
+    shape1_segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, input_shape_op, 0, 1,
+                                                                   node.Name() + "_shape1_slice_B"));
     // Static middle dims
     if (mode == "DCR") {
       std::vector<uint32_t> mid{static_cast<uint32_t>(blocksize), static_cast<uint32_t>(blocksize),
@@ -93,11 +94,12 @@ Status DepthToSpaceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
           mid, {3}));
     }
     // H, W from input dims 2, 3
-    shape1_segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, input_shape_op, 2, 2));
+    shape1_segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, input_shape_op, 2, 2,
+                                                                   node.Name() + "_shape1_slice_HW"));
 
-    shape_opts.set("label", node.Name() + "_shape1_concat");
+    shape_options.set("label", node.Name() + "_shape1_concat");
     emscripten::val shape1_operand = wnn_builder.call<emscripten::val>(
-        "concat", shape1_segments, 0, shape_opts);
+        "concat", shape1_segments, 0, shape_options);
 
     options.set("label", node.Name() + "_reshape1");
     emscripten::val tmp = wnn_builder.call<emscripten::val>(
@@ -122,12 +124,13 @@ Status DepthToSpaceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     // and -1 would give H*bs*W*bs (wrong, we need two separate dims).
     //
     // Best approach: compute H*bs = reduceProduct(dims[2:4]), W*bs = reduceProduct(dims[4:6])
-    shape_opts.set("label", node.Name() + "_shape2_shape");
-    emscripten::val tmp_shape = wnn_builder.call<emscripten::val>("shape", tmp, shape_opts);
+    shape_options.set("label", node.Name() + "_shape2_shape");
+    emscripten::val tmp_shape = wnn_builder.call<emscripten::val>("shape", tmp, shape_options);
 
     emscripten::val shape2_segments = emscripten::val::array();
     // B from dim 0
-    shape2_segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, tmp_shape, 0, 1));
+    shape2_segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, tmp_shape, 0, 1,
+                                                                   node.Name() + "_shape2_slice_B"));
     // C' (static)
     shape2_segments.call<void>("push", model_builder.CreateOrGetConstant<uint32_t>(
         ONNX_NAMESPACE::TensorProto_DataType_UINT32, static_cast<uint32_t>(new_channels), {1}));
@@ -138,9 +141,9 @@ Status DepthToSpaceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     shape2_segments.call<void>("push", shape_utils::ReduceShapeRange(
         model_builder, tmp_shape, 4, 2, node.Name() + "_shape2_w_reduce"));
 
-    shape_opts.set("label", node.Name() + "_shape2_concat");
+    shape_options.set("label", node.Name() + "_shape2_concat");
     emscripten::val shape2_operand = wnn_builder.call<emscripten::val>(
-        "concat", shape2_segments, 0, shape_opts);
+        "concat", shape2_segments, 0, shape_options);
 
     options = emscripten::val::object();
     options.set("label", node.Name());
