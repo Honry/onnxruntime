@@ -91,7 +91,12 @@ Status TileOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     output = model_builder.GetBuilder().call<emscripten::val>("dynamicTile", input, repetitions_operand, options);
   } else {
     // Non-constant repetitions: use operand directly for dynamicTile.
+    // Cast to uint32 (ONNX repeats is int64, dynamicTile requires uint32).
     emscripten::val repetitions_operand = model_builder.GetOperand(input_defs[1]->Name());
+    emscripten::val cast_options = emscripten::val::object();
+    cast_options.set("label", node.Name() + "_cast_repeats_uint32");
+    repetitions_operand = model_builder.GetBuilder().call<emscripten::val>(
+        "cast", repetitions_operand, emscripten::val("uint32"), cast_options);
     output = model_builder.GetBuilder().call<emscripten::val>("dynamicTile", input, repetitions_operand, options);
   }
 
@@ -138,15 +143,8 @@ bool TileOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // Check input 1 (repetitions operand) against dynamicTile's "repetitions" parameter.
-  int32_t repetitions_type;
-  if (!GetType(*input_defs[1], repetitions_type, logger)) {
-    return false;
-  }
-  if (!IsDataTypeSupportedByWebNNOp("Tile", webnn_op_type, repetitions_type, wnn_limits,
-                                    "repetitions", "repeats", logger)) {
-    return false;
-  }
+  // dynamicTile's repetitions is always uint32 (we cast at build time).
+  // Skip type check — ONNX repeats input is int64 but we handle the conversion.
 
   return true;
 }

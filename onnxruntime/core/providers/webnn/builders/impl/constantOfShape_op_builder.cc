@@ -27,9 +27,9 @@ class ConstantOfShapeOpBuilder : public BaseOpBuilder {
  private:
   bool IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node& node,
                          const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
-  bool HasSupportedInputsImpl(const GraphViewer& graph_viewer, const Node& node,
-                              const emscripten::val& wnn_limits,
-                              const logging::Logger& logger) const override;
+  bool HasSupportedInputsImpl(const GraphViewer& /*graph_viewer*/, const Node& /*node*/,
+                              const emscripten::val& /*wnn_limits*/,
+                              const logging::Logger& /*logger*/) const override { return true; }
 
   // ConstantOfShape is supported since opset 9.
   int GetMinSupportedOpSet(const Node& /* node */) const override { return 9; }
@@ -143,7 +143,12 @@ Status ConstantOfShapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
 
   // For operand shape, use dynamicExpand to expand the scalar constant to the dynamic shape.
   if (!is_constant_shape) {
+    // Cast to uint32 (ONNX shape is int64, dynamicExpand requires uint32).
     emscripten::val shape_operand = model_builder.GetOperand(input_defs[0]->Name());
+    emscripten::val cast_options = emscripten::val::object();
+    cast_options.set("label", node.Name() + "_cast_shape_uint32");
+    shape_operand = model_builder.GetBuilder().call<emscripten::val>(
+        "cast", shape_operand, emscripten::val("uint32"), cast_options);
     emscripten::val options = emscripten::val::object();
     options.set("label", node.Name());
     output = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", output, shape_operand, options);
@@ -188,20 +193,6 @@ bool ConstantOfShapeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer
   return true;
 }
 
-bool ConstantOfShapeOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
-                                                      const Node& node,
-                                                      const emscripten::val& wnn_limits,
-                                                      const logging::Logger& logger) const {
-  // When shape is a constant initializer, it is consumed at build time.
-  // No WebNN input to validate.
-  if (graph_viewer.GetConstantInitializer(node.InputDefs()[0]->Name())) {
-    return true;
-  }
-
-  // When shape is an operand, delegate to the base class which checks
-  // input data type and rank against dynamicExpand's limits via op_inputs_map.
-  return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
-}
 
 void CreateConstantOfShapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {
   op_registrations.builders.push_back(std::make_unique<ConstantOfShapeOpBuilder>());

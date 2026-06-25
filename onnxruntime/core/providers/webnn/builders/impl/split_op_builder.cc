@@ -71,7 +71,12 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   emscripten::val output_array = emscripten::val::undefined();
   if (is_operand_split) {
     // Operand split path: use dynamicSplit with the splits operand.
+    // Cast to uint32 (ONNX split is int64, dynamicSplit requires uint32).
     emscripten::val splits_operand = model_builder.GetOperand(split_name);
+    emscripten::val cast_options = emscripten::val::object();
+    cast_options.set("label", node.Name() + "_cast_splits_uint32");
+    splits_operand = model_builder.GetBuilder().call<emscripten::val>(
+        "cast", splits_operand, emscripten::val("uint32"), cast_options);
     output_array = model_builder.GetBuilder().call<emscripten::val>("dynamicSplit", input, splits_operand, options);
   } else {
     // Constant split path: read split count or explicit split lengths.
@@ -231,15 +236,8 @@ bool SplitOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // Check input 1 (splits operand) against dynamicSplit's "splits" parameter.
-  int32_t splits_type;
-  if (!GetType(*input_defs[1], splits_type, logger)) {
-    return false;
-  }
-  if (!IsDataTypeSupportedByWebNNOp("Split", webnn_op_type, splits_type, wnn_limits,
-                                    "splits", "split", logger)) {
-    return false;
-  }
+  // dynamicSplit's splits is always uint32 (we cast at build time).
+  // Skip type check — ONNX split input is int64 but we handle the conversion.
 
   return true;
 }

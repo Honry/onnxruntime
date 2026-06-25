@@ -170,15 +170,8 @@ bool ExpandOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // Check input 1 (shape operand) against dynamicExpand's "newShape" parameter.
-  int32_t shape_type;
-  if (!GetType(*input_defs[1], shape_type, logger)) {
-    return false;
-  }
-  if (!IsDataTypeSupportedByWebNNOp("Expand", webnn_op_type, shape_type, wnn_limits,
-                                    "newShape", "shape", logger)) {
-    return false;
-  }
+  // dynamicExpand's newShape is always uint32 (we cast at build time).
+  // Skip type check — ONNX shape input is int64 but we handle the conversion.
 
   return true;
 }

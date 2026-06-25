@@ -112,7 +112,16 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     }
   } else {
     // Operand shape path: shape is a non-constant operand. Use dynamicReshape directly.
+    // Cast to uint32 if needed (ONNX shape is int64, dynamicReshape requires uint32).
     emscripten::val shape_operand = model_builder.GetOperand(input_defs[1]->Name());
+    int32_t shape_type;
+    if (GetType(*input_defs[1], shape_type, logger) &&
+        shape_type != ONNX_NAMESPACE::TensorProto_DataType_UINT32) {
+      emscripten::val cast_options = emscripten::val::object();
+      cast_options.set("label", node.Name() + "_cast_shape_uint32");
+      shape_operand = model_builder.GetBuilder().call<emscripten::val>(
+          "cast", shape_operand, emscripten::val("uint32"), cast_options);
+    }
     output = model_builder.GetBuilder().call<emscripten::val>(
         "dynamicReshape", input, shape_operand, options);
   }
@@ -194,15 +203,8 @@ bool ReshapeOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // Check input 1 (shape operand) against dynamicReshape's "newShape" parameter.
-  int32_t shape_type;
-  if (!GetType(*input_defs[1], shape_type, logger)) {
-    return false;
-  }
-  if (!IsDataTypeSupportedByWebNNOp("Reshape", webnn_op_type, shape_type, wnn_limits,
-                                    "newShape", "shape", logger)) {
-    return false;
-  }
+  // dynamicReshape's newShape is always uint32 (ComputeShape casts at build time).
+  // Skip type check — ONNX shape input is int64 but we handle the conversion.
 
   return true;
 }
