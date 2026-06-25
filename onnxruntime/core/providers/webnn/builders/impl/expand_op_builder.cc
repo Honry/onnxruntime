@@ -78,7 +78,16 @@ Status ExpandOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     output = model_builder.GetBuilder().call<emscripten::val>("expand", input, output_shape_arr, options);
   } else {
     // Operand shape path: use dynamicExpand with the shape operand.
+    // dynamicExpand requires uint32 shape — cast if the operand is int64.
     emscripten::val shape_operand = model_builder.GetOperand(input_defs[1]->Name());
+    int32_t shape_type;
+    if (GetType(*input_defs[1], shape_type, logger) &&
+        shape_type != ONNX_NAMESPACE::TensorProto_DataType_UINT32) {
+      emscripten::val cast_options = emscripten::val::object();
+      cast_options.set("label", node.Name() + "_cast_shape_uint32");
+      shape_operand = model_builder.GetBuilder().call<emscripten::val>(
+          "cast", shape_operand, emscripten::val("uint32"), cast_options);
+    }
     output = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", input, shape_operand, options);
   }
 

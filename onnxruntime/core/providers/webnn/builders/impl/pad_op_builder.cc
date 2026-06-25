@@ -171,11 +171,11 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
         starts.push_back(start_padding[i] >= 0 ? SafeInt<uint32_t>(0) : SafeInt<uint32_t>(-start_padding[i]));
         sizes.push_back(SafeInt<uint32_t>(input_shape[i] + start_padding[i] + end_padding[i]));
       }
-      emscripten::val slice_opts = emscripten::val::object();
-      slice_opts.set("label", label + "_slice_output");
+      emscripten::val slice_options = emscripten::val::object();
+      slice_options.set("label", label + "_slice_output");
       output = builder.call<emscripten::val>("slice", output,
                                              emscripten::val::array(starts),
-                                             emscripten::val::array(sizes), slice_opts);
+                                             emscripten::val::array(sizes), slice_options);
     }
   } else if (is_constant_pads) {
     // Constant pads but dynamic input: use dynamicPad with constant pads operands.
@@ -233,29 +233,29 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
       const emscripten::val mask_const = model_builder.CreateOrGetConstant<uint8_t>(
           ONNX_NAMESPACE::TensorProto_DataType_UINT8, label + "_mask", mask, shape_1d(2 * rank));
 
-      emscripten::val opts = emscripten::val::object();
-      opts.set("label", label + "_pads_gather");
+      emscripten::val options = emscripten::val::object();
+      options.set("label", label + "_pads_gather");
       emscripten::val pads_expanded = builder.call<emscripten::val>(
-          "gather", pads_op, gather_idx_const, opts);
-      opts.set("label", label + "_pads_select");
+          "gather", pads_op, gather_idx_const, options);
+      options.set("label", label + "_pads_select");
       pads_op = builder.call<emscripten::val>(
-          "where", mask_const, pads_expanded, zeros_const, opts);
+          "where", mask_const, pads_expanded, zeros_const, options);
     }
 
     // Split ONNX pads [begin0..beginR, end0..endR] into two operands for dynamicPad.
-    emscripten::val slice_opts = emscripten::val::object();
-    slice_opts.set("label", label + "_pads_begin_slice");
+    emscripten::val slice_options = emscripten::val::object();
+    slice_options.set("label", label + "_pads_begin_slice");
     emscripten::val beginning_pads = builder.call<emscripten::val>(
         "slice", pads_op,
         emscripten::val::array(std::vector<uint32_t>{0}),
         emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
-        slice_opts);
-    slice_opts.set("label", label + "_pads_end_slice");
+        slice_options);
+    slice_options.set("label", label + "_pads_end_slice");
     emscripten::val ending_pads = builder.call<emscripten::val>(
         "slice", pads_op,
         emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
         emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
-        slice_opts);
+        slice_options);
     output = builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, options);
   }
 
