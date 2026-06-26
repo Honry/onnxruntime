@@ -243,26 +243,86 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
     }
 
     // Split ONNX pads [begin0..beginR, end0..endR] into two operands for dynamicPad.
-    // Cast to uint32 (ONNX pads is int64, dynamicPad requires uint32).
-    emscripten::val slice_options = emscripten::val::object();
-    slice_options.set("label", label + "_pads_begin_slice");
+    emscripten::val common_options = emscripten::val::object();
+    common_options.set("label", label + "_pads_begin_slice");
     emscripten::val beginning_pads = builder.call<emscripten::val>(
         "slice", pads_op,
         emscripten::val::array(std::vector<uint32_t>{0}),
         emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
-        slice_options);
-    slice_options.set("label", label + "_pads_end_slice");
+        common_options);
+    common_options.set("label", label + "_pads_end_slice");
     emscripten::val ending_pads = builder.call<emscripten::val>(
         "slice", pads_op,
         emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
         emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
-        slice_options);
-    emscripten::val cast_options = emscripten::val::object();
-    cast_options.set("label", label + "_cast_begin_uint32");
-    beginning_pads = builder.call<emscripten::val>("cast", beginning_pads, emscripten::val("uint32"), cast_options);
-    cast_options.set("label", label + "_cast_end_uint32");
-    ending_pads = builder.call<emscripten::val>("cast", ending_pads, emscripten::val("uint32"), cast_options);
-    output = builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, options);
+        common_options);
+
+    // ONNX Pad allows negative pads (trim/crop). WebNN dynamicPad only accepts non-negative
+    // uint32 values. Decompose: clamp negatives to 0 for padding, then dynamicSlice to trim.
+    int32_t pads_type;
+    ORT_RETURN_IF_NOT(GetType(*input_defs[1], pads_type, logger), "Cannot get pads type");
+    const bool use_int64 = pads_type == ONNX_NAMESPACE::TensorProto_DataType_INT64 &&
+                           model_builder.IsInt64Supported();
+    const int32_t pads_data_type = use_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
+                                             : ONNX_NAMESPACE::TensorProto_DataType_INT32;
+    const std::string type_str = use_int64 ? "int64" : "int32";
+
+    const emscripten::val zero_const = use_int64
+        ? model_builder.CreateOrGetConstant<int64_t>(pads_data_type, int64_t{0},
+              std::vector<uint32_t>{static_cast<uint32_t>(rank)})
+        : model_builder.CreateOrGetConstant<int32_t>(pads_data_type, int32_t{0},
+              std::vector<uint32_t>{static_cast<uint32_t>(rank)});
+
+    // Clamped pads for padding (negatives → 0).
+    common_options.set("label", label + "_begin_pos");
+    emscripten::val begin_pos = builder.call<emscripten::val>(
+        "max", beginning_pads, zero_const, common_options);
+    common_options.set("label", label + "_end_pos");
+    emscripten::val end_pos = builder.call<emscripten::val>(
+        "max", ending_pads, zero_const, common_options);
+
+    // Trim amounts (abs of negatives, 0 for positive pads).
+    common_options.set("label", label + "_neg_begin");
+    emscripten::val neg_begin = builder.call<emscripten::val>(
+        "sub", zero_const, beginning_pads, common_options);
+    common_options.set("label", label + "_begin_trim");
+    emscripten::val begin_trim = builder.call<emscripten::val>(
+        "max", neg_begin, zero_const, common_options);
+    common_options.set("label", label + "_neg_end");
+    emscripten::val neg_end = builder.call<emscripten::val>(
+        "sub", zero_const, ending_pads, common_options);
+    common_options.set("label", label + "_end_trim");
+    emscripten::val end_trim = builder.call<emscripten::val>(
+        "max", neg_end, zero_const, common_options);
+
+    // Cast clamped pads to uint32 and call dynamicPad.
+    common_options.set("label", label + "_cast_begin_uint32");
+    begin_pos = builder.call<emscripten::val>("cast", begin_pos, emscripten::val("uint32"), common_options);
+    common_options.set("label", label + "_cast_end_uint32");
+    end_pos = builder.call<emscripten::val>("cast", end_pos, emscripten::val("uint32"), common_options);
+    output = builder.call<emscripten::val>("dynamicPad", input, begin_pos, end_pos, options);
+
+    // Apply dynamicSlice to trim regions where pads were negative.
+    // starts = begin_trim, sizes = shape(padded) - begin_trim - end_trim
+    common_options.set("label", label + "_padded_shape");
+    emscripten::val padded_shape = builder.call<emscripten::val>("shape", output, common_options);
+    common_options.set("label", label + "_padded_shape_cast");
+    emscripten::val padded_shape_typed = builder.call<emscripten::val>(
+        "cast", padded_shape, emscripten::val(type_str), common_options);
+    common_options.set("label", label + "_trim_sizes_sub1");
+    emscripten::val sizes = builder.call<emscripten::val>(
+        "sub", padded_shape_typed, begin_trim, common_options);
+    common_options.set("label", label + "_trim_sizes_sub2");
+    sizes = builder.call<emscripten::val>("sub", sizes, end_trim, common_options);
+
+    common_options.set("label", label + "_cast_trim_starts");
+    begin_trim = builder.call<emscripten::val>("cast", begin_trim, emscripten::val("uint32"), common_options);
+    common_options.set("label", label + "_cast_trim_sizes");
+    sizes = builder.call<emscripten::val>("cast", sizes, emscripten::val("uint32"), common_options);
+
+    emscripten::val trim_options = emscripten::val::object();
+    trim_options.set("label", label + "_trim");
+    output = builder.call<emscripten::val>("dynamicSlice", output, begin_trim, sizes, trim_options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));

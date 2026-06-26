@@ -54,14 +54,16 @@ Status SizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
     emscripten::val wnn_builder = model_builder.GetBuilder();
 
-    emscripten::val shape_options = emscripten::val::object();
-    shape_options.set("label", node.Name() + "_shape");
-    emscripten::val shape_operand = wnn_builder.call<emscripten::val>("shape", input, shape_options);
+    emscripten::val common_options = emscripten::val::object();
+    common_options.set("label", node.Name() + "_shape");
+    emscripten::val shape_operand = wnn_builder.call<emscripten::val>("shape", input, common_options);
 
-    emscripten::val reduce_options = emscripten::val::object();
-    reduce_options.set("label", node.Name());
-    reduce_options.set("keepDimensions", false);
-    output = wnn_builder.call<emscripten::val>("reduceProduct", shape_operand, reduce_options);
+    common_options.set("label", node.Name() + "_reduceProduct");
+    output = wnn_builder.call<emscripten::val>("reduceProduct", shape_operand, common_options);
+
+    std::string output_type_str = model_builder.IsInt64Supported() ? "int64" : "int32";
+    common_options.set("label", node.Name() + "_cast_output_" + output_type_str);
+    output = wnn_builder.call<emscripten::val>("cast", output, emscripten::val(output_type_str), common_options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));

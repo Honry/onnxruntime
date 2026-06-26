@@ -295,6 +295,178 @@ inline emscripten::val Reshape(ModelBuilder& model_builder,
   }
 }
 
+// Get the input's runtime shape as a 1-D operand in the working signed type (int64 or int32).
+// WebNN shape() returns uint32; this casts to int64 if supported, otherwise int32.
+inline emscripten::val GetShapeInWorkingType(ModelBuilder& model_builder,
+                                             const emscripten::val& input,
+                                             const std::string& label) {
+  emscripten::val wnn_builder = model_builder.GetBuilder();
+  const bool is_int64 = model_builder.IsInt64Supported();
+  const std::string type_str = is_int64 ? "int64" : "int32";
+
+  emscripten::val options = emscripten::val::object();
+  options.set("label", label + "_shape");
+  emscripten::val shape_op = wnn_builder.call<emscripten::val>("shape", input, options);
+  options.set("label", label + "_shape_cast");
+  return wnn_builder.call<emscripten::val>("cast", shape_op, emscripten::val(type_str), options);
+}
+
+// Normalize negative indices by wrapping relative to dim_sizes, then clamp to [0, dim_size].
+// Handles both negative indices (ONNX relative-to-end semantics) and out-of-bounds values
+// like INT_MAX (ONNX "to end of axis" convention in Slice).
+//
+// indices and dim_sizes must be the same data type (int64 or int32) and same shape.
+// Returns the normalized and clamped indices in the same type.
+inline emscripten::val NormalizeAndClampIndices(ModelBuilder& model_builder,
+                                               const emscripten::val& indices,
+                                               const emscripten::val& dim_sizes,
+                                               uint32_t length,
+                                               const std::string& label) {
+  emscripten::val wnn_builder = model_builder.GetBuilder();
+  const bool is_int64 = model_builder.IsInt64Supported();
+  const int32_t working_type = is_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
+                                        : ONNX_NAMESPACE::TensorProto_DataType_INT32;
+
+  const emscripten::val zero_const = is_int64
+      ? model_builder.CreateOrGetConstant<int64_t>(working_type, int64_t{0},
+            std::vector<uint32_t>{length})
+      : model_builder.CreateOrGetConstant<int32_t>(working_type, int32_t{0},
+            std::vector<uint32_t>{length});
+
+  emscripten::val options = emscripten::val::object();
+
+  // Wrap negative: val = where(val < 0, val + dim_size, val)
+  options.set("label", label + "_is_neg");
+  emscripten::val is_neg = wnn_builder.call<emscripten::val>(
+      "lesser", indices, zero_const, options);
+  options.set("label", label + "_add_dim");
+  emscripten::val wrapped = wnn_builder.call<emscripten::val>(
+      "add", indices, dim_sizes, options);
+  options.set("label", label + "_wrap");
+  emscripten::val normalized = wnn_builder.call<emscripten::val>(
+      "where", is_neg, wrapped, indices, options);
+
+  // Clamp to [0, dim_size]: min(dim_sizes), then max(0)
+  options.set("label", label + "_clamp_max");
+  normalized = wnn_builder.call<emscripten::val>("min", normalized, dim_sizes, options);
+  options.set("label", label + "_clamp_min");
+  return wnn_builder.call<emscripten::val>("max", normalized, zero_const, options);
+}
+
+// Resolve ONNX -1/0 semantics in a runtime shape operand for dynamicReshape.
+//
+// When Reshape's shape input is a non-constant operand (e.g., from an unfused Concat),
+// it may contain -1 (infer dimension) or 0 (copy from input). WebNN's dynamicReshape
+// requires all positive uint32 values, so we insert sub-ops to resolve these at runtime:
+//
+//   0 → replaced with the corresponding dimension from shape(input)
+//  -1 → replaced with total_elements / product(other_dims)
+//
+// The shape_operand is expected to be int64 (ONNX's Reshape shape type).
+// input_rank and output_rank are known at build time from ONNX shape info.
+// Returns a uint32 operand suitable for dynamicReshape.
+inline emscripten::val ResolveReshapeShape(ModelBuilder& model_builder,
+                                           const emscripten::val& input,
+                                           const emscripten::val& shape_operand,
+                                           uint32_t input_rank,
+                                           uint32_t output_rank,
+                                           const std::string& label) {
+  emscripten::val wnn_builder = model_builder.GetBuilder();
+  const bool is_int64 = model_builder.IsInt64Supported();
+  const int32_t working_type = is_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
+                                        : ONNX_NAMESPACE::TensorProto_DataType_INT32;
+
+  emscripten::val shape_op = shape_operand;
+  emscripten::val options = emscripten::val::object();
+
+  // Step 1: Get input's runtime shape in working type.
+  emscripten::val input_shape_typed = GetShapeInWorkingType(model_builder, input, label);
+
+  // Step 2: Resolve 0 → copy from input shape at same position.
+  // ONNX 0 means "copy input_shape[i]". When output_rank != input_rank, we pad/slice
+  // input_shape to match output_rank so `where` operands have compatible shapes.
+  emscripten::val input_shape_aligned = input_shape_typed;
+  if (input_rank != output_rank) {
+    if (input_rank > output_rank) {
+      // Slice input_shape to output_rank (only first output_rank dims are relevant for 0-copy).
+      options.set("label", label + "_input_shape_slice");
+      input_shape_aligned = wnn_builder.call<emscripten::val>(
+          "slice", input_shape_typed,
+          emscripten::val::array(std::vector<uint32_t>{0}),
+          emscripten::val::array(std::vector<uint32_t>{output_rank}),
+          options);
+    } else {
+      // Pad input_shape with 1s to output_rank (positions beyond input_rank won't have 0
+      // in valid ONNX models, but padding ensures no shape mismatch in `where`).
+      uint32_t pad_size = output_rank - input_rank;
+      const emscripten::val pad_ones = is_int64
+          ? model_builder.CreateOrGetConstant<int64_t>(working_type, label + "_pad_ones",
+                std::vector<int64_t>(pad_size, 1), {pad_size})
+          : model_builder.CreateOrGetConstant<int32_t>(working_type, label + "_pad_ones",
+                std::vector<int32_t>(pad_size, 1), {pad_size});
+      options.set("label", label + "_input_shape_pad");
+      emscripten::val pad_segments = emscripten::val::array();
+      pad_segments.call<void>("push", input_shape_typed);
+      pad_segments.call<void>("push", pad_ones);
+      input_shape_aligned = wnn_builder.call<emscripten::val>(
+          "concat", pad_segments, 0, options);
+    }
+  }
+
+  const emscripten::val zero_const = is_int64
+      ? model_builder.CreateOrGetConstant<int64_t>(working_type, int64_t{0}, {})
+      : model_builder.CreateOrGetConstant<int32_t>(working_type, int32_t{0}, {});
+  options.set("label", label + "_is_zero");
+  emscripten::val is_zero = wnn_builder.call<emscripten::val>(
+      "equal", shape_op, zero_const, options);
+  options.set("label", label + "_resolve_zero");
+  emscripten::val shape_no_zero = wnn_builder.call<emscripten::val>(
+      "where", is_zero, input_shape_aligned, shape_op, options);
+
+  // Step 3: Resolve -1 → infer = total_elements / product(other_dims).
+  const emscripten::val neg1_const = is_int64
+      ? model_builder.CreateOrGetConstant<int64_t>(working_type, int64_t{-1}, {})
+      : model_builder.CreateOrGetConstant<int32_t>(working_type, int32_t{-1}, {});
+  options.set("label", label + "_is_neg1");
+  emscripten::val is_neg1 = wnn_builder.call<emscripten::val>(
+      "equal", shape_no_zero, neg1_const, options);
+
+  // Replace -1 with 1 for product computation.
+  const emscripten::val one_const = is_int64
+      ? model_builder.CreateOrGetConstant<int64_t>(working_type, int64_t{1}, {})
+      : model_builder.CreateOrGetConstant<int32_t>(working_type, int32_t{1}, {});
+  options.set("label", label + "_shape_for_product");
+  emscripten::val shape_for_product = wnn_builder.call<emscripten::val>(
+      "where", is_neg1, one_const, shape_no_zero, options);
+
+  // product_other = reduceProduct(shape_for_product)
+  emscripten::val reduce_options = emscripten::val::object();
+  reduce_options.set("label", label + "_product_other");
+  reduce_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0}));
+  emscripten::val product_other = wnn_builder.call<emscripten::val>(
+      "reduceProduct", shape_for_product, reduce_options);
+
+  // total_elements = reduceProduct(input_shape_typed)
+  reduce_options.set("label", label + "_total_elements");
+  emscripten::val total_elements = wnn_builder.call<emscripten::val>(
+      "reduceProduct", input_shape_typed, reduce_options);
+
+  // inferred_dim = total_elements / product_other
+  options.set("label", label + "_inferred_div");
+  emscripten::val inferred_dim = wnn_builder.call<emscripten::val>(
+      "div", total_elements, product_other, options);
+
+  // Replace -1 positions with the inferred value.
+  options.set("label", label + "_resolve_neg1");
+  emscripten::val shape_resolved = wnn_builder.call<emscripten::val>(
+      "where", is_neg1, inferred_dim, shape_no_zero, options);
+
+  // Step 4: Cast to uint32 for dynamicReshape.
+  options.set("label", label + "_cast_uint32");
+  return wnn_builder.call<emscripten::val>(
+      "cast", shape_resolved, emscripten::val("uint32"), options);
+}
+
 }  // namespace shape_utils
 }  // namespace webnn
 }  // namespace onnxruntime
