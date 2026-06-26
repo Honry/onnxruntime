@@ -16,6 +16,7 @@
 #include "core/providers/webnn/builders/op_builder_factory.h"
 
 #include "base_op_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -443,7 +444,18 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
     }
   }
 
-  // Step 4: Compute sizes and call dynamicSlice(input, starts, sizes, options).
+  // Step 4: Normalize negative starts/ends and clamp INT_MAX ends.
+  // ONNX Slice allows negative indices (relative-to-end) and INT_MAX (slice-to-end).
+  // WebNN dynamicSlice requires positive uint32 starts/sizes, so resolve these here.
+  {
+    emscripten::val dim_sizes = shape_utils::GetShapeInWorkingType(model_builder, input, label + "_norm");
+    starts_full = shape_utils::NormalizeAndClampIndices(
+        model_builder, starts_full, dim_sizes, static_cast<uint32_t>(rank), label + "_starts");
+    ends_full = shape_utils::NormalizeAndClampIndices(
+        model_builder, ends_full, dim_sizes, static_cast<uint32_t>(rank), label + "_ends");
+  }
+
+  // Step 5: Compute sizes and call dynamicSlice(input, starts, sizes, options).
   // sizes[i] = ceil((ends[i] - starts[i]) / strides[i])
   // Since strides are constants, compute: span = ends - starts, then div by strides constant.
   std::vector<uint32_t> strides_full(rank, 1);
