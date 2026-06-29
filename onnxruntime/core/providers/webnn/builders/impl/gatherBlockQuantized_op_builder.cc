@@ -55,24 +55,29 @@ Status GatherBlockQuantizedOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_
 
   // GatherBlockQuantized only supports block-wise quantization, the input and scales should have the same rank.
   // So we don't need to reshape scales for broadcasting.
-  emscripten::val zero_points = emscripten::val::undefined();
-  if (TensorExists(input_defs, 3)) {  // zero_points
-    zero_points = model_builder.GetOperand(input_defs[3]->Name());
-  } else {
-    const uint8_t default_zero_point = bits == 4 ? 0 : 128;
-    // Create a constant for zero_points, which has the same shape as scales and same type as input.
-    zero_points = model_builder.CreateOrGetConstant<uint8_t>(input_type,
-                                                             default_zero_point,
-                                                             GetNarrowedIntFromInt64<uint32_t>(scales_shape));
-  }
-
   // dequantized_input = DequantizeLinear(input, scales, zero_points)
-  common_options.set("label", node.Name() + "_dequantize_input");
-  emscripten::val dequantized_input = model_builder.GetBuilder().call<emscripten::val>("dequantizeLinear",
-                                                                                       input,
-                                                                                       scales,
-                                                                                       zero_points,
-                                                                                       common_options);
+  emscripten::val dq_options = emscripten::val::object();
+  dq_options.set("label", node.Name() + "_dequantize_input");
+  emscripten::val dequantized_input = emscripten::val::undefined();
+  if (IsZeroPointOptional()) {
+    if (TensorExists(input_defs, 3)) {
+      dq_options.set("zeroPoint", model_builder.GetOperand(input_defs[3]->Name()));
+    }
+    dequantized_input = model_builder.GetBuilder().call<emscripten::val>(
+        "dequantizeLinear", input, scales, dq_options);
+  } else {
+    emscripten::val zero_points = emscripten::val::undefined();
+    if (TensorExists(input_defs, 3)) {
+      zero_points = model_builder.GetOperand(input_defs[3]->Name());
+    } else {
+      const uint8_t default_zero_point = bits == 4 ? 0 : 128;
+      zero_points = model_builder.CreateOrGetConstant<uint8_t>(
+          input_type, default_zero_point,
+          GetNarrowedIntFromInt64<uint32_t>(scales_shape));
+    }
+    dequantized_input = model_builder.GetBuilder().call<emscripten::val>(
+        "dequantizeLinear", input, scales, zero_points, dq_options);
+  }
 
   // output = Gather(dequantized_input, indices, axis=gather_axis)
   common_options.set("label", node.Name() + "_gather");

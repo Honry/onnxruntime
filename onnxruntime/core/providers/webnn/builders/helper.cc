@@ -399,6 +399,15 @@ bool IsComputeShapesSupported() {
   return is_supported;
 }
 
+bool IsZeroPointOptional() {
+  // New API: dequantizeLinear(input, scale, options) — zeroPoint is in options.
+  // Old API: dequantizeLinear(input, scale, zeroPoint, options) — zeroPoint is positional.
+  // Detect by checking Function.length: new API has length 2 (required params only).
+  static bool is_optional =
+      emscripten::val::global("MLGraphBuilder")["prototype"]["dequantizeLinear"]["length"].as<int>() <= 2;
+  return is_optional;
+}
+
 // Convert int8 to uint4/int4 (stored as uint8), used for creating WebNN Constant
 // with same value in both high and low nibbles for uint4/int4 data type.
 uint8_t PackInt8ToUint8DoubledNibbles(int8_t value, const int32_t& data_type) {

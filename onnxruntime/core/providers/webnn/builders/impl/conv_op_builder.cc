@@ -219,9 +219,16 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
         ONNX_NAMESPACE::TensorProto_DataType_FLOAT, 1.0f, target_shape);
 
     // Dequantize x to Float32
-    common_options.set("label", node.Name() + "_dequantized_x");
-    input = model_builder.GetBuilder().call<emscripten::val>("dequantizeLinear", input, x_scale, x_zero_point,
-                                                             common_options);
+    emscripten::val dq_x_options = emscripten::val::object();
+    dq_x_options.set("label", node.Name() + "_dequantized_x");
+    if (IsZeroPointOptional()) {
+      dq_x_options.set("zeroPoint", x_zero_point);
+      input = model_builder.GetBuilder().call<emscripten::val>(
+          "dequantizeLinear", input, x_scale, dq_x_options);
+    } else {
+      input = model_builder.GetBuilder().call<emscripten::val>(
+          "dequantizeLinear", input, x_scale, x_zero_point, dq_x_options);
+    }
 
     std::vector<int64_t> w_zero_point_shape;
     if (TensorExists(input_defs, 3)) {  // w_zero_point
@@ -242,9 +249,16 @@ Status ConvOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
     emscripten::val w_scale = model_builder.CreateOrGetConstant<float>(
         ONNX_NAMESPACE::TensorProto_DataType_FLOAT, 1.0f, target_shape);
     // Dequantize w to Float32
-    common_options.set("label", node.Name() + "_dequantized_w");
-    filter = model_builder.GetBuilder().call<emscripten::val>("dequantizeLinear", filter, w_scale, w_zero_point,
-                                                              common_options);
+    emscripten::val dq_w_options = emscripten::val::object();
+    dq_w_options.set("label", node.Name() + "_dequantized_w");
+    if (IsZeroPointOptional()) {
+      dq_w_options.set("zeroPoint", w_zero_point);
+      filter = model_builder.GetBuilder().call<emscripten::val>(
+          "dequantizeLinear", filter, w_scale, dq_w_options);
+    } else {
+      filter = model_builder.GetBuilder().call<emscripten::val>(
+          "dequantizeLinear", filter, w_scale, w_zero_point, dq_w_options);
+    }
     // Conv with dequantized x and w
     options.set("label", node.Name() + "_conv_dequantized_inputs");
     output = model_builder.GetBuilder().call<emscripten::val>("conv2d", input, filter, options);

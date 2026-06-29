@@ -151,19 +151,29 @@ Status GemmOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const N
         ProcessZeroPointAndScale(b_shape, 3, model_builder, node, a_type, logger, b_zero_point, b_scale));
 
     // Dequantize A to Float32
-    common_options.set("label", node.Name() + "_dequantized_a");
-    emscripten::val dequantized_a = model_builder.GetBuilder().call<emscripten::val>("dequantizeLinear",
-                                                                                     a,
-                                                                                     a_scale,
-                                                                                     a_zero_point,
-                                                                                     common_options);
+    emscripten::val dq_a_options = emscripten::val::object();
+    dq_a_options.set("label", node.Name() + "_dequantized_a");
+    emscripten::val dequantized_a = emscripten::val::undefined();
+    if (IsZeroPointOptional()) {
+      dq_a_options.set("zeroPoint", a_zero_point);
+      dequantized_a = model_builder.GetBuilder().call<emscripten::val>(
+          "dequantizeLinear", a, a_scale, dq_a_options);
+    } else {
+      dequantized_a = model_builder.GetBuilder().call<emscripten::val>(
+          "dequantizeLinear", a, a_scale, a_zero_point, dq_a_options);
+    }
     // Dequantize B to Float32
-    common_options.set("label", node.Name() + "_dequantized_b");
-    emscripten::val dequantized_b = model_builder.GetBuilder().call<emscripten::val>("dequantizeLinear",
-                                                                                     b,
-                                                                                     b_scale,
-                                                                                     b_zero_point,
-                                                                                     common_options);
+    emscripten::val dq_b_options = emscripten::val::object();
+    dq_b_options.set("label", node.Name() + "_dequantized_b");
+    emscripten::val dequantized_b = emscripten::val::undefined();
+    if (IsZeroPointOptional()) {
+      dq_b_options.set("zeroPoint", b_zero_point);
+      dequantized_b = model_builder.GetBuilder().call<emscripten::val>(
+          "dequantizeLinear", b, b_scale, dq_b_options);
+    } else {
+      dequantized_b = model_builder.GetBuilder().call<emscripten::val>(
+          "dequantizeLinear", b, b_scale, b_zero_point, dq_b_options);
+    }
     // MatMul dequantized A and B
     common_options.set("label", node.Name() + "_matmul_dequantized_ab");
     emscripten::val matmul_dequantized_ab = model_builder.GetBuilder().call<emscripten::val>("matmul",
@@ -299,22 +309,20 @@ bool GemmOpBuilder::HasSupportedInputsImpl(const GraphViewer&, const Node& node,
     return IsInputRankSupportedByOp(node, wnn_limits, logger) &&
            IsDataTypeSupportedByOp(op_type, input0_type, wnn_limits, "a", "A", logger);
   } else if (op_type == "MatMulInteger") {
-    // Check up to 4 inputs for MatMulInteger
-    for (size_t i = 0; i < input_defs.size(); ++i) {
+    // Check input rank for A and B (zeroPoint is now an option, not a positional input).
+    for (size_t i = 0; i < 2 && i < input_defs.size(); ++i) {
       std::vector<int64_t> shape;
       if (!GetShape(*input_defs[i], shape, logger)) {
         return false;
       }
 
       // We made workaround to support 1D for input A and B, skip further checks if they are 1D
-      if (i <= 1 && shape.size() == 1) {
+      if (shape.size() == 1) {
         continue;
       }
 
-      // For DequantizeLinear, input indices: 0 (x), 1 (scale), 2 (zero_point)
       if (!IsInputRankSupported(wnn_limits, "dequantizeLinear",
-                                (i < 2) ? "input" : "zeroPoint",
-                                shape.size(), node.Name(), logger)) {
+                                "input", shape.size(), node.Name(), logger)) {
         return false;
       }
     }
