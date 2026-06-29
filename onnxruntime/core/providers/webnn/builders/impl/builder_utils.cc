@@ -174,8 +174,10 @@ emscripten::val ComputeDynamicSamePadding(ModelBuilder& model_builder,
     cast_options.set("label", node_name + "_cast_dim" + std::to_string(dim_idx));
     dim_val = builder.call<emscripten::val>("cast", dim_val, emscripten::val("int32"), cast_options);
 
-    emscripten::val stride_const = model_builder.CreateOrGetConstant<int32_t>(INT32, static_cast<int32_t>(stride), scalar_shape);
-    emscripten::val kernel_const = model_builder.CreateOrGetConstant<int32_t>(INT32, static_cast<int32_t>(kernel_size), scalar_shape);
+    emscripten::val stride_const = model_builder.CreateOrGetConstant<int32_t>(
+        INT32, static_cast<int32_t>(stride), scalar_shape);
+    emscripten::val kernel_const = model_builder.CreateOrGetConstant<int32_t>(
+        INT32, static_cast<int32_t>(kernel_size), scalar_shape);
     emscripten::val one_const = model_builder.CreateOrGetConstant<int32_t>(INT32, 1, scalar_shape);
     emscripten::val two_const = model_builder.CreateOrGetConstant<int32_t>(INT32, 2, scalar_shape);
     emscripten::val zero_const = model_builder.CreateOrGetConstant<int32_t>(INT32, 0, scalar_shape);
@@ -243,15 +245,20 @@ emscripten::val ComputeDynamicSamePadding(ModelBuilder& model_builder,
     }
   }
 
-  emscripten::val concat_options = emscripten::val::object();
-  concat_options.set("label", node_name + "_same_pad_begin_concat");
-  emscripten::val beginning_pads = builder.call<emscripten::val>("concat", begin_segments, 0, concat_options);
-  concat_options.set("label", node_name + "_same_pad_end_concat");
-  emscripten::val ending_pads = builder.call<emscripten::val>("concat", end_segments, 0, concat_options);
+  emscripten::val common_options = emscripten::val::object();
+  common_options.set("label", node_name + "_same_pad_begin_concat");
+  emscripten::val beginning_pads = builder.call<emscripten::val>("concat", begin_segments, 0, common_options);
+  common_options.set("label", node_name + "_same_pad_end_concat");
+  emscripten::val ending_pads = builder.call<emscripten::val>("concat", end_segments, 0, common_options);
 
-  emscripten::val pad_options = emscripten::val::object();
-  pad_options.set("label", node_name + "_same_pad");
-  return builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, pad_options);
+  // Cast to uint32 (dynamicPad requires uint32 padding operands).
+  common_options.set("label", node_name + "_same_pad_begin_cast");
+  beginning_pads = builder.call<emscripten::val>("cast", beginning_pads, emscripten::val("uint32"), common_options);
+  common_options.set("label", node_name + "_same_pad_end_cast");
+  ending_pads = builder.call<emscripten::val>("cast", ending_pads, emscripten::val("uint32"), common_options);
+
+  common_options.set("label", node_name + "_same_pad");
+  return builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, common_options);
 }
 
 }  // namespace webnn

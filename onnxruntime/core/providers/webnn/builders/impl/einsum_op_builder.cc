@@ -707,7 +707,6 @@ Status EinsumOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
       emscripten::val input = model_builder.GetOperand(node.InputDefs()[0]->Name());
       emscripten::val options = emscripten::val::object();
-      options.set("keepDimensions", false);
       options.set("axes", emscripten::val::array(reduced_axes));
       options.set("label", node.Name() + "_reduceSum");
 
@@ -783,7 +782,6 @@ Status EinsumOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
         reduced_axes.push_back(input_labels.size() - 1);
       }
       emscripten::val options_reduce = emscripten::val::object();
-      options_reduce.set("keepDimensions", false);
       options_reduce.set("axes", emscripten::val::array(reduced_axes));
       options_reduce.set("label", node.Name() + "_reduceSum");
       output = model_builder.GetBuilder().call<emscripten::val>("reduceSum", output, options_reduce);  // triu

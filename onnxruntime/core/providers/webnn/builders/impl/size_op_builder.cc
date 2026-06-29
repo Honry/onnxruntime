@@ -23,8 +23,12 @@ class SizeOpBuilder : public BaseOpBuilder {
  private:
   bool HasSupportedInputsImpl(const GraphViewer&, const Node& node,
                               const emscripten::val& wnn_limits, const logging::Logger& logger) const override;
-  bool HasSupportedOutputsImpl(const Node& node, const emscripten::val& wnn_limits,
-                               const logging::Logger& logger) const override;
+  // WebNN shape() outputs uint32 regardless of ONNX's int64 output type declaration.
+  // Skip output type validation to avoid rejecting the node.
+  bool HasSupportedOutputsImpl(const Node& /*node*/, const emscripten::val& /*wnn_limits*/,
+                               const logging::Logger& /*logger*/) const override {
+    return true;
+  }
 };
 
 Status SizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
@@ -58,12 +62,13 @@ Status SizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     common_options.set("label", node.Name() + "_shape");
     emscripten::val shape_operand = wnn_builder.call<emscripten::val>("shape", input, common_options);
 
-    common_options.set("label", node.Name() + "_reduceProduct");
-    output = wnn_builder.call<emscripten::val>("reduceProduct", shape_operand, common_options);
+    std::string shape_type_str = model_builder.IsInt64Supported() ? "int64" : "int32";
+    common_options.set("label", node.Name() + "_cast_shape_" + shape_type_str);
+    emscripten::val cast_shape_operand = wnn_builder.call<emscripten::val>(
+        "cast", shape_operand, emscripten::val(shape_type_str), common_options);
 
-    std::string output_type_str = model_builder.IsInt64Supported() ? "int64" : "int32";
-    common_options.set("label", node.Name() + "_cast_output_" + output_type_str);
-    output = wnn_builder.call<emscripten::val>("cast", output, emscripten::val(output_type_str), common_options);
+    common_options.set("label", node.Name() + "_reduceProduct");
+    output = wnn_builder.call<emscripten::val>("reduceProduct", cast_shape_operand, common_options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -85,27 +90,6 @@ bool SizeOpBuilder::HasSupportedInputsImpl(const GraphViewer&, const Node& node,
     const std::string_view webnn_op_type = GetWebNNOpType(decomposed_op_type);
     const std::string_view webnn_input_name = GetWebNNOpFirstInputName(decomposed_op_type);
     if (!IsDataTypeSupportedByWebNNOp(op_type, webnn_op_type, input_type, wnn_limits, webnn_input_name, "input", logger)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-bool SizeOpBuilder::HasSupportedOutputsImpl(const Node& node,
-                                            const emscripten::val& wnn_limits,
-                                            const logging::Logger& logger) const {
-  const auto& output_defs = node.OutputDefs();
-  const std::string_view op_type = node.OpType();
-  int32_t output_type = 0;
-  if (!GetType(*output_defs[0], output_type, logger)) {
-    return false;
-  }
-
-  // Check if the output data type is supported by every decomposed WebNN op.
-  for (const std::string_view decomposed_op_type : decomposed_op_map.at(op_type)) {
-    const std::string_view webnn_op_type = GetWebNNOpType(decomposed_op_type);
-    if (!IsDataTypeSupportedByWebNNOp(op_type, webnn_op_type, output_type, wnn_limits, "output", "output", logger)) {
       return false;
     }
   }

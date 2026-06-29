@@ -245,9 +245,17 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                         "Error getting Resize sizes");
       options.set("sizes", emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(sizes)));
     } else {
+      // Read scales and extract spatial axes.
+      const auto& scales_tensor = *initializers.at(input_defs[2]->Name());
+      std::vector<uint8_t> unpacked_scales;
+      ORT_RETURN_IF_NOT(UnpackInitializerData(scales_tensor, unpacked_scales,
+                                              model_builder.GetGraphViewer(), logger),
+                        "Error unpacking scales tensor");
+      const float* all_scales = reinterpret_cast<const float*>(unpacked_scales.data());
       std::vector<float> scales;
-      ORT_RETURN_IF_NOT(GetResizeScalesAndAxes(model_builder.GetGraphViewer(), node, scales, axes, logger),
-                        "Error getting Resize scales");
+      for (int64_t axis : axes) {
+        scales.push_back(all_scales[static_cast<size_t>(axis)]);
+      }
       options.set("scales", emscripten::val::array(scales));
     }
     output = model_builder.GetBuilder().call<emscripten::val>("resample2d", input, options);
