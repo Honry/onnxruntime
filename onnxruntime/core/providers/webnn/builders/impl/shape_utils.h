@@ -295,14 +295,15 @@ inline emscripten::val Reshape(ModelBuilder& model_builder,
   }
 }
 
-// Get the input's runtime shape as a 1-D operand in the working signed type (int64 or int32).
-// WebNN shape() returns uint32; this casts to int64 if supported, otherwise int32.
+// Get the input's runtime shape as a 1-D operand cast to the specified signed type.
+// WebNN shape() returns uint32; this casts to the target type for arithmetic compatibility.
+// use_int64: true → cast to int64, false → cast to int32.
 inline emscripten::val GetShapeInWorkingType(ModelBuilder& model_builder,
                                              const emscripten::val& input,
+                                             bool use_int64,
                                              const std::string& label) {
   emscripten::val wnn_builder = model_builder.GetBuilder();
-  const bool is_int64 = model_builder.IsInt64Supported();
-  const std::string type_str = is_int64 ? "int64" : "int32";
+  const std::string type_str = use_int64 ? "int64" : "int32";
 
   emscripten::val options = emscripten::val::object();
   options.set("label", label + "_shape");
@@ -315,22 +316,23 @@ inline emscripten::val GetShapeInWorkingType(ModelBuilder& model_builder,
 // Handles both negative indices (ONNX relative-to-end semantics) and out-of-bounds values
 // like INT_MAX (ONNX "to end of axis" convention in Slice).
 //
-// indices and dim_sizes must be the same data type (int64 or int32) and same shape.
+// All operands (indices, dim_sizes, zero_const) must be the same signed data type.
+// use_int64: true if operands are int64, false if int32.
 // Returns the normalized and clamped indices in the same type.
 inline emscripten::val NormalizeAndClampIndices(ModelBuilder& model_builder,
                                                const emscripten::val& indices,
                                                const emscripten::val& dim_sizes,
+                                               bool use_int64,
                                                uint32_t length,
                                                const std::string& label) {
   emscripten::val wnn_builder = model_builder.GetBuilder();
-  const bool is_int64 = model_builder.IsInt64Supported();
-  const int32_t working_type = is_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
-                                        : ONNX_NAMESPACE::TensorProto_DataType_INT32;
+  const int32_t data_type = use_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
+                                      : ONNX_NAMESPACE::TensorProto_DataType_INT32;
 
-  const emscripten::val zero_const = is_int64
-      ? model_builder.CreateOrGetConstant<int64_t>(working_type, int64_t{0},
+  const emscripten::val zero_const = use_int64
+      ? model_builder.CreateOrGetConstant<int64_t>(data_type, int64_t{0},
             std::vector<uint32_t>{length})
-      : model_builder.CreateOrGetConstant<int32_t>(working_type, int32_t{0},
+      : model_builder.CreateOrGetConstant<int32_t>(data_type, int32_t{0},
             std::vector<uint32_t>{length});
 
   emscripten::val options = emscripten::val::object();
@@ -380,7 +382,7 @@ inline emscripten::val ResolveReshapeShape(ModelBuilder& model_builder,
   emscripten::val options = emscripten::val::object();
 
   // Step 1: Get input's runtime shape in working type.
-  emscripten::val input_shape_typed = GetShapeInWorkingType(model_builder, input, label);
+  emscripten::val input_shape_typed = GetShapeInWorkingType(model_builder, input, is_int64, label);
 
   // Step 2: Resolve 0 → copy from input shape at same position.
   // ONNX 0 means "copy input_shape[i]". When output_rank != input_rank, we pad/slice
