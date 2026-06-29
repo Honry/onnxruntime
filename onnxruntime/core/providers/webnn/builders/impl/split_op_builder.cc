@@ -89,8 +89,12 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       const auto& split_tensor = *initializers.at(split_name);
       ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(split_tensor, splits, model_builder.GetGraphViewer(), logger),
                         "Cannot get input for split.");
-    } else if (!helper.HasAttr("split")) {
-      split_count = node.OutputDefs().size();
+    }
+
+    // If neither explicit splits nor split_count was determined, default to equal split
+    // based on the number of outputs (handles empty split attribute and missing num_outputs).
+    if (splits.empty() && split_count == 0) {
+      split_count = static_cast<uint32_t>(node.OutputDefs().size());
     }
 
     if (!HasDynamicShape(input_shape)) {

@@ -263,7 +263,6 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     emscripten::val pos_range = BuildRange(
         model_builder, pos_s_shape, node.Name() + "_/GQA/pos/range");
     emscripten::val pos_reduce_options = emscripten::val::object();
-    pos_reduce_options.set("keepDimensions", false);
     pos_reduce_options.set("label", node.Name() + "_/GQA/pos/s_minus_1");
     emscripten::val pos_s_minus_1 = model_builder.GetBuilder().call<emscripten::val>(
         "reduceMax", pos_range, pos_reduce_options);
@@ -447,7 +446,6 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   emscripten::val seq_range = BuildRange(
       model_builder, seq_ones_shape, node.Name() + "_/GQA/seq_range");
   emscripten::val seq_reduce_options = emscripten::val::object();
-  seq_reduce_options.set("keepDimensions", false);
   seq_reduce_options.set("label", node.Name() + "_/GQA/s_minus_1");
   emscripten::val s_minus_1 = model_builder.GetBuilder().call<emscripten::val>(
       "reduceMax", seq_range, seq_reduce_options);
