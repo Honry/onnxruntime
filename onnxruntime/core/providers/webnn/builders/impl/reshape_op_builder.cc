@@ -112,24 +112,36 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     }
   } else {
     // Operand shape path: shape is a non-constant operand (e.g., from an unfused Concat).
-    // The operand may contain -1 (infer) or 0 (copy from input) at runtime.
-    // Resolve these to actual positive values before calling dynamicReshape.
     emscripten::val shape_operand = model_builder.GetOperand(input_defs[1]->Name());
 
-    // Get input rank and output rank from ONNX shape info (both known at build time).
-    std::vector<int64_t> input_shape;
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
-    uint32_t input_rank = static_cast<uint32_t>(input_shape.size());
+    // Shape op outputs are always positive (never 0 or -1), so skip resolution.
+    // Using Cast(Shape(x)) directly preserves partial shape info for backend fusions.
+    const Node* shape_producer = model_builder.GetGraphViewer().GetProducerNode(input_defs[1]->Name());
+    if (shape_producer && shape_producer->OpType() == "Shape") {
+      if (model_builder.IsInt64Supported()) {
+        emscripten::val cast_options = emscripten::val::object();
+        cast_options.set("label", node.Name() + "_cast_shape");
+        shape_operand = model_builder.GetBuilder().call<emscripten::val>(
+            "cast", shape_operand, emscripten::val("uint32"), cast_options);
+      }
+      output = model_builder.GetBuilder().call<emscripten::val>(
+          "dynamicReshape", input, shape_operand, options);
+    } else {
+      // Non-Shape operand: may contain -1 (infer) or 0 (copy from input).
+      // Resolve these to actual positive values before calling dynamicReshape.
+      std::vector<int64_t> input_shape;
+      ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
+      uint32_t input_rank = static_cast<uint32_t>(input_shape.size());
 
-    // Output rank = length of the shape tensor (shape of shape input is [output_rank]).
-    std::vector<int64_t> shape_tensor_shape;
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[1], shape_tensor_shape, logger), "Cannot get shape tensor shape");
-    uint32_t output_rank = static_cast<uint32_t>(shape_tensor_shape[0]);
+      std::vector<int64_t> shape_tensor_shape;
+      ORT_RETURN_IF_NOT(GetShape(*input_defs[1], shape_tensor_shape, logger), "Cannot get shape tensor shape");
+      uint32_t output_rank = static_cast<uint32_t>(shape_tensor_shape[0]);
 
-    emscripten::val resolved_shape = shape_utils::ResolveReshapeShape(
-        model_builder, input, shape_operand, input_rank, output_rank, node.Name());
-    output = model_builder.GetBuilder().call<emscripten::val>(
-        "dynamicReshape", input, resolved_shape, options);
+      emscripten::val resolved_shape = shape_utils::ResolveReshapeShape(
+          model_builder, input, shape_operand, input_rank, output_rank, node.Name());
+      output = model_builder.GetBuilder().call<emscripten::val>(
+          "dynamicReshape", input, resolved_shape, options);
+    }
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));

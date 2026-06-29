@@ -448,11 +448,20 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
   // ONNX Slice allows negative indices (relative-to-end) and INT_MAX (slice-to-end).
   // WebNN dynamicSlice requires positive uint32 starts/sizes, so resolve these here.
   {
-    emscripten::val dim_sizes = shape_utils::GetShapeInWorkingType(model_builder, input, label + "_norm");
+    // Match the type of starts/ends operands (int64 if supported AND original type is int64).
+    int32_t tind_type;
+    ORT_RETURN_IF_NOT(GetType(*input_defs[1], tind_type, logger), "Cannot get starts type");
+    const bool norm_use_int64 = tind_type == ONNX_NAMESPACE::TensorProto_DataType_INT64 &&
+                                model_builder.IsInt64Supported();
+
+    emscripten::val dim_sizes = shape_utils::GetShapeInWorkingType(
+        model_builder, input, norm_use_int64, label + "_norm");
     starts_full = shape_utils::NormalizeAndClampIndices(
-        model_builder, starts_full, dim_sizes, static_cast<uint32_t>(rank), label + "_starts");
+        model_builder, starts_full, dim_sizes, norm_use_int64,
+        static_cast<uint32_t>(rank), label + "_starts");
     ends_full = shape_utils::NormalizeAndClampIndices(
-        model_builder, ends_full, dim_sizes, static_cast<uint32_t>(rank), label + "_ends");
+        model_builder, ends_full, dim_sizes, norm_use_int64,
+        static_cast<uint32_t>(rank), label + "_ends");
   }
 
   // Step 5: Compute sizes and call dynamicSlice(input, starts, sizes, options).

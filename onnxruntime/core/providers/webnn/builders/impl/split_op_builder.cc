@@ -85,14 +85,14 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
     if (helper.HasAttr("num_outputs")) {
       split_count = helper.Get("num_outputs", 0);
-    } else if (!split_name.empty()) {
+    }
+    if (!split_name.empty() && splits.empty()) {
       const auto& split_tensor = *initializers.at(split_name);
       ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(split_tensor, splits, model_builder.GetGraphViewer(), logger),
                         "Cannot get input for split.");
     }
 
-    // If neither explicit splits nor split_count was determined, default to equal split
-    // based on the number of outputs (handles empty split attribute and missing num_outputs).
+    // Default to equal split based on number of outputs when no split info is available.
     if (splits.empty() && split_count == 0) {
       split_count = static_cast<uint32_t>(node.OutputDefs().size());
     }
@@ -112,15 +112,12 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
             "split", input, emscripten::val::array(splits), options);
       }
     } else {
-      // Dynamic input with constant splits: use dynamicSplit with a constant operand.
+      // Dynamic input: use dynamicSplit with a splits operand.
       if (split_count > 0 && splits.empty()) {
-        // Even split: each output gets axis_dim / split_count.
-        // Create a splits operand with split_count equal values — but we don't know axis dim.
-        // dynamicSplit with split_count should work the same as static split.
         output_array = model_builder.GetBuilder().call<emscripten::val>(
             "dynamicSplit", input, split_count, options);
       } else {
-        // Explicit splits: create a constant operand.
+        // Explicit splits: create a constant uint32 operand.
         const emscripten::val& splits_operand = model_builder.CreateOrGetConstant<uint32_t>(
             ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_splits",
             splits, {static_cast<uint32_t>(splits.size())});
