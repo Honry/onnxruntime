@@ -242,8 +242,22 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
 
   emscripten::val position_ids = emscripten::val::undefined();
   bool use_position_ids_as_offset = false;
+  // Cache key for the derived position offset. The offset is seqlens_k - (S - 1), so it is fully
+  // determined by the seqlens_k input and the query sequence dimension. Every layer of a decoder
+  // stack shares both, so they reuse one offset; keying on the seq identity (not just seqlens_k)
+  // keeps it correct if a graph ever mixes sequence lengths. Empty seq identity disables sharing.
+  const std::string pos_seq_id = GetDimIdentity(*input_defs[0], 1);
+  const std::string pos_offset_key =
+      pos_seq_id.empty() ? std::string()
+                         : "gqa_pos_offset:" + input_defs[5]->Name() + ":" + pos_seq_id;
   if (has_position_ids) {
     position_ids = model_builder.GetOperand(input_defs[9]->Name());
+  } else if (!pos_offset_key.empty() && model_builder.HasCachedOperand(pos_offset_key)) {
+    // Reuse the offset computed by the first layer instead of rebuilding the identical
+    // shape→slice→range→reduceMax→sub→unsqueeze→cast chain per layer — those duplicates would
+    // otherwise survive as distinct SSA tensors the backend's CSE cannot merge.
+    position_ids = model_builder.GetCachedOperand(pos_offset_key);
+    use_position_ids_as_offset = true;
   } else {
     // If position_ids is not provided, derive it from seqlens_k as the per-batch position offset.
     // The model computes seqlens_k = reduceSum(attention_mask) - 1 = past_seq_len + (S - 1).
@@ -290,6 +304,10 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       position_ids = reshaped_seqlens_k;
     }
     use_position_ids_as_offset = true;
+    // Cache for reuse by the remaining attention layers (no-op when sharing is disabled).
+    if (!pos_offset_key.empty()) {
+      model_builder.AddCachedOperand(pos_offset_key, position_ids);
+    }
   }
 
   const uint32_t group_size = SafeInt<uint32_t>(num_heads / kv_num_heads);
@@ -329,6 +347,12 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     // TransposeOptimizer would cancel (breaking OpenVINO's RoPE pattern matching).
     const bool rotary_output_bnsh = true;
 
+    // Identity of the query/key sequence dimension (dim 1), used to share the [0..S-1] rotary range
+    // across every layer and across the paired Q/K calls. All GQA layers see the same sequence
+    // dimension, so they collapse to one range — matching the single model-level arange a typical
+    // PyTorch export produces.
+    const std::string seq_range_key = GetDimIdentity(*input_defs[0], 1);
+
     // Reshape query to (batch_size, sequence_length, num_heads, head_size) for rotary embedding
     emscripten::val reshaped_query_for_rotary = shape_utils::Reshape(
         model_builder, query_input, input_q_shape,
@@ -353,7 +377,8 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
         use_position_ids_as_offset,  // position_ids_is_offset
         rotary_output_bnsh,
         HasDynamicShape(input_q_shape),
-        rotary_query_output));
+        rotary_query_output,
+        seq_range_key));
 
     // Reshape key to (batch_size, sequence_length, kv_num_heads, head_size) for rotary embedding
     emscripten::val reshaped_key_for_rotary = shape_utils::Reshape(
@@ -379,7 +404,8 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
         use_position_ids_as_offset,  // position_ids_is_offset
         rotary_output_bnsh,
         HasDynamicShape(input_q_shape),
-        rotary_key_output));
+        rotary_key_output,
+        seq_range_key));
 
     // BNSH outputs: use directly, skip reshape-to-flat + later reshape+transpose
     query_input = rotary_query_output;  // [B, N, S, H]

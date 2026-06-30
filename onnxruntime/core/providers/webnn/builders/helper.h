@@ -73,6 +73,27 @@ inline bool HasDynamicShape(const std::vector<int64_t>& shape) {
   return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == kDynamicDim; });
 }
 
+// Returns a stable identity token for dimension `axis` of `node_arg`, suitable as a cache key for
+// operands whose value is fully determined by that dimension's extent (e.g. a [0..S-1] range built
+// from the sequence dimension). ONNX guarantees two dims that share a dim_value (static) or a
+// dim_param (symbolic) have the same runtime extent, so equal tokens ⇒ identical operand. Static
+// dims are keyed "v<value>", symbolic dims "p<param>". Returns empty string when the axis is out of
+// range or carries neither (unknown extent) — callers must treat empty as "not shareable".
+inline std::string GetDimIdentity(const NodeArg& node_arg, int axis) {
+  const auto* shape_proto = node_arg.Shape();
+  if (shape_proto == nullptr || axis < 0 || axis >= shape_proto->dim_size()) {
+    return {};
+  }
+  const auto& dim = shape_proto->dim(axis);
+  if (dim.has_dim_value()) {
+    return "v" + std::to_string(dim.dim_value());
+  }
+  if (dim.has_dim_param() && !dim.dim_param().empty()) {
+    return "p" + dim.dim_param();
+  }
+  return {};
+}
+
 // Check if the WebNN context supports dynamic shape operations (shape + dynamicReshape).
 // Returns true if both ops are listed in opSupportLimits, meaning the browser can handle
 // nodes with dynamic (symbolic) dimensions.

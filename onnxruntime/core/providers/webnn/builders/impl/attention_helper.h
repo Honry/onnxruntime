@@ -138,7 +138,11 @@ inline Status ApplyRotaryEmbedding(
     bool position_ids_is_offset,
     bool output_bnsh,              // If true, output stays in BNSH format (no back-transpose)
     bool has_dynamic_input,        // If true, use dynamic ops (dynamicReshape, unsqueeze, squeeze, dynamicExpand)
-    emscripten::val& output) {
+    emscripten::val& output,
+    // Identity token for the input's sequence dimension (from GetDimIdentity). The [0..S-1] range
+    // built below depends only on this dimension, so callers sharing a seq identity (every layer of
+    // a decoder stack, plus the paired Q/K calls) reuse one range. Empty disables sharing.
+    const std::string& seq_range_cache_key = "") {
   emscripten::val wnn_builder = model_builder.GetBuilder();
   ORT_RETURN_IF_NOT(head_size >= rotary_embedding_dim,
                     "Rotary embedding dimension must be less than or equal to head_size");
@@ -235,7 +239,18 @@ inline Status ApplyRotaryEmbedding(
   emscripten::val second_half = split_halves[1];  // [B, num_heads, S, half_dim]
 
   // Helper: generate a 1D range [0, 1, ..., sequence_length-1] with dynamic or static sequence_length.
+  // The range depends only on the sequence length (input dim 1). Calls that share a sequence
+  // identity — every layer of a decoder stack, plus the paired query/key calls — reuse one range
+  // instead of rebuilding the identical shape→slice→range chain per call; those duplicates would
+  // otherwise survive as distinct SSA tensors the backend's CSE cannot merge, bloating the graph and
+  // blocking pattern fusion. Keying on the seq-dim identity (not a global string) keeps this correct
+  // for models with more than one sequence length (e.g. encoder/decoder cross-attention).
+  const std::string seq_range_full_key =
+      seq_range_cache_key.empty() ? std::string() : "rotary_seq_range:" + seq_range_cache_key;
   auto build_sequence_range = [&](const std::string& label_suffix) -> emscripten::val {
+    if (!seq_range_full_key.empty() && model_builder.HasCachedOperand(seq_range_full_key)) {
+      return model_builder.GetCachedOperand(seq_range_full_key);
+    }
     // Get [S] shape from input dim 1 via shape() → slice, then use BuildRange.
     emscripten::val shape_options = emscripten::val::object();
     shape_options.set("label", node_name + "_rotary_range_shape" + label_suffix);
@@ -249,6 +264,9 @@ inline Status ApplyRotaryEmbedding(
       emscripten::val cast_options = emscripten::val::object();
       cast_options.set("label", node_name + "_rotary_range_cast" + label_suffix);
       range = wnn_builder.call<emscripten::val>("cast", range, emscripten::val("int64"), cast_options);
+    }
+    if (!seq_range_full_key.empty()) {
+      model_builder.AddCachedOperand(seq_range_full_key, range);
     }
     return range;
   };
