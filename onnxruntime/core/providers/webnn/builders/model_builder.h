@@ -43,6 +43,17 @@ class ModelBuilder {
 
   void AddOperand(const std::string& name, const emscripten::val& operand);
 
+  // Cross-node cache for operands that are computed identically by many nodes (e.g. the RoPE
+  // position offset derived from seqlens_k, which is the same for every attention layer).
+  // Builders can compute such an operand once and reuse it instead of rebuilding the identical
+  // subgraph per layer — the duplicates otherwise survive as distinct SSA tensors that the
+  // backend's CSE cannot merge, blocking fusion and bloating the graph.
+  bool HasCachedOperand(const std::string& key) const { return cached_operands_.count(key) > 0; }
+  const emscripten::val& GetCachedOperand(const std::string& key) const { return cached_operands_.at(key); }
+  void AddCachedOperand(const std::string& key, const emscripten::val& operand) {
+    cached_operands_.insert(std::make_pair(key, operand));
+  }
+
   // Register a WebNN constant operand using the provided tensor and descriptor information.
   Status RegisterConstant(const onnx::TensorProto& tensor, emscripten::val& operand,
                           emscripten::val& desc, const logging::Logger& logger);
@@ -81,6 +92,8 @@ class ModelBuilder {
   emscripten::val wnn_limits_ = emscripten::val::undefined();
   bool enable_causal_lm_;
   InlinedHashMap<std::string, emscripten::val> wnn_operands_;
+  // Cross-node reuse cache (see HasCachedOperand/GetCachedOperand/AddCachedOperand).
+  InlinedHashMap<std::string, emscripten::val> cached_operands_;
   std::vector<std::string> input_names_;
   std::vector<std::string> output_names_;
   // The output names which need to be casted to int32.

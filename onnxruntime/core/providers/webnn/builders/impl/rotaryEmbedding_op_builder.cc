@@ -184,6 +184,9 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
   // Apply rotary embedding using the helper function.
   // For 4D input: output_bnsh=true avoids a back-transpose that would form a pair with the
   // external transpose, preventing the downstream optimizer from breaking RoPE pattern matching.
+  // Identity of the sequence dimension (3D input: dim 1; 4D input [B, N, S, H]: dim 2), so repeated
+  // RotaryEmbedding nodes over the same sequence share one [0..S-1] range.
+  const std::string seq_range_key = GetDimIdentity(*input_defs[0], input_is_4d ? 2 : 1);
   emscripten::val output;
   ORT_RETURN_IF_ERROR(ApplyRotaryEmbedding(
       model_builder,
@@ -201,7 +204,8 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
       position_ids_is_offset,
       input_is_4d,  // output_bnsh: 4D input is BNSH, output stays BNSH; 3D needs BSNH for reshape
       HasDynamicShape(input_shape),
-      output));
+      output,
+      seq_range_key));
 
   if (input_is_4d) {
     // Output is already BNSH (same as original input layout). No transpose needed.
