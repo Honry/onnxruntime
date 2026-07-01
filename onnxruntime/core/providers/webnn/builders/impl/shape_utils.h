@@ -260,7 +260,19 @@ inline emscripten::val Reshape(ModelBuilder& model_builder,
   emscripten::val options = emscripten::val::object();
   options.set("label", label);
 
-  if (!HasDynamicShape(input_shape)) {
+  // Check if all referenced input dims are positive (static and non-zero).
+  // target_dims 0 means "copy from input[i]" — need that dim to be known and positive.
+  bool can_use_static = !HasDynamicShape(input_shape);
+  if (can_use_static) {
+    for (size_t i = 0; i < target_dims.size(); ++i) {
+      if (target_dims[i] == 0 && (i >= input_shape.size() || input_shape[i] <= 0)) {
+        can_use_static = false;
+        break;
+      }
+    }
+  }
+
+  if (can_use_static) {
     // Static path: resolve 0/-1 to concrete values.
     std::vector<uint32_t> concrete_shape;
     concrete_shape.reserve(target_dims.size());
@@ -274,7 +286,6 @@ inline emscripten::val Reshape(ModelBuilder& model_builder,
       if (target_dims[i] == 0) {
         concrete_shape.push_back(SafeInt<uint32_t>(input_shape[i]));
       } else if (target_dims[i] == -1) {
-        // Compute inferred dim: for 0-positions, multiply their known input values into product.
         int64_t product_with_zeros = product_known;
         for (size_t j = 0; j < target_dims.size(); ++j) {
           if (target_dims[j] == 0 && j < input_shape.size()) {
