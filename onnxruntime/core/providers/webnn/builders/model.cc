@@ -33,6 +33,26 @@ Status Model::ComputeShapes(
                            "MLGraph.computeShapes() is not available");
   }
 
+  // Fast path: if the input shapes are identical to the last successful call, reuse the
+  // cached output shapes and skip the JS computeShapes() round-trip. This is a pure-function
+  // memoization keyed on input shapes, valid because the compiled MLGraph never changes.
+  // Common in LLM decode loops that repeat the same input shapes across many runs.
+  if (!cached_compute_input_shapes_.empty() &&
+      cached_compute_input_shapes_.size() == input_shapes.size()) {
+    bool same = true;
+    for (const auto& [name, shape] : input_shapes) {
+      auto it = cached_compute_input_shapes_.find(name);
+      if (it == cached_compute_input_shapes_.end() || it->second != shape) {
+        same = false;
+        break;
+      }
+    }
+    if (same) {
+      output_shapes = cached_compute_output_shapes_;
+      return Status::OK();
+    }
+  }
+
   emscripten::val js_input_shapes = emscripten::val::object();
   for (const auto& [name, shape] : input_shapes) {
     emscripten::val js_shape = emscripten::val::array();
@@ -66,6 +86,10 @@ Status Model::ComputeShapes(
     }
     output_shapes.emplace(output_name, std::move(shape));
   }
+
+  // Populate the memo only on the success path, so a failed call never poisons the cache.
+  cached_compute_input_shapes_ = input_shapes;
+  cached_compute_output_shapes_ = output_shapes;
 
   return Status::OK();
 }

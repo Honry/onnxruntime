@@ -303,38 +303,46 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
       {
         std::unique_lock<std::mutex> lock(model->GetMutex());
 
-        // Try computeShapes as the primary shape resolution when dynamic dims exist.
+        // Output shape resolution priority (cheapest / most authoritative first):
+        //   1. Static compile-time dim.
+        //   2. Symbolic dim_param inference from runtime input shapes (free, authoritative).
+        //   3. Caller pre-allocated output tensor from session.run(feeds, fetches) (free).
+        //   4. MLGraph.computeShapes() gatekeeper (reliable but expensive: WASM<->JS + WebNN
+        //      shape inference). Invoked lazily and at most once per run, only for dims still
+        //      unresolved after 1-3.
+        //   5. Heuristic max-bound guess (cheap but unreliable, so it runs after computeShapes).
+        //   6. Hard error.
+        //
+        // computeShapes() is a graph-wide call that resolves all outputs at once, so we invoke
+        // it lazily via this closure the first time an output dim cannot be resolved cheaply.
+        // Model::ComputeShapes() additionally memoizes results across runs with identical inputs.
         InlinedHashMap<std::string, std::vector<int64_t>> computed_output_shapes;
         bool shapes_computed = false;
-
-        if (model->SupportsComputeShapes()) {
-          bool has_dynamic_output = false;
-          for (size_t i = 0; i < fused_output_shapes.size() && !has_dynamic_output; ++i) {
-            for (const auto& dim : fused_output_shapes[i]) {
-              if (dim == webnn::kDynamicDim) {
-                has_dynamic_output = true;
-                break;
-              }
-            }
+        bool compute_shapes_attempted = false;
+        auto try_compute_shapes = [&]() {
+          if (compute_shapes_attempted) {
+            return;
+          }
+          compute_shapes_attempted = true;
+          if (!model->SupportsComputeShapes()) {
+            return;
           }
 
-          if (has_dynamic_output) {
-            InlinedHashMap<std::string, std::vector<int64_t>> input_shapes_for_compute;
-            for (size_t i = 0; i < model_inputs.size(); i++) {
-              const auto& input_name = model_inputs[i];
-              auto input_idx = model->GetMappedInputIdx(input_name);
-              input_shapes_for_compute.emplace(input_name, runtime_input_shapes[input_idx]);
-            }
-
-            auto status = model->ComputeShapes(input_shapes_for_compute, computed_output_shapes);
-            if (status.IsOK()) {
-              shapes_computed = true;
-            } else {
-              LOGS_DEFAULT(WARNING) << "[WebNN] computeShapes() failed: " << status.ErrorMessage()
-                                    << ". Falling back to symbolic shape resolution.";
-            }
+          InlinedHashMap<std::string, std::vector<int64_t>> input_shapes_for_compute;
+          for (size_t i = 0; i < model_inputs.size(); i++) {
+            const auto& input_name = model_inputs[i];
+            auto input_idx = model->GetMappedInputIdx(input_name);
+            input_shapes_for_compute.emplace(input_name, runtime_input_shapes[input_idx]);
           }
-        }
+
+          auto status = model->ComputeShapes(input_shapes_for_compute, computed_output_shapes);
+          if (status.IsOK()) {
+            shapes_computed = true;
+          } else {
+            LOGS_DEFAULT(WARNING) << "[WebNN] computeShapes() failed: " << status.ErrorMessage()
+                                  << ". Falling back to heuristic shape resolution.";
+          }
+        };
 
         InlinedHashMap<std::string, webnn::OnnxTensorData> outputs;
         outputs.reserve(model_outputs.size());
@@ -345,24 +353,18 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
           const auto output_idx = model->GetMappedOutputIdx(output_name);
 
           std::vector<int64_t> output_shape;
-          bool resolved_by_compute_shapes = false;
 
-          if (shapes_computed) {
-            auto it = computed_output_shapes.find(output_name);
-            if (it != computed_output_shapes.end()) {
-              output_shape = it->second;
-              resolved_by_compute_shapes = true;
-            }
-          }
-
-          if (!resolved_by_compute_shapes) {
-            // Use fused-node output shape metadata as allocation baseline.
+          {
+            // Step 1: static compile-time baseline. Use fused-node output shape metadata;
+            // any dim left as kDynamicDim is resolved by the cheaper-first steps below.
             output_shape = output_info.shape;
             if (output_idx < fused_output_shapes.size() && !fused_output_shapes[output_idx].empty()) {
               output_shape = fused_output_shapes[output_idx];
             }
 
-            // Resolve dynamic output dimensions from current runtime input shapes via dim_param.
+            // Step 2: symbolic dim_param inference. Resolve dynamic output dimensions from
+            // current runtime input shapes via dim_param (exact match, N*dim_param, dim_a+dim_b).
+            // Free and authoritative, so preferred over computeShapes().
             if (output_idx < output_dim_params.size()) {
               const auto& dim_params = output_dim_params[output_idx];
               const size_t dims_to_resolve = output_shape.size() < dim_params.size() ? output_shape.size() : dim_params.size();
@@ -474,8 +476,9 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
               }
             }
 
-            // Fallback: if any dynamic dimensions remain unresolved, try to read the shape from
-            // a pre-allocated output tensor (provided via session.run(feeds, fetches)).
+            // Step 3: caller pre-allocated output tensor. If any dynamic dimensions remain
+            // unresolved, try to read the shape from a pre-allocated output tensor (provided
+            // via session.run(feeds, fetches)). Free and authoritative.
             {
               bool has_unresolved = false;
               for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
@@ -500,7 +503,35 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
               }
             }
 
-            // If dynamic dimensions remain unresolved, try to infer from the max bounds
+            // Step 4: computeShapes() gatekeeper. If dims still remain unresolved after the free
+            // methods above, ask WebNN to compute output shapes. This is the reliable-but-expensive
+            // path (WASM<->JS + WebNN shape inference), so it runs only now, lazily, and at most
+            // once per run (the closure guards re-entry; Model::ComputeShapes memoizes across runs).
+            {
+              bool has_unresolved = false;
+              for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
+                if (output_shape[dim_idx] == webnn::kDynamicDim) {
+                  has_unresolved = true;
+                  break;
+                }
+              }
+              if (has_unresolved) {
+                try_compute_shapes();
+                if (shapes_computed) {
+                  auto it = computed_output_shapes.find(output_name);
+                  if (it != computed_output_shapes.end() && it->second.size() == output_shape.size()) {
+                    for (size_t dim_idx = 0; dim_idx < output_shape.size(); ++dim_idx) {
+                      if (output_shape[dim_idx] == webnn::kDynamicDim && it->second[dim_idx] > 0) {
+                        output_shape[dim_idx] = it->second[dim_idx];
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            // Step 5: heuristic max-bound guess. If dynamic dimensions remain unresolved, try to
+            // infer from the max bounds
             // of known dims (e.g., use batch_size=1 for dim 0, sequence_length for others).
             // This handles intermediate outputs (like Expand's causal mask) whose shapes are
             // data-dependent and not annotated with a resolvable dim_param.
