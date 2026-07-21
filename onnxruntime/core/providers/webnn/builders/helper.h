@@ -73,6 +73,26 @@ inline bool HasDynamicShape(const std::vector<int64_t>& shape) {
   return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == kDynamicDim; });
 }
 
+// Check if a built WebNN operand carries a dynamic shape. Unlike the NodeArg/vector overloads
+// (which reflect the ONNX graph), this inspects the operand's actual runtime shape, so it also
+// catches dims that became symbolic through dynamic* ops (reshapeDynamic/expandDynamic/...) even
+// when the originating ONNX shape was static. A symbolic dim surfaces as a non-numeric entry (or
+// 0) in operand["shape"]; a dynamic-rank operand has a null/undefined shape.
+inline bool HasDynamicShape(const emscripten::val& operand) {
+  emscripten::val dims = operand["shape"];
+  if (dims.isNull() || dims.isUndefined()) {
+    return true;
+  }
+  const uint32_t rank = dims["length"].as<uint32_t>();
+  for (uint32_t i = 0; i < rank; ++i) {
+    emscripten::val d = dims[i];
+    if (!d.isNumber() || d.as<uint32_t>() == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Returns a stable identity token for dimension `axis` of `node_arg`, suitable as a cache key for
 // operands whose value is fully determined by that dimension's extent (e.g. a [0..S-1] range built
 // from the sequence dimension). ONNX guarantees two dims that share a dim_value (static) or a

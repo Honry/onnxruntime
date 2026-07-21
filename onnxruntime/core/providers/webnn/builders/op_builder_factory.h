@@ -27,6 +27,7 @@ void CreateClipOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_
 void CreateConstantOfShapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateConvOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateConcatOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateCausalConvWithStateOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateCumSumOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateDepthToSpaceOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateDropoutOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
@@ -44,6 +45,7 @@ void CreateGruOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_r
 void CreateLogicalOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateLRNOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateLpNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateLinearAttentionOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateLstmOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateMatMulNBitsOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateMaxMinOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);

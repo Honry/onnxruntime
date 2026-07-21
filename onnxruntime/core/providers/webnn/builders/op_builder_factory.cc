@@ -137,6 +137,14 @@ static OpBuilderRegistrations CreateOpBuilderRegistrations() {
     CreateGroupQueryAttentionOpBuilder("GroupQueryAttention", op_registrations);
   }
 
+  {  // LinearAttention (gated-DeltaNet linear attention, decode/T=1 path)
+    CreateLinearAttentionOpBuilder("LinearAttention", op_registrations);
+  }
+
+  {  // CausalConvWithState (stateful causal depthwise conv1d)
+    CreateCausalConvWithStateOpBuilder("CausalConvWithState", op_registrations);
+  }
+
   {  // Flatten
     CreateFlattenOpBuilder("Flatten", op_registrations);
   }

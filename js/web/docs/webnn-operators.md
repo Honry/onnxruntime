@@ -21,6 +21,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | AveragePool | ai.onnx(7-9, 10, 11, 12-18, 19+) | averagePool2d | Only supports 4-D input, 2-D 'kernel_shape' |
 | BatchNormalization | ai.onnx(7-8, 9-13, 14, 15+) | batchNormalization | Only supports 'training_mode' value is 0, one output |
 | Cast | ai.onnx(7-8, 9-12, 13-18, 19-20, 21+) | cast | |
+| CausalConvWithState | com.microsoft(1+) | concat, conv2d, dynamicPad, dynamicSlice, mul, reshape, sigmoid, squeeze, unsqueeze | Only supports ndim=1; 'weight' must be a constant depthwise kernel (C, 1, K); activation is one of none/silu/swish |
 | Ceil | ai.onnx(7-12, 13+) | ceil | |
 | Clip | ai.onnx(7-10, 11, 12, 13+) | clamp | |
 | Concat | ai.onnx(7-10, 11-12, 13+) | concat | |
@@ -64,6 +65,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | IsInf | ai.onnx(10-19, 20+) | isInfinite, equal, greater | |
 | LayerNormalization | ai.onnx(7-16, 17+) | layerNormalization | |
 | LeakyRelu | ai.onnx(7-15, 16+) | leakyRelu | |
+| LinearAttention | com.microsoft(1+) | add, concat, dynamicExpand, exp, matmul, mul, reshape, slice, sub, transpose | The sequential gated-DeltaNet recurrence is unrolled over the (per-shape specialized) sequence length: one step for decode (T=1), T steps for prefill (T>1). Requires a static sequence length at build time. Supports all update_rules and standard/inverse GQA |
 | Less | ai.onnx(7-8, 9-12, 13+) | lesser | |
 | LessOrEqual | ai.onnx(12-15, 16+) | lesserOrEqual | |
 | Log | ai.onnx(7-12, 13+) | log | |

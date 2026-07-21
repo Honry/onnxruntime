@@ -15,52 +15,6 @@
 namespace onnxruntime {
 namespace webnn {
 
-// Broadcast a KV tensor from [B,kv_N,P,H] to [B,N,P,H] via unsqueeze → expandDynamic → reshapeDynamic.
-// Used to replicate kv_num_heads to match num_heads when group_size > 1.
-static emscripten::val GroupBroadcast(ModelBuilder& model_builder,
-                                      const emscripten::val& present_kv,
-                                      uint32_t group_size,
-                                      uint32_t num_heads,
-                                      const std::string& label) {
-  emscripten::val wnn_builder = model_builder.GetBuilder();
-
-  // Step 1: unsqueeze [B,kv_N,P,H] → [B,kv_N,1,P,H]
-  emscripten::val unsqueeze_options = emscripten::val::object();
-  unsqueeze_options.set("label", label + "_unsqueeze");
-  emscripten::val unsqueezed = wnn_builder.call<emscripten::val>(
-      "unsqueeze", present_kv, emscripten::val::array(std::vector<uint32_t>{2}), unsqueeze_options);
-
-  // Step 2: expandDynamic [B,kv_N,1,P,H] → [B,kv_N,G,P,H]
-  // Build expand shape: shape(unsqueezed) with dim 2 replaced by group_size.
-  emscripten::val shape_options = emscripten::val::object();
-  shape_options.set("label", label + "_expand_shape");
-  emscripten::val shape_op = wnn_builder.call<emscripten::val>("shape", unsqueezed, shape_options);
-  emscripten::val segments = emscripten::val::array();
-  segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_op, 0, 2,
-                                                           label + "_slice_0_2"));
-  segments.call<void>("push", model_builder.CreateOrGetConstant<uint32_t>(
-      ONNX_NAMESPACE::TensorProto_DataType_UINT32, static_cast<uint32_t>(group_size), {1}));
-  segments.call<void>("push", shape_utils::SliceShapeRange(wnn_builder, shape_op, 3, 2,
-                                                           label + "_slice_3_2"));
-  emscripten::val concat_options = emscripten::val::object();
-  concat_options.set("label", label + "_expand_shape_concat");
-  emscripten::val expand_target = wnn_builder.call<emscripten::val>("concat", segments, 0, concat_options);
-
-  emscripten::val expand_options = emscripten::val::object();
-  expand_options.set("label", label + "_expand");
-  emscripten::val expanded = wnn_builder.call<emscripten::val>(
-      "expandDynamic", unsqueezed, expand_target, expand_options);
-
-  // Step 3: reshapeDynamic [B,kv_N,G,P,H] → [B,N,P,H]
-  emscripten::val reshape_shape = shape_utils::ComputeShape(
-      model_builder, present_kv,
-      {0, static_cast<int64_t>(num_heads), 0, 0},
-      label + "_reshape");
-  emscripten::val reshape_options = emscripten::val::object();
-  reshape_options.set("label", label + "_reshape");
-  return wnn_builder.call<emscripten::val>("reshapeDynamic", expanded, reshape_shape, reshape_options);
-}
-
 class GroupQueryAttentionOpBuilder : public BaseOpBuilder {
  public:
   void AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const override;
@@ -688,10 +642,10 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     // -> expandDynamic -> (B,kv_N,G,P,H)
     // -> reshapeDynamic -> (B,N,P,H) broadcasted kv shape
 
-    true_present_key = GroupBroadcast(model_builder, present_key, group_size, num_heads,
+    true_present_key = BroadcastHeads(model_builder, present_key, group_size, num_heads,
                                       node.Name() + "_/GQA/true_present_key");
 
-    true_present_value = GroupBroadcast(model_builder, present_value, group_size, num_heads,
+    true_present_value = BroadcastHeads(model_builder, present_value, group_size, num_heads,
                                         node.Name() + "_/GQA/true_present_value");
   } else {  // no need for broadcast
     true_present_key = present_key;
