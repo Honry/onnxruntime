@@ -135,8 +135,15 @@ Status DynamicQuantizeLinearOpBuilder::AddToModelBuilderImpl(ModelBuilder& model
 
   // y = QuantizeLinear (x, Scale, ZeroPoint)
   common_options.set("label", node.Name() + "_quantize_linear");
-  emscripten::val y = model_builder.GetBuilder().call<emscripten::val>(
-      "quantizeLinear", input, new_scale, new_zero_point, common_options);
+  emscripten::val y = emscripten::val::undefined();
+  if (IsZeroPointOptional()) {
+    common_options.set("zeroPoint", new_zero_point);
+    y = model_builder.GetBuilder().call<emscripten::val>(
+        "quantizeLinear", input, new_scale, common_options);
+  } else {
+    y = model_builder.GetBuilder().call<emscripten::val>(
+        "quantizeLinear", input, new_scale, new_zero_point, common_options);
+  }
 
   // Add output: y
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(y));

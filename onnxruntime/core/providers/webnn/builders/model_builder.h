@@ -55,8 +55,12 @@ class ModelBuilder {
   }
 
   // Register a WebNN constant operand using the provided tensor and descriptor information.
+  // When xor_mask is non-zero, every raw byte is XORed with it in-place before the constant is
+  // created. This is used to re-register uint4 weights as symmetric int4 (xor_mask = 0x88 flips
+  // both nibbles' sign bit, i.e. int4_val = uint4_val - 8) without any extra JS-side buffer.
   Status RegisterConstant(const onnx::TensorProto& tensor, emscripten::val& operand,
-                          emscripten::val& desc, const logging::Logger& logger);
+                          emscripten::val& desc, const logging::Logger& logger,
+                          uint8_t xor_mask = 0);
   template <typename T>
   const emscripten::val& CreateOrGetConstant(const int32_t& data_type, T value,
                                              const std::vector<uint32_t>& shape = {});

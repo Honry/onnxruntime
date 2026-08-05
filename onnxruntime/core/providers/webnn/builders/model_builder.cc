@@ -99,7 +99,8 @@ void ModelBuilder::PreprocessInitializers() {
 }
 
 Status ModelBuilder::RegisterConstant(const onnx::TensorProto& tensor, emscripten::val& operand,
-                                      emscripten::val& desc, const logging::Logger& logger) {
+                                      emscripten::val& desc, const logging::Logger& logger,
+                                      uint8_t xor_mask) {
   emscripten::val wnn_builder = GetBuilder();
   const auto data_type = tensor.data_type();
 
@@ -130,12 +131,26 @@ Status ModelBuilder::RegisterConstant(const onnx::TensorProto& tensor, emscripte
                                                       ExternalDataLoadType::CPU,
                                                       unpacked_tensor.data()));
       tensor_ptr = reinterpret_cast<std::byte*>(unpacked_tensor.data());
-    } else if (tensor.has_raw_data()) {
+    } else if (tensor.has_raw_data() && xor_mask == 0) {
+      // Zero-copy fast path: alias the tensor's raw data directly. Only valid without a transform -
+      // raw_data() is shared/immutable, so XORing it in place would corrupt the initializer for any
+      // later reader. When xor_mask is set we fall through and take a private copy instead.
       tensor_ptr = reinterpret_cast<std::byte*>(const_cast<char*>(tensor.raw_data().c_str()));
     } else {
+      // Unpack into a mutable scratch buffer. Also the landing spot for the raw_data + xor_mask case,
+      // giving us a private copy that is safe to transform in place below.
       ORT_RETURN_IF_NOT(UnpackInitializerData(tensor, unpacked_tensor, graph_viewer_, logger),
                         "Failed to unpack initializer data for tensor: " + tensor.name());
       tensor_ptr = reinterpret_cast<std::byte*>(unpacked_tensor.data());
+    }
+
+    // Apply the optional in-place raw-byte transform. Currently only MatMulNBits uses it, to fold
+    // uint4 -> symmetric int4 (xor_mask 0x88). When set, the bytes always live in the mutable
+    // unpacked_tensor (external, unpack, or raw_data path above), never in shared raw_data().
+    if (xor_mask != 0) {
+      for (auto& b : unpacked_tensor) {
+        b ^= xor_mask;
+      }
     }
 
     const auto& shape = tensor.dims();

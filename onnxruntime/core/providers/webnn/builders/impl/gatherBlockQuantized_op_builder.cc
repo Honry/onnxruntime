@@ -115,29 +115,41 @@ Status GatherBlockQuantizedOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_
 
   // GatherBlockQuantized only supports block-wise quantization, the input and scales should have the same rank.
   // So we don't need to reshape scales for broadcasting.
-  if (zero_points.isUndefined()) {
-    // Create a default zero_point with the same shape as scales.
-    const std::vector<uint32_t> zp_shape = GetNarrowedIntFromInt64<uint32_t>(scales_shape);
-    if (requires_reinterpret_u4) {
-      // Default zero_point for uint8-packed 4-bit is 8, stored as uint4 (two per byte, so 0x88).
-      emscripten::val zp_desc = emscripten::val::object();
-      zp_desc.set("dataType", emscripten::val("uint4"));
-      zp_desc.set("shape", emscripten::val::array(zp_shape));
-      zp_desc.set("dimensions", emscripten::val::array(zp_shape));
-      emscripten::val zp_buffer = emscripten::val::global("Uint8Array").new_((Product(scales_shape) + 1) / 2);
-      zp_buffer.call<void>("fill", emscripten::val(0x88));
-      zero_points = model_builder.GetBuilder().call<emscripten::val>("constant", zp_desc, zp_buffer);
-    } else {
-      // Default zero_point is 128 for uint8, 0 for int4/uint4.
-      const uint8_t default_zero_point = input_type == ONNX_NAMESPACE::TensorProto_DataType_UINT8 ? 128 : 0;
-      zero_points = model_builder.CreateOrGetConstant<uint8_t>(input_type, default_zero_point, zp_shape);
-    }
-  }
-
   // dequantized_input = DequantizeLinear(input, scales, zero_points)
   common_options.set("label", node.Name() + "_dequantize_input");
-  emscripten::val dequantized_input =
-      model_builder.GetBuilder().call<emscripten::val>("dequantizeLinear", input, scales, zero_points, common_options);
+  emscripten::val dequantized_input = emscripten::val::undefined();
+  if (IsZeroPointOptional()) {
+    // New WebNN API: zeroPoint is optional and passed via the options dictionary. Only supply it when the
+    // model provides one (symmetric quantization omits it). zero_points already accounts for the uint4
+    // reinterpret path above.
+    if (!zero_points.isUndefined()) {
+      common_options.set("zeroPoint", zero_points);
+    }
+    dequantized_input =
+        model_builder.GetBuilder().call<emscripten::val>("dequantizeLinear", input, scales, common_options);
+  } else {
+    // Old WebNN API: zeroPoint is positional and required, so synthesize a default when absent.
+    if (zero_points.isUndefined()) {
+      // Create a default zero_point with the same shape as scales.
+      const std::vector<uint32_t> zp_shape = GetNarrowedIntFromInt64<uint32_t>(scales_shape);
+      if (requires_reinterpret_u4) {
+        // Default zero_point for uint8-packed 4-bit is 8, stored as uint4 (two per byte, so 0x88).
+        emscripten::val zp_desc = emscripten::val::object();
+        zp_desc.set("dataType", emscripten::val("uint4"));
+        zp_desc.set("shape", emscripten::val::array(zp_shape));
+        zp_desc.set("dimensions", emscripten::val::array(zp_shape));
+        emscripten::val zp_buffer = emscripten::val::global("Uint8Array").new_((Product(scales_shape) + 1) / 2);
+        zp_buffer.call<void>("fill", emscripten::val(0x88));
+        zero_points = model_builder.GetBuilder().call<emscripten::val>("constant", zp_desc, zp_buffer);
+      } else {
+        // Default zero_point is 128 for uint8, 0 for int4/uint4.
+        const uint8_t default_zero_point = input_type == ONNX_NAMESPACE::TensorProto_DataType_UINT8 ? 128 : 0;
+        zero_points = model_builder.CreateOrGetConstant<uint8_t>(input_type, default_zero_point, zp_shape);
+      }
+    }
+    dequantized_input = model_builder.GetBuilder().call<emscripten::val>(
+        "dequantizeLinear", input, scales, zero_points, common_options);
+  }
 
   // output = Gather(dequantized_input, indices, axis=gather_axis)
   common_options.set("label", node.Name() + "_gather");

@@ -2,6 +2,7 @@
 // Copyright (c) Intel Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include "core/framework/tensorprotoutils.h"
 #include "core/providers/shared/utils/utils.h"
 #include "core/providers/webnn/builders/helper.h"
 #include "core/providers/webnn/builders/model_builder.h"
@@ -33,7 +34,7 @@ class MatMulNBitsBuilder : public BaseOpBuilder {
 
 void MatMulNBitsBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
   // Inputs B and zero_points (if present) must be initializers.
-  // For 4-bit: they are uint8 (packed pairs) and need re-registration as uint4 WebNN constants.
+  // For 4-bit: they are uint8 (packed pairs) and need re-registration as int4 WebNN constants.
   // For 8-bit: B is uint8 and needs re-registration as uint8 WebNN constant with correct shape.
   //            zero_points (if present) also need re-registration.
   const auto& input_defs = node.InputDefs();
@@ -54,15 +55,16 @@ void MatMulNBitsBuilder::AddInitializersToSkip(ModelBuilder& model_builder, cons
 // DequantizeLinear + Transpose + MatMul.
 //
 // Supports both 4-bit and 8-bit quantization:
-// - 4-bit: B stored as uint8 (packed pairs), registered as 'uint4' with shape
+// - 4-bit: B stored as uint8 (packed pairs), registered as 'int4' with shape
 //          [N, n_blocks_per_col, blob_size * 2].
 // - 8-bit: B stored as uint8 (one element per byte), registered as 'uint8' with shape
 //          [N, n_blocks_per_col, block_size].
 //
 // Common transformations:
 // 1. scales: reshape to [N, n_blocks_per_col, 1].
-// 2. zero_points: same shape as reshaped scales. If present, must be a constant initializer.
-//                 Otherwise, created with default value (8 for uint4, 0 for uint8).
+// 2. zero_points: optional. If present, must be a constant initializer with same shape as
+//                 reshaped scales. For int4 without explicit zero_points, dequantizeLinear is
+//                 called without zeroPoint (symmetric quantization). For uint8, default is 128.
 Status MatMulNBitsBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                                  const Node& node,
                                                  const logging::Logger& logger) const {
@@ -91,35 +93,49 @@ Status MatMulNBitsBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   const bool has_zero_points = TensorExists(input_defs, 3);
 
   if (bits == 4) {
-    // 4-bit path: B is stored as uint8 (packed pairs), register as uint4 with doubled blob_size.
+    // 4-bit path: register as int4 (symmetric quantization, zp=0).
+    // ONNX MatMulNBits stores weights as uint8 (packed pairs of 4-bit values) with default zp=8.
+    // Dequantization: (uint4_val - 8) * scale. We reinterpret as int4 with zp=0:
+    // int4_val * scale (mathematically equivalent). The conversion XORs each packed byte with
+    // 0x88, which flips the sign bit (MSB) of both 4-bit nibbles, computing int4_val = uint4_val - 8.
+    // The XOR runs in-place on the C++ scratch buffer inside RegisterConstant (see below), so it
+    // adds no extra memory allocation and never materializes the weights in the JS heap.
+    //
+    // Re-register B as int4: on disk it is uint8 [N, n_blocks_per_col, blob_size]; the int4 view has
+    // the same byte count with a doubled last dim [N, n_blocks_per_col, blob_size * 2]. RegisterConstant
+    // streams external data via the shared C++ LoadWebAssemblyExternalData loader and applies the
+    // ^0x88 sign flip on the raw bytes before creating the WebNN constant.
+    constexpr uint8_t kUint4ToInt4Xor = 0x88;
     const uint32_t double_blob_size = SafeInt<uint32_t>(B_shape[2] * 2);
-    const std::vector<uint32_t> x_shape{N, n_blocks_per_col, double_blob_size};
-    emscripten::val x_shape_array = emscripten::val::array(x_shape);
-    emscripten::val x_desc = emscripten::val::object();
-    x_desc.set("dataType", emscripten::val("uint4"));
-    x_desc.set("shape", x_shape_array);
-    x_desc.set("dimensions", x_shape_array);
-    const auto B_tensor = *initializers.at(input_defs[1]->Name());
-    ORT_RETURN_IF_ERROR(model_builder.RegisterConstant(B_tensor, dq_x, x_desc, logger));
+    const std::vector<uint32_t> b_shape_int4{N, n_blocks_per_col, double_blob_size};
+    emscripten::val b_desc = emscripten::val::object();
+    b_desc.set("dataType", emscripten::val("int4"));
+    b_desc.set("shape", emscripten::val::array(b_shape_int4));
+    b_desc.set("dimensions", emscripten::val::array(b_shape_int4));
 
-    // zero_points for 4-bit
-    emscripten::val zero_points_desc = emscripten::val::object();
-    zero_points_desc.set("dataType", emscripten::val("uint4"));
-    zero_points_desc.set("shape", x_scale_shape_array);
-    zero_points_desc.set("dimensions", x_scale_shape_array);
+    const auto B_tensor = *initializers.at(input_defs[1]->Name());
+    ORT_RETURN_IF_ERROR(model_builder.RegisterConstant(B_tensor, dq_x, b_desc, logger, kUint4ToInt4Xor));
+
     if (has_zero_points) {
-      const auto zero_points_tensor = *initializers.at(input_defs[3]->Name());
-      ORT_RETURN_IF_ERROR(model_builder.RegisterConstant(zero_points_tensor, x_zero_point, zero_points_desc, logger));
-    } else {
-      // Default zero_point for uint4 is 8
-      const int8_t default_zero_point = 8;
+      emscripten::val zp_desc = emscripten::val::object();
+      zp_desc.set("dataType", emscripten::val("int4"));
+      zp_desc.set("shape", x_scale_shape_array);
+      zp_desc.set("dimensions", x_scale_shape_array);
+
+      const auto zp_tensor = *initializers.at(input_defs[3]->Name());
+      ORT_RETURN_IF_ERROR(model_builder.RegisterConstant(zp_tensor, x_zero_point, zp_desc,
+                                                         logger, kUint4ToInt4Xor));
+    } else if (!IsZeroPointOptional()) {
+      // Old API requires zeroPoint as positional arg; create a zero constant for int4.
+      emscripten::val zp_desc = emscripten::val::object();
+      zp_desc.set("dataType", emscripten::val("int4"));
+      zp_desc.set("shape", x_scale_shape_array);
+      zp_desc.set("dimensions", x_scale_shape_array);
       auto num_elements = (Product(x_scale_shape) + 1) / 2;
-      emscripten::val default_zero_point_buffer = emscripten::val::global("Uint8Array").new_(num_elements);
-      default_zero_point_buffer.call<void>("fill",
-                                           emscripten::val(PackInt8ToUint8DoubledNibbles(
-                                               default_zero_point, ONNX_NAMESPACE::TensorProto_DataType_UINT4)));
-      x_zero_point =
-          model_builder.GetBuilder().call<emscripten::val>("constant", zero_points_desc, default_zero_point_buffer);
+      emscripten::val zp_buffer =
+          emscripten::val::global("Uint8Array").new_(num_elements);
+      x_zero_point = model_builder.GetBuilder().call<emscripten::val>(
+          "constant", zp_desc, zp_buffer);
     }
   } else {
     assert(bits == 8);
@@ -140,9 +156,10 @@ Status MatMulNBitsBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     zero_points_desc.set("dimensions", x_scale_shape_array);
     if (has_zero_points) {
       const auto zero_points_tensor = *initializers.at(input_defs[3]->Name());
-      ORT_RETURN_IF_ERROR(model_builder.RegisterConstant(zero_points_tensor, x_zero_point, zero_points_desc, logger));
-    } else {
-      // Default zero_point for uint8 is 128 (mid-point of [0,255])
+      ORT_RETURN_IF_ERROR(model_builder.RegisterConstant(zero_points_tensor, x_zero_point,
+                                                         zero_points_desc, logger));
+    } else if (!IsZeroPointOptional()) {
+      // Old API requires zeroPoint as positional arg; create default 128 constant.
       auto num_elements = Product(x_scale_shape);
       emscripten::val default_zero_point_buffer = emscripten::val::global("Uint8Array").new_(num_elements);
       default_zero_point_buffer.call<void>("fill", 128);
@@ -156,10 +173,20 @@ Status MatMulNBitsBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   emscripten::val x_scale =
       model_builder.GetBuilder().call<emscripten::val>("reshape", scales, x_scale_shape_array, options);
 
-  // DequantizeLinear
-  options.set("label", node.Name() + "_dequantizeLinear");
-  emscripten::val dq =
-      model_builder.GetBuilder().call<emscripten::val>("dequantizeLinear", dq_x, x_scale, x_zero_point, options);
+  // DequantizeLinear (zeroPoint is optional for symmetric quantization)
+  emscripten::val dq_options = emscripten::val::object();
+  dq_options.set("label", node.Name() + "_dequantizeLinear");
+  emscripten::val dq = emscripten::val::undefined();
+  if (IsZeroPointOptional()) {
+    if (!x_zero_point.isUndefined()) {
+      dq_options.set("zeroPoint", x_zero_point);
+    }
+    dq = model_builder.GetBuilder().call<emscripten::val>(
+        "dequantizeLinear", dq_x, x_scale, dq_options);
+  } else {
+    dq = model_builder.GetBuilder().call<emscripten::val>(
+        "dequantizeLinear", dq_x, x_scale, x_zero_point, dq_options);
+  }
 
   // Reshape DequantizeLinear from [N, n_blocks_per_col, block_size] to 2D [N, K].
   // MatMulNBits pads K up to n_blocks_per_col * block_size when K is not an exact
@@ -279,20 +306,18 @@ bool MatMulNBitsBuilder::HasSupportedInputsImpl(const GraphViewer&,
   }
 
   // Determine the WebNN data type based on the bits attribute.
-  // For 4-bit: data is packed uint4. For 8-bit: data is plain uint8.
+  // For 4-bit: int4 (symmetric quantization). For 8-bit: plain uint8.
   NodeAttrHelper attr_helper(node);
   const auto bits = attr_helper.Get("bits", 4);
   const int32_t dq_input_type = (bits == 8) ? ONNX_NAMESPACE::TensorProto_DataType_UINT8
-                                            : ONNX_NAMESPACE::TensorProto_DataType_UINT4;
+                                            : ONNX_NAMESPACE::TensorProto_DataType_INT4;
 
   // Ensure the quantized data type is supported by WebNN's dequantizeLinear op.
-  // Also check that the zero_point type is supported (same type as quantized input).
+  // zeroPoint is optional in WebNN dequantizeLinear, skip its type check.
   // Input rank: Only the rank of the first input (A) is flexible. Verify that its rank is supported by
   //             WebNN's matmul op.
   return IsDataTypeSupportedByOp("DequantizeLinear", dq_input_type,
                                  wnn_limits, "input", "x", logger) &&
-         IsDataTypeSupportedByOp("DequantizeLinear", dq_input_type,
-                                 wnn_limits, "zeroPoint", "x_zero_point", logger) &&
          IsRankSupportedByWebNNOp(wnn_limits, "matmul", "a", input_shape.size(), node.Name(), logger);
 }
 
