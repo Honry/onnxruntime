@@ -40,7 +40,7 @@ void ExpandOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const N
   const auto& input_defs = node.InputDefs();
   const auto& shape_name = input_defs[1]->Name();
   // Skip the shape input when it is a constant initializer AND the input has static shape.
-  // When the input has dynamic shape, we need the shape operand for dynamicExpand even if it's constant.
+  // When the input has dynamic shape, we need the shape operand for expandDynamic even if it's constant.
   if (model_builder.GetGraphViewer().GetConstantInitializer(shape_name) &&
       !HasDynamicShape(*input_defs[0])) {
     model_builder.AddInitializerToSkip(shape_name);
@@ -77,8 +77,8 @@ Status ExpandOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     emscripten::val output_shape_arr = emscripten::val::array(GetNarrowedIntFromInt64<uint32_t>(output_shape));
     output = model_builder.GetBuilder().call<emscripten::val>("expand", input, output_shape_arr, options);
   } else {
-    // Operand shape path: use dynamicExpand with the shape operand.
-    // dynamicExpand requires uint32 shape — cast if the operand is int64.
+    // Operand shape path: use expandDynamic with the shape operand.
+    // expandDynamic requires uint32 shape — cast if the operand is int64.
     emscripten::val shape_operand = model_builder.GetOperand(input_defs[1]->Name());
     int32_t shape_type;
     if (GetType(*input_defs[1], shape_type, logger) &&
@@ -88,7 +88,7 @@ Status ExpandOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       shape_operand = model_builder.GetBuilder().call<emscripten::val>(
           "cast", shape_operand, emscripten::val("uint32"), cast_options);
     }
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", input, shape_operand, options);
+    output = model_builder.GetBuilder().call<emscripten::val>("expandDynamic", input, shape_operand, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -134,7 +134,7 @@ bool ExpandOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
       return false;
     }
   }
-  // When shape is an operand (not a constant initializer), dynamicExpand handles
+  // When shape is an operand (not a constant initializer), expandDynamic handles
   // the shape at runtime so no static shape validation is needed.
 
   return true;
@@ -150,11 +150,11 @@ bool ExpandOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
   }
 
-  // When shape is an operand, check inputs against dynamicExpand's limits.
+  // When shape is an operand, check inputs against expandDynamic's limits.
   const auto& input_defs = node.InputDefs();
-  const std::string_view webnn_op_type = "dynamicExpand";
+  const std::string_view webnn_op_type = "expandDynamic";
 
-  // Check input 0 (data tensor) against dynamicExpand's "input" parameter.
+  // Check input 0 (data tensor) against expandDynamic's "input" parameter.
   int32_t input_type;
   if (!GetType(*input_defs[0], input_type, logger)) {
     return false;
@@ -170,7 +170,7 @@ bool ExpandOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // dynamicExpand's newShape is always uint32 (we cast at build time).
+  // expandDynamic's newShape is always uint32 (we cast at build time).
   // Skip type check — ONNX shape input is int64 but we handle the conversion.
 
   return true;

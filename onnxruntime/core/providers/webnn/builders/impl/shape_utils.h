@@ -3,7 +3,7 @@
 // Licensed under the MIT License.
 
 // Common utilities for building WebNN dynamic shape subgraphs.
-// These helpers construct shape operand chains (shape → slice → concat → dynamicReshape)
+// These helpers construct shape operand chains (shape → slice → concat → reshapeDynamic)
 // that are shared across multiple op builders (Flatten, Squeeze, Unsqueeze, etc.).
 
 #pragma once
@@ -76,9 +76,9 @@ inline emscripten::val ReduceShapeRange(ModelBuilder& model_builder,
   return wnn_builder.call<emscripten::val>("reduceProduct", segment, reduce_options);
 }
 
-// Build a dynamic reshape: concat segments into a 1-D target shape, then call dynamicReshape.
+// Build a dynamic reshape: concat segments into a 1-D target shape, then call reshapeDynamic.
 // segments: a JS array of 1-D operands to concat into the target shape.
-// Returns the dynamicReshape output operand.
+// Returns the reshapeDynamic output operand.
 inline emscripten::val DynamicReshapeWithSegments(ModelBuilder& model_builder,
                                                   const emscripten::val& input,
                                                   const emscripten::val& segments,
@@ -92,11 +92,11 @@ inline emscripten::val DynamicReshapeWithSegments(ModelBuilder& model_builder,
 
   emscripten::val options = emscripten::val::object();
   options.set("label", node_name);
-  return wnn_builder.call<emscripten::val>("dynamicReshape", input, target_shape, options);
+  return wnn_builder.call<emscripten::val>("reshapeDynamic", input, target_shape, options);
 }
 
 
-// Builds a 1-D shape operand for dynamicReshape from a target shape specification
+// Builds a 1-D shape operand for reshapeDynamic from a target shape specification
 // that may include 0 (copy from input) and -1 (infer).
 //
 // Emitted sub-op patterns per dimension (matching reshapeFusion's recognized patterns):
@@ -237,7 +237,7 @@ inline emscripten::val ComputeShape(ModelBuilder& model_builder,
   common_options.set("label", label + "_concat");
   emscripten::val result = wnn_builder.call<emscripten::val>("concat", segments, 0, common_options);
 
-  // Step 5: Cast back to uint32 for dynamicReshape (requires uint32 shape operand).
+  // Step 5: Cast back to uint32 for reshapeDynamic (requires uint32 shape operand).
   if (is_int64) {
     common_options.set("label", label + "_cast_uint32");
     result = wnn_builder.call<emscripten::val>(
@@ -248,7 +248,7 @@ inline emscripten::val ComputeShape(ModelBuilder& model_builder,
 
 // Reshape with automatic static/dynamic dispatch.
 // If input_shape is all-static, resolves target_dims to concrete values and calls reshape.
-// If input_shape has dynamic dims, calls ComputeShape + dynamicReshape.
+// If input_shape has dynamic dims, calls ComputeShape + reshapeDynamic.
 //
 // target_dims convention: 0 = copy from input at same position, -1 = infer, >0 = static value.
 inline emscripten::val Reshape(ModelBuilder& model_builder,
@@ -300,9 +300,9 @@ inline emscripten::val Reshape(ModelBuilder& model_builder,
     return wnn_builder.call<emscripten::val>(
         "reshape", input, emscripten::val::array(concrete_shape), options);
   } else {
-    // Dynamic path: ComputeShape + dynamicReshape.
+    // Dynamic path: ComputeShape + reshapeDynamic.
     emscripten::val shape_operand = ComputeShape(model_builder, input, target_dims, label);
-    return wnn_builder.call<emscripten::val>("dynamicReshape", input, shape_operand, options);
+    return wnn_builder.call<emscripten::val>("reshapeDynamic", input, shape_operand, options);
   }
 }
 
@@ -366,10 +366,10 @@ inline emscripten::val NormalizeAndClampIndices(ModelBuilder& model_builder,
   return wnn_builder.call<emscripten::val>("max", normalized, zero_const, options);
 }
 
-// Resolve ONNX -1/0 semantics in a runtime shape operand for dynamicReshape.
+// Resolve ONNX -1/0 semantics in a runtime shape operand for reshapeDynamic.
 //
 // When Reshape's shape input is a non-constant operand (e.g., from an unfused Concat),
-// it may contain -1 (infer dimension) or 0 (copy from input). WebNN's dynamicReshape
+// it may contain -1 (infer dimension) or 0 (copy from input). WebNN's reshapeDynamic
 // requires all positive uint32 values, so we insert sub-ops to resolve these at runtime:
 //
 //   0 → replaced with the corresponding dimension from shape(input)
@@ -377,7 +377,7 @@ inline emscripten::val NormalizeAndClampIndices(ModelBuilder& model_builder,
 //
 // The shape_operand is expected to be int64 (ONNX's Reshape shape type).
 // input_rank and output_rank are known at build time from ONNX shape info.
-// Returns a uint32 operand suitable for dynamicReshape.
+// Returns a uint32 operand suitable for reshapeDynamic.
 inline emscripten::val ResolveReshapeShape(ModelBuilder& model_builder,
                                            const emscripten::val& input,
                                            const emscripten::val& shape_operand,
@@ -474,7 +474,7 @@ inline emscripten::val ResolveReshapeShape(ModelBuilder& model_builder,
   emscripten::val shape_resolved = wnn_builder.call<emscripten::val>(
       "where", is_neg1, inferred_dim, shape_no_zero, options);
 
-  // Step 4: Cast to uint32 for dynamicReshape.
+  // Step 4: Cast to uint32 for reshapeDynamic.
   options.set("label", label + "_cast_uint32");
   return wnn_builder.call<emscripten::val>(
       "cast", shape_resolved, emscripten::val("uint32"), options);

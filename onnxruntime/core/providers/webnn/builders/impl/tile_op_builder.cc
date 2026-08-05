@@ -75,7 +75,7 @@ Status TileOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                                               emscripten::val::array(repetitions),
                                                               options);
   } else if (is_constant_repetitions) {
-    // Constant repetitions but dynamic input: create operand from constant data for dynamicTile.
+    // Constant repetitions but dynamic input: create operand from constant data for tileDynamic.
     const auto& repetitions_initializer = *initializers.at(input_defs[1]->Name());
     const int64_t* raw_repetitions_data = repetitions_initializer.int64_data().empty()
                                               ? reinterpret_cast<const int64_t*>(repetitions_initializer.raw_data().data())
@@ -88,16 +88,16 @@ Status TileOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     const emscripten::val& repetitions_operand = model_builder.CreateOrGetConstant<uint32_t>(
         ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_repetitions",
         repetitions, {static_cast<uint32_t>(size)});
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicTile", input, repetitions_operand, options);
+    output = model_builder.GetBuilder().call<emscripten::val>("tileDynamic", input, repetitions_operand, options);
   } else {
-    // Non-constant repetitions: use operand directly for dynamicTile.
-    // Cast to uint32 (ONNX repeats is int64, dynamicTile requires uint32).
+    // Non-constant repetitions: use operand directly for tileDynamic.
+    // Cast to uint32 (ONNX repeats is int64, tileDynamic requires uint32).
     emscripten::val repetitions_operand = model_builder.GetOperand(input_defs[1]->Name());
     emscripten::val cast_options = emscripten::val::object();
     cast_options.set("label", node.Name() + "_cast_repeats_uint32");
     repetitions_operand = model_builder.GetBuilder().call<emscripten::val>(
         "cast", repetitions_operand, emscripten::val("uint32"), cast_options);
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicTile", input, repetitions_operand, options);
+    output = model_builder.GetBuilder().call<emscripten::val>("tileDynamic", input, repetitions_operand, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -124,10 +124,10 @@ bool TileOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
   }
 
-  // When repetitions is an operand, check inputs against dynamicTile's limits.
-  const std::string_view webnn_op_type = "dynamicTile";
+  // When repetitions is an operand, check inputs against tileDynamic's limits.
+  const std::string_view webnn_op_type = "tileDynamic";
 
-  // Check input 0 (data tensor) against dynamicTile's "input" parameter.
+  // Check input 0 (data tensor) against tileDynamic's "input" parameter.
   int32_t input_type;
   if (!GetType(*input_defs[0], input_type, logger)) {
     return false;
@@ -143,7 +143,7 @@ bool TileOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // dynamicTile's repetitions is always uint32 (we cast at build time).
+  // tileDynamic's repetitions is always uint32 (we cast at build time).
   // Skip type check — ONNX repeats input is int64 but we handle the conversion.
 
   return true;

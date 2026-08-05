@@ -198,7 +198,7 @@ const std::unordered_map<std::string_view, WebnnOpInfo> op_inputs_map = {
     {"GlobalAveragePool", {"averagePool2d", {{0, "input"}}}},
     {"ReduceLogSumExp", {"reduceLogSumExp", {{0, "input"}}}},
     {"ReduceSumSquare", {"reduceSumSquare", {{0, "input"}}}},
-    {"ConstantOfShape", {"dynamicExpand", {{0, "newShape"}}}},
+    {"ConstantOfShape", {"expandDynamic", {{0, "newShape"}}}},
     {"GatherND", {"gatherND", {{0, "input"}, {1, "indices"}}}},
     {"GreaterOrEqual", {"greaterOrEqual", {{0, "a"}, {1, "b"}}}},
     {"Conv", {"conv2d", {{0, "input"}, {1, "filter"}, {2, "bias"}}}},

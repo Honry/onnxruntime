@@ -94,11 +94,11 @@ inline std::string GetDimIdentity(const NodeArg& node_arg, int axis) {
   return {};
 }
 
-// Check if the WebNN context supports dynamic shape operations (shape + dynamicReshape).
+// Check if the WebNN context supports dynamic shape operations (shape + reshapeDynamic).
 // Returns true if both ops are listed in opSupportLimits, meaning the browser can handle
 // nodes with dynamic (symbolic) dimensions.
 inline bool IsDynamicShapeSupported(const emscripten::val& wnn_limits) {
-  return !wnn_limits["shape"].isUndefined() && !wnn_limits["dynamicReshape"].isUndefined();
+  return !wnn_limits["shape"].isUndefined() && !wnn_limits["reshapeDynamic"].isUndefined();
 }
 
 template <typename T>

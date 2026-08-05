@@ -103,7 +103,7 @@ Status DepthToSpaceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
     options.set("label", node.Name() + "_reshape1");
     emscripten::val tmp = wnn_builder.call<emscripten::val>(
-        "dynamicReshape", input, shape1_operand, options);
+        "reshapeDynamic", input, shape1_operand, options);
 
     // Step 2: Transpose
     const std::vector<uint32_t> perm = (mode == "DCR")
@@ -148,7 +148,7 @@ Status DepthToSpaceOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     options = emscripten::val::object();
     options.set("label", node.Name());
     emscripten::val output = wnn_builder.call<emscripten::val>(
-        "dynamicReshape", tmp, shape2_operand, options);
+        "reshapeDynamic", tmp, shape2_operand, options);
 
     model_builder.AddOperand(output_defs[0]->Name(), std::move(output));
   } else {

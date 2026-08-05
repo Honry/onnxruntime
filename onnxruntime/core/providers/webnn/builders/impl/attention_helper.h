@@ -42,13 +42,13 @@ inline emscripten::val BuildRange(ModelBuilder& model_builder,
     return wnn_builder.call<emscripten::val>("range", zero_scalar, limit, one_scalar, range_options);
   }
 
-  // Fallback: dynamicExpand([1], dim_shape) → cumulativeSum(axis=0) → sub(1)
+  // Fallback: expandDynamic([1], dim_shape) → cumulativeSum(axis=0) → sub(1)
   emscripten::val one_constant =
       model_builder.CreateOrGetConstant<int>(ONNX_NAMESPACE::TensorProto_DataType_INT32, 1, {1});
 
   emscripten::val options = emscripten::val::object();
   options.set("label", label + "_expand");
-  emscripten::val ones = wnn_builder.call<emscripten::val>("dynamicExpand", one_constant, dim_shape, options);
+  emscripten::val ones = wnn_builder.call<emscripten::val>("expandDynamic", one_constant, dim_shape, options);
 
   emscripten::val cumsum_options = emscripten::val::object();
   cumsum_options.set("label", label + "_cumsum");
@@ -137,7 +137,7 @@ inline Status ApplyRotaryEmbedding(
     bool has_position_ids,
     bool position_ids_is_offset,
     bool output_bnsh,              // If true, output stays in BNSH format (no back-transpose)
-    bool has_dynamic_input,        // If true, use dynamic ops (dynamicReshape, unsqueeze, squeeze, dynamicExpand)
+    bool has_dynamic_input,        // If true, use dynamic ops (reshapeDynamic, unsqueeze, squeeze, expandDynamic)
     emscripten::val& output,
     // Identity token for the input's sequence dimension (from GetDimIdentity). The [0..S-1] range
     // built below depends only on this dimension, so callers sharing a seq identity (every layer of
@@ -181,13 +181,13 @@ inline Status ApplyRotaryEmbedding(
       rope_input = wnn_builder.call<emscripten::val>(
           "reshape", rope_input, emscripten::val::array(deinterleave_shape), deinterleave_reshape_options);
     } else {
-      // Dynamic path: use ComputeShape + dynamicReshape.
+      // Dynamic path: use ComputeShape + reshapeDynamic.
       std::vector<int64_t> deinterleave_dims{0, 0, 0,
           static_cast<int64_t>(half_rotary_embedding_dim), 2};
       emscripten::val deinterleave_shape_op = shape_utils::ComputeShape(
           model_builder, rope_input, deinterleave_dims, node_name + "_rotary_deinterleave_reshape");
       rope_input = wnn_builder.call<emscripten::val>(
-          "dynamicReshape", rope_input, deinterleave_shape_op, deinterleave_reshape_options);
+          "reshapeDynamic", rope_input, deinterleave_shape_op, deinterleave_reshape_options);
     }
 
     const std::vector<uint32_t> deinterleave_perm{0, 1, 2, 4, 3};
@@ -209,12 +209,12 @@ inline Status ApplyRotaryEmbedding(
       rope_input = wnn_builder.call<emscripten::val>(
           "reshape", rope_input, emscripten::val::array(flat_shape), flat_reshape_options);
     } else {
-      // Dynamic path: use ComputeShape + dynamicReshape.
+      // Dynamic path: use ComputeShape + reshapeDynamic.
       std::vector<int64_t> flat_dims{0, 0, 0, static_cast<int64_t>(rotary_embedding_dim)};
       emscripten::val flat_shape_op = shape_utils::ComputeShape(
           model_builder, rope_input, flat_dims, node_name + "_rotary_deinterleave_flat");
       rope_input = wnn_builder.call<emscripten::val>(
-          "dynamicReshape", rope_input, flat_shape_op, flat_reshape_options);
+          "reshapeDynamic", rope_input, flat_shape_op, flat_reshape_options);
     }
   }
 
@@ -457,13 +457,13 @@ inline Status ApplyRotaryEmbedding(
       output = wnn_builder.call<emscripten::val>(
           "reshape", output, emscripten::val::array(reinterleave_shape), reinterleave_reshape_options);
     } else {
-      // Dynamic path: use ComputeShape + dynamicReshape.
+      // Dynamic path: use ComputeShape + reshapeDynamic.
       std::vector<int64_t> reinterleave_dims{0, 0, 0, 2,
           static_cast<int64_t>(half_rotary_embedding_dim)};
       emscripten::val reinterleave_shape_op = shape_utils::ComputeShape(
           model_builder, output, reinterleave_dims, node_name + "_rotary_reinterleave_reshape");
       output = wnn_builder.call<emscripten::val>(
-          "dynamicReshape", output, reinterleave_shape_op, reinterleave_reshape_options);
+          "reshapeDynamic", output, reinterleave_shape_op, reinterleave_reshape_options);
     }
 
     const std::vector<uint32_t> reinterleave_perm{0, 1, 2, 4, 3};
@@ -485,12 +485,12 @@ inline Status ApplyRotaryEmbedding(
       output = wnn_builder.call<emscripten::val>(
           "reshape", output, emscripten::val::array(final_shape), final_reshape_options);
     } else {
-      // Dynamic path: use ComputeShape + dynamicReshape.
+      // Dynamic path: use ComputeShape + reshapeDynamic.
       std::vector<int64_t> final_dims{0, 0, 0, static_cast<int64_t>(rotary_embedding_dim)};
       emscripten::val final_shape_op = shape_utils::ComputeShape(
           model_builder, output, final_dims, node_name + "_rotary_reinterleave_flat");
       output = wnn_builder.call<emscripten::val>(
-          "dynamicReshape", output, final_shape_op, final_reshape_options);
+          "reshapeDynamic", output, final_shape_op, final_reshape_options);
     }
   }
 
@@ -590,11 +590,11 @@ inline emscripten::val ScaledDotProductAttention(ModelBuilder& model_builder, co
     attn_output = model_builder.GetBuilder().call<emscripten::val>(
         "reshape", attn_output, emscripten::val::array(output_shape), common_options);
   } else {
-    // Dynamic path: use ComputeShape + dynamicReshape.
+    // Dynamic path: use ComputeShape + reshapeDynamic.
     emscripten::val reshape_output_shape = shape_utils::ComputeShape(
         model_builder, attn_output, reshape_output_target, node.Name() + "_/Attention/qkv/reshape");
     attn_output = model_builder.GetBuilder().call<emscripten::val>(
-        "dynamicReshape", attn_output, reshape_output_shape, common_options);
+        "reshapeDynamic", attn_output, reshape_output_shape, common_options);
   }
 
   return attn_output;

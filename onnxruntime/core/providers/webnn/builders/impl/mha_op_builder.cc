@@ -85,7 +85,7 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
   const uint32_t q_rank = static_cast<uint32_t>(q_input_shape.size());
   if (q_rank == 3) {  // Query with shape (batch_size, sequence_length, hidden_size)
     // Read hidden_size from a shape proto with a static last dim. The WebNN operand shape
-    // may contain dynamic dim descriptors (objects) after upstream dynamicReshape, even for
+    // may contain dynamic dim descriptors (objects) after upstream reshapeDynamic, even for
     // dims that were originally static, so .as<uint32_t>() would return 0.
     // Try query proto first, then fall back to value proto (same hidden_size, validated in
     // IsOpSupportedImpl).
@@ -114,7 +114,7 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
       split_options.set("label", node.Name() + "_/MHA/key/split");
       emscripten::val output_array = emscripten::val::undefined();
       if (HasDynamicShape(k_input_shape)) {
-        output_array = model_builder.GetBuilder().call<emscripten::val>("dynamicSplit", key_input, 2, split_options);
+        output_array = model_builder.GetBuilder().call<emscripten::val>("splitDynamic", key_input, 2, split_options);
       } else {
         output_array = model_builder.GetBuilder().call<emscripten::val>("split", key_input, 2, split_options);
       }
@@ -148,7 +148,7 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
     split_options.set("label", node.Name() + "_/MHA/query/split");
     emscripten::val output_array = emscripten::val::undefined();
     if (HasDynamicShape(q_input_shape)) {
-      output_array = model_builder.GetBuilder().call<emscripten::val>("dynamicSplit", query_input, 3, split_options);
+      output_array = model_builder.GetBuilder().call<emscripten::val>("splitDynamic", query_input, 3, split_options);
     } else {
       output_array = model_builder.GetBuilder().call<emscripten::val>("split", query_input, 3, split_options);
     }

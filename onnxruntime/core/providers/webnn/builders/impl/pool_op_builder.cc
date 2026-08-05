@@ -126,7 +126,7 @@ Status PoolOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       const emscripten::val& end_op = model_builder.CreateOrGetConstant<uint32_t>(
           ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_pad_end",
           ending_padding, {static_cast<uint32_t>(ending_padding.size())});
-      input = model_builder.GetBuilder().call<emscripten::val>("dynamicPad", input, begin_op, end_op, pad_options);
+      input = model_builder.GetBuilder().call<emscripten::val>("padDynamic", input, begin_op, end_op, pad_options);
     } else {
       input = model_builder.GetBuilder().call<emscripten::val>("pad", input, emscripten::val::array(beginning_padding),
                                                                emscripten::val::array(ending_padding), pad_options);

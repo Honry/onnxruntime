@@ -174,7 +174,7 @@ void ResizeOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const N
   if (node.InputDefs().size() > 3) {
     const auto& sizes_name = node.InputDefs()[3]->Name();
     // Only skip sizes when it is a constant initializer (consumed at build time).
-    // When it is an operand, we need it as the sizes input for dynamicResample2d.
+    // When it is an operand, we need it as the sizes input for resample2dDynamic.
     if (model_builder.GetGraphViewer().GetConstantInitializer(sizes_name)) {
       model_builder.AddInitializerToSkip(sizes_name);  // sizes
       model_builder.AddInputToSkip(sizes_name);        // sizes
@@ -230,13 +230,13 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
           common_options);
     }
 
-    // Cast to uint32 (ONNX sizes is int64, dynamicResample2d requires uint32).
+    // Cast to uint32 (ONNX sizes is int64, resample2dDynamic requires uint32).
     common_options.set("label", node.Name() + "_cast_sizes_uint32");
     sizes_operand = model_builder.GetBuilder().call<emscripten::val>(
         "cast", sizes_operand, emscripten::val("uint32"), common_options);
 
     options.set("sizes", sizes_operand);
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, options);
+    output = model_builder.GetBuilder().call<emscripten::val>("resample2dDynamic", input, options);
   } else if (!HasDynamicShape(input_shape)) {
     // Static path: use WebNN resample2d with sizes or scales.
     if (is_constant_sizes) {
@@ -260,7 +260,7 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     }
     output = model_builder.GetBuilder().call<emscripten::val>("resample2d", input, options);
   } else if (is_constant_sizes) {
-    // Dynamic input + constant sizes: create uint32 constant for dynamicResample2d.
+    // Dynamic input + constant sizes: create uint32 constant for resample2dDynamic.
     std::vector<int64_t> sizes;
     ORT_RETURN_IF_NOT(GetResizeSizesAndAxes(model_builder.GetGraphViewer(), node, sizes, axes, input_shape, logger),
                       "Error getting Resize sizes");
@@ -269,7 +269,7 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
         ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_sizes",
         webnn_sizes, {static_cast<uint32_t>(webnn_sizes.size())});
     options.set("sizes", sizes_operand);
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, options);
+    output = model_builder.GetBuilder().call<emscripten::val>("resample2dDynamic", input, options);
   } else {
     // Dynamic input + constant scales: compute sizes at runtime via shape sub-ops.
     // Read scales directly from the initializer and extract spatial axes.
@@ -311,7 +311,7 @@ Status ResizeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
         "cast", sizes_float, emscripten::val("uint32"), common_options);
 
     options.set("sizes", sizes_operand);
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicResample2d", input, options);
+    output = model_builder.GetBuilder().call<emscripten::val>("resample2dDynamic", input, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -409,7 +409,7 @@ bool ResizeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
           return false;
         }
       }
-      // Dynamic sizes: accepted, will use dynamicResample2d at build time.
+      // Dynamic sizes: accepted, will use resample2dDynamic at build time.
     } else {  // We are using 'scales'.
       // 'scales' must be a constant initializer.
       std::vector<float> scales;
@@ -431,15 +431,15 @@ bool ResizeOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
 
   // When sizes is a constant initializer (or absent/empty), the op maps to resample2d.
   // Delegate to the base class which checks input 0 against WebNN resample2d's limits.
-  // When sizes is a non-constant operand, it's the dynamic path using dynamicResample2d.
+  // When sizes is a non-constant operand, it's the dynamic path using resample2dDynamic.
   if (sizes_name.empty() || graph_viewer.GetConstantInitializer(sizes_name)) {
     return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
   }
 
-  // When sizes is a dynamic operand, check inputs against dynamicResample2d's limits.
-  const std::string_view webnn_op_type = "dynamicResample2d";
+  // When sizes is a dynamic operand, check inputs against resample2dDynamic's limits.
+  const std::string_view webnn_op_type = "resample2dDynamic";
 
-  // Check input 0 (data tensor) against dynamicResample2d's "input" parameter.
+  // Check input 0 (data tensor) against resample2dDynamic's "input" parameter.
   int32_t input_type;
   if (!GetType(*input_defs[0], input_type, logger)) {
     return false;
@@ -455,7 +455,7 @@ bool ResizeOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // dynamicResample2d's sizes is always uint32 (we cast at build time).
+  // resample2dDynamic's sizes is always uint32 (we cast at build time).
   // Skip type check — ONNX sizes input is int64 but we handle the conversion.
 
   return true;

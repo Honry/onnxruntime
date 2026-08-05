@@ -89,7 +89,7 @@ Status LRNOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     const emscripten::val& end_op = model_builder.CreateOrGetConstant<uint32_t>(
         ONNX_NAMESPACE::TensorProto_DataType_UINT32, node_name + "_pad_end",
         ending_padding, {static_cast<uint32_t>(ending_padding.size())});
-    pad_output = wnn_builder.call<emscripten::val>("dynamicPad", pow1_output, begin_op, end_op, pad_options);
+    pad_output = wnn_builder.call<emscripten::val>("padDynamic", pow1_output, begin_op, end_op, pad_options);
   } else {
     pad_output = wnn_builder.call<emscripten::val>("pad", pow1_output, emscripten::val::array(beginning_padding),
                                                     emscripten::val::array(ending_padding), pad_options);

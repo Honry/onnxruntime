@@ -75,8 +75,7 @@ Status Model::ComputeShapes(
 
   for (uint32_t i = 0; i < num_outputs; ++i) {
     std::string output_name = keys[i].as<std::string>();
-    emscripten::val descriptor = result[output_name];
-    emscripten::val js_shape = descriptor["shape"];
+    emscripten::val js_shape = result[output_name];
 
     const uint32_t rank = js_shape["length"].as<uint32_t>();
     std::vector<int64_t> shape;

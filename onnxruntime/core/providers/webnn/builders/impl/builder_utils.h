@@ -38,7 +38,7 @@ common::Status ComputeConvTransposePadsAndOutputShape(const std::vector<int64_t>
                                                       std::vector<int64_t>& pads_out,
                                                       std::vector<int64_t>& output_shape_out) ORT_MUST_USE_RESULT;
 
-// Compute SAME_UPPER/SAME_LOWER padding dynamically using WebNN graph ops and apply dynamicPad.
+// Compute SAME_UPPER/SAME_LOWER padding dynamically using WebNN graph ops and apply padDynamic.
 // Used when spatial dimensions are dynamic and explicit padding cannot be pre-computed.
 // Returns the padded input operand.
 emscripten::val ComputeDynamicSamePadding(ModelBuilder& model_builder,

@@ -27,7 +27,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Conv | ai.onnx(7-10, 11+) | conv2d | Only supports 3-D or 4-D input and 'W' (weight) |
 | ConvInteger | ai.onnx(10+) | cast, conv2d, dequantizeLinear | Only supports 3-D or 4-D input and 'W' (weight) |
 | ConvTranspose | ai.onnx(7-10, 11+) | convTranspose2d | Only supports 3-D or 4-D input and 'W' (weight) |
-| ConstantOfShape | ai.onnx(9-19, 20, 21-22, 23-24, 25+) | constant, dynamicExpand | |
+| ConstantOfShape | ai.onnx(9-19, 20, 21-22, 23-24, 25+) | constant, expandDynamic | |
 | Cos | ai.onnx(7+) | cos | |
 | CumSum | ai.onnx(11-13, 14+) | cumulativeSum | 'axis' input should be a constant |
 | Div | ai.onnx(7-12, 13, 14+) | div | |
@@ -40,7 +40,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Equal | ai.onnx(7-10, 11-12, 13-18, 19+) | equal | |
 | Erf | ai.onnx(7-9, 10-12, 13+) | erf | |
 | Exp | ai.onnx(7-12, 13+) | exp | |
-| Expand | ai.onnx(8-12, 13+) | expand, dynamicExpand | |
+| Expand | ai.onnx(8-12, 13+) | expand, expandDynamic | |
 | Flatten | ai.onnx(7-8, 9-10, 11-12, 13-20, 21+) | flatten | |
 | Floor | ai.onnx(7-12, 13+) | floor | |
 | Gather | ai.onnx(7-10, 11-12, 13+) | gather | |
@@ -83,7 +83,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Neg | ai.onnx(7-12, 13+) | neg | |
 | Not | ai.onnx(7+) | logicalNot | |
 | Or | ai.onnx(7+) | logicalOr | |
-| Pad | ai.onnx(7-10, 11-12, 13-17, 18, 19-20, 21+) | pad, dynamicPad | Input 'constant_value' and 'axes' if present must be a constant. modes == 'wrap' is not supported |
+| Pad | ai.onnx(7-10, 11-12, 13-17, 18, 19-20, 21+) | pad, padDynamic | Input 'constant_value' and 'axes' if present must be a constant. modes == 'wrap' is not supported |
 | Pow | ai.onnx(7-11, 12, 13-14, 15+) | pow | |
 | PRelu | ai.onnx(7-8, 9-15, 16+) | prelu | |
 | QuantizeLinear | ai.onnx(10-12, 13-18, 19-20, 21-22, 23+) | quantizeLinear, reshape | |
@@ -101,8 +101,8 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | ReduceSum | ai.onnx(7-10, 11-12, 13+) | reduceSum | Input 'axes' if present should be a constant |
 | ReduceSumSquare | ai.onnx(7-10, 11-12, 13-17, 18+) | reduceSumSquare | Input 'axes' if present should be a constant |
 | Relu | ai.onnx(7-12, 13, 14+) | relu | |
-| Reshape | ai.onnx(7-12, 13, 14-18, 19-20, 21+) | reshape, dynamicReshape | allowzero=1 is not supported |
-| Resize | ai.onnx(11-12, 13-17, 18, 19+) | resample2d, dynamicResample2d | Only supports 4-D input, antialias == 0, exclude_outside == 0, keep_aspect_ratio_policy == 'stretch', 'linear' and 'nearest' modes, input 'scales' if present must be a constant |
+| Reshape | ai.onnx(7-12, 13, 14-18, 19-20, 21+) | reshape, reshapeDynamic | allowzero=1 is not supported |
+| Resize | ai.onnx(11-12, 13-17, 18, 19+) | resample2d, resample2dDynamic | Only supports 4-D input, antialias == 0, exclude_outside == 0, keep_aspect_ratio_policy == 'stretch', 'linear' and 'nearest' modes, input 'scales' if present must be a constant |
 | RotaryEmbedding | ai.onnx(23+), com.microsoft(1+) | add, concat, gather, mul, reshape, slice, split | |
 | ScatterElements | ai.onnx(11-12, 13-15, 16-17, 18+) | scatterElements | Only supports 'reduction' == 'none' |
 | ScatterND | ai.onnx(11-12, 13-15, 16-17, 18+) | scatterND | Only supports 'reduction' == 'none' |
@@ -115,15 +115,15 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Softplus | ai.onnx(7+) | softplus | |
 | Softsign | ai.onnx(7+) | softsign | |
 | Sin | ai.onnx(7+) | sin | |
-| Slice | ai.onnx(7-9, 10, 11-12, 13+) | slice, dynamicSlice, reverse | Input 'axes' and 'steps' if present must be a constant |
+| Slice | ai.onnx(7-9, 10, 11-12, 13+) | slice, sliceDynamic, reverse | Input 'axes' and 'steps' if present must be a constant |
 | Softmax | ai.onnx(7-10, 11-12, 13+) | softmax | |
-| Split | ai.onnx(7-10, 11-12, 13-17, 18+) | split, dynamicSplit | |
+| Split | ai.onnx(7-10, 11-12, 13-17, 18+) | split, splitDynamic | |
 | Sqrt | ai.onnx(7-12, 13+) | sqrt | |
 | Squeeze | ai.onnx(7-10, 11-12, 13-20, 21+) | squeeze | Input 'axes' if present should be a constant |
 | Sub | ai.onnx(7-12, 13, 14+) | sub | |
 | Tan | ai.onnx(7+) | tan | |
 | Tanh | ai.onnx(7-12, 13+) | tanh | |
-| Tile | ai.onnx(7-12, 13+) | tile, dynamicTile | |
+| Tile | ai.onnx(7-12, 13+) | tile, tileDynamic | |
 | Transpose | ai.onnx(7-12, 13-20, 21+) | transpose | |
 | Trilu | ai.onnx(14+) | triangular | Input 'k' (option 'diagonal' for WebNN) if present should be a constant |
 | Unsqueeze | ai.onnx(7-10, 11-12, 13-20, 21+) | unsqueeze | Input 'axes' if present should be a constant |

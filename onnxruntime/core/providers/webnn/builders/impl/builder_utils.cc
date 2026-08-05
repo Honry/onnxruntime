@@ -226,8 +226,8 @@ emscripten::val ComputeDynamicSamePadding(ModelBuilder& model_builder,
   auto [pad_begin_h, pad_end_h] = compute_pad_for_dim(h_idx, kernel_h, strides[0]);
   auto [pad_begin_w, pad_end_w] = compute_pad_for_dim(w_idx, kernel_w, strides[1]);
 
-  // Build two separate pads operands for dynamicPad (follows WebNN pad() style):
-  // dynamicPad(input, beginningPadding, endingPadding, options)
+  // Build two separate pads operands for padDynamic (follows WebNN pad() style):
+  // padDynamic(input, beginningPadding, endingPadding, options)
   emscripten::val zero_const = model_builder.CreateOrGetConstant<int32_t>(INT32, 0, scalar_shape);
 
   emscripten::val begin_segments = emscripten::val::array();
@@ -251,14 +251,14 @@ emscripten::val ComputeDynamicSamePadding(ModelBuilder& model_builder,
   common_options.set("label", node_name + "_same_pad_end_concat");
   emscripten::val ending_pads = builder.call<emscripten::val>("concat", end_segments, 0, common_options);
 
-  // Cast to uint32 (dynamicPad requires uint32 padding operands).
+  // Cast to uint32 (padDynamic requires uint32 padding operands).
   common_options.set("label", node_name + "_same_pad_begin_cast");
   beginning_pads = builder.call<emscripten::val>("cast", beginning_pads, emscripten::val("uint32"), common_options);
   common_options.set("label", node_name + "_same_pad_end_cast");
   ending_pads = builder.call<emscripten::val>("cast", ending_pads, emscripten::val("uint32"), common_options);
 
   common_options.set("label", node_name + "_same_pad");
-  return builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, common_options);
+  return builder.call<emscripten::val>("padDynamic", input, beginning_pads, ending_pads, common_options);
 }
 
 }  // namespace webnn

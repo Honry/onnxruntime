@@ -190,7 +190,7 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
             emscripten::val reshape_input_options = emscripten::val::object();
             reshape_input_options.set("label", node.Name() + "_reshape_input");
             input = model_builder.GetBuilder().call<emscripten::val>(
-                "dynamicReshape", original_input, shape_operand, reshape_input_options);
+                "reshapeDynamic", original_input, shape_operand, reshape_input_options);
             skip_unpad = true;
           } else {
             // No preceding Reshape or not a Reshape. Use Shape(input) + concat([1]).
@@ -207,7 +207,7 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
             emscripten::val reshape_input_options = emscripten::val::object();
             reshape_input_options.set("label", node.Name() + "_reshape_input");
             input = wnn_builder.call<emscripten::val>(
-                "dynamicReshape", input, pad_shape, reshape_input_options);
+                "reshapeDynamic", input, pad_shape, reshape_input_options);
           }
         } else {
           // Static: use reshape with concrete values.
@@ -235,7 +235,7 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
         emscripten::val reshape_input_options = emscripten::val::object();
         reshape_input_options.set("label", node.Name() + "_reshape_input");
         input = model_builder.GetBuilder().call<emscripten::val>(
-            "dynamicReshape", input, shape_operand, reshape_input_options);
+            "reshapeDynamic", input, shape_operand, reshape_input_options);
       }
     }
 
@@ -254,7 +254,7 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
           emscripten::val reshape_output_options = emscripten::val::object();
           reshape_output_options.set("label", node.Name() + "_reshape_output");
           output = wnn_builder.call<emscripten::val>(
-              "dynamicReshape", output, unpad_shape, reshape_output_options);
+              "reshapeDynamic", output, unpad_shape, reshape_output_options);
         } else {
           // Static: reshape back to original shape.
           std::vector<uint32_t> orig_shape = GetNarrowedIntFromInt64<uint32_t>(input_shape);
@@ -272,7 +272,7 @@ Status NormalizationOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder
         emscripten::val reshape_output_options = emscripten::val::object();
         reshape_output_options.set("label", node.Name() + "_reshape_output");
         output = model_builder.GetBuilder().call<emscripten::val>(
-            "dynamicReshape", output, shape_operand, reshape_output_options);
+            "reshapeDynamic", output, shape_operand, reshape_output_options);
       }
     }
   } else {

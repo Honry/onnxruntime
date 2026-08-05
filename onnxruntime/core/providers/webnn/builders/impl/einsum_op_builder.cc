@@ -302,7 +302,7 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
   if (input_a_labels.size() < a_0.size()) {
     uint32_t extra_dims = static_cast<uint32_t>(a_0.size() - input_a_labels.size());
     if (has_dynamic_a) {
-      // Dynamic path: use shape op + concat with constant [1]s, then dynamicReshape.
+      // Dynamic path: use shape op + concat with constant [1]s, then reshapeDynamic.
       emscripten::val shape_op = wnn_builder.call<emscripten::val>("shape", input_a);
       emscripten::val segments = emscripten::val::array();
       segments.call<void>("push", shape_op);
@@ -370,7 +370,7 @@ Status PairwiseOperandProcess(ModelBuilder& model_builder,
   // Input Reshape: if the number of (1,1,0) > 1, flatten the b_2 and a_3 dims.
   if (a_3.size() > 1) {
     if (has_dynamic) {
-      // Dynamic path: use shape/slice/reduceProduct/dynamicReshape.
+      // Dynamic path: use shape/slice/reduceProduct/reshapeDynamic.
       // After transpose, input_a layout is [a_1..., a_2, a_3...].
       // Target: [a_1..., a_2, product(a_3...)].
       uint32_t a1_count = static_cast<uint32_t>(a_1.size());
@@ -930,7 +930,7 @@ bool EinsumOpBuilder::HasSupportedInputsImpl(const GraphViewer&, const Node& nod
     if (recognized_operator_type == RecognizedOperatorType::Pairwise &&
         PairwiseNeedsReshape(label_indices, components, num_labels) &&
         !IsDynamicShapeSupported(wnn_limits)) {
-      LOGS(logger, VERBOSE) << "Einsum pairwise with reshape requires dynamic shape support (shape + dynamicReshape)";
+      LOGS(logger, VERBOSE) << "Einsum pairwise with reshape requires dynamic shape support (shape + reshapeDynamic)";
       return false;
     }
   }

@@ -38,7 +38,7 @@ class SplitOpBuilder : public BaseOpBuilder {
 
 void SplitOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
   // Skip split initializer if present and is a constant initializer.
-  // When it is an operand, we need it as the splits input for dynamicSplit.
+  // When it is an operand, we need it as the splits input for splitDynamic.
   if (node.InputDefs().size() > 1) {
     const auto& split_name = node.InputDefs()[1]->Name();
     if (model_builder.GetGraphViewer().GetConstantInitializer(split_name)) {
@@ -70,14 +70,14 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   emscripten::val output_array = emscripten::val::undefined();
   if (is_operand_split) {
-    // Operand split path: use dynamicSplit with the splits operand.
-    // Cast to uint32 (ONNX split is int64, dynamicSplit requires uint32).
+    // Operand split path: use splitDynamic with the splits operand.
+    // Cast to uint32 (ONNX split is int64, splitDynamic requires uint32).
     emscripten::val splits_operand = model_builder.GetOperand(split_name);
     emscripten::val cast_options = emscripten::val::object();
     cast_options.set("label", node.Name() + "_cast_splits_uint32");
     splits_operand = model_builder.GetBuilder().call<emscripten::val>(
         "cast", splits_operand, emscripten::val("uint32"), cast_options);
-    output_array = model_builder.GetBuilder().call<emscripten::val>("dynamicSplit", input, splits_operand, options);
+    output_array = model_builder.GetBuilder().call<emscripten::val>("splitDynamic", input, splits_operand, options);
   } else {
     // Constant split path: read split count or explicit split lengths.
     uint32_t split_count = 0;
@@ -112,17 +112,17 @@ Status SplitOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
             "split", input, emscripten::val::array(splits), options);
       }
     } else {
-      // Dynamic input: use dynamicSplit with a splits operand.
+      // Dynamic input: use splitDynamic with a splits operand.
       if (split_count > 0 && splits.empty()) {
         output_array = model_builder.GetBuilder().call<emscripten::val>(
-            "dynamicSplit", input, split_count, options);
+            "splitDynamic", input, split_count, options);
       } else {
         // Explicit splits: create a constant uint32 operand.
         const emscripten::val& splits_operand = model_builder.CreateOrGetConstant<uint32_t>(
             ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_splits",
             splits, {static_cast<uint32_t>(splits.size())});
         output_array = model_builder.GetBuilder().call<emscripten::val>(
-            "dynamicSplit", input, splits_operand, options);
+            "splitDynamic", input, splits_operand, options);
       }
     }
   }
@@ -167,7 +167,7 @@ bool SplitOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
         return false;
       }
     }
-    // When split is an operand (not a constant initializer), dynamicSplit handles
+    // When split is an operand (not a constant initializer), splitDynamic handles
     // the splits at runtime so no static validation is needed.
   } else {
     if (helper.HasAttr("num_outputs")) {
@@ -218,10 +218,10 @@ bool SplitOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
   }
 
-  // When split is an operand, check inputs against dynamicSplit's limits.
-  const std::string_view webnn_op_type = "dynamicSplit";
+  // When split is an operand, check inputs against splitDynamic's limits.
+  const std::string_view webnn_op_type = "splitDynamic";
 
-  // Check input 0 (data tensor) against dynamicSplit's "input" parameter.
+  // Check input 0 (data tensor) against splitDynamic's "input" parameter.
   int32_t input_type;
   if (!GetType(*input_defs[0], input_type, logger)) {
     return false;
@@ -237,7 +237,7 @@ bool SplitOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // dynamicSplit's splits is always uint32 (we cast at build time).
+  // splitDynamic's splits is always uint32 (we cast at build time).
   // Skip type check — ONNX split input is int64 but we handle the conversion.
 
   return true;

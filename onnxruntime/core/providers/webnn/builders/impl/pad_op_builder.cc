@@ -178,7 +178,7 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
                                              emscripten::val::array(sizes), slice_options);
     }
   } else if (is_constant_pads) {
-    // Constant pads but dynamic input: use dynamicPad with constant pads operands.
+    // Constant pads but dynamic input: use padDynamic with constant pads operands.
     // Split ONNX pads [begin0..beginR, end0..endR] into two operands.
     std::vector<uint32_t> start_u32(start_padding.begin(), start_padding.end());
     std::vector<uint32_t> end_u32(end_padding.begin(), end_padding.end());
@@ -188,9 +188,9 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
     const emscripten::val& ending_pads = model_builder.CreateOrGetConstant<uint32_t>(
         ONNX_NAMESPACE::TensorProto_DataType_UINT32, label + "_ending_pads",
         end_u32, {static_cast<uint32_t>(rank)});
-    output = builder.call<emscripten::val>("dynamicPad", input, beginning_pads, ending_pads, options);
+    output = builder.call<emscripten::val>("padDynamic", input, beginning_pads, ending_pads, options);
   } else {
-    // Dynamic path: pads is a runtime operand. Call dynamicPad.
+    // Dynamic path: pads is a runtime operand. Call padDynamic.
     emscripten::val pads_op = model_builder.GetOperand(input_defs[1]->Name());
 
     // If axes is specified (constant), expand pads from partial axes to full rank via gather + where.
@@ -242,7 +242,7 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
           "where", mask_const, pads_expanded, zeros_const, options);
     }
 
-    // Split ONNX pads [begin0..beginR, end0..endR] into two operands for dynamicPad.
+    // Split ONNX pads [begin0..beginR, end0..endR] into two operands for padDynamic.
     emscripten::val common_options = emscripten::val::object();
     common_options.set("label", label + "_pads_begin_slice");
     emscripten::val beginning_pads = builder.call<emscripten::val>(
@@ -257,8 +257,8 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
         emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
         common_options);
 
-    // ONNX Pad allows negative pads (trim/crop). WebNN dynamicPad only accepts non-negative
-    // uint32 values. Decompose: clamp negatives to 0 for padding, then dynamicSlice to trim.
+    // ONNX Pad allows negative pads (trim/crop). WebNN padDynamic only accepts non-negative
+    // uint32 values. Decompose: clamp negatives to 0 for padding, then sliceDynamic to trim.
     int32_t pads_type;
     ORT_RETURN_IF_NOT(GetType(*input_defs[1], pads_type, logger), "Cannot get pads type");
     const bool use_int64 = pads_type == ONNX_NAMESPACE::TensorProto_DataType_INT64 &&
@@ -295,14 +295,14 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
     emscripten::val end_trim = builder.call<emscripten::val>(
         "max", neg_end, zero_const, common_options);
 
-    // Cast clamped pads to uint32 and call dynamicPad.
+    // Cast clamped pads to uint32 and call padDynamic.
     common_options.set("label", label + "_cast_begin_uint32");
     begin_pos = builder.call<emscripten::val>("cast", begin_pos, emscripten::val("uint32"), common_options);
     common_options.set("label", label + "_cast_end_uint32");
     end_pos = builder.call<emscripten::val>("cast", end_pos, emscripten::val("uint32"), common_options);
-    output = builder.call<emscripten::val>("dynamicPad", input, begin_pos, end_pos, options);
+    output = builder.call<emscripten::val>("padDynamic", input, begin_pos, end_pos, options);
 
-    // Apply dynamicSlice to trim regions where pads were negative.
+    // Apply sliceDynamic to trim regions where pads were negative.
     // starts = begin_trim, sizes = shape(padded) - begin_trim - end_trim
     common_options.set("label", label + "_padded_shape");
     emscripten::val padded_shape = builder.call<emscripten::val>("shape", output, common_options);
@@ -322,7 +322,7 @@ Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
 
     emscripten::val trim_options = emscripten::val::object();
     trim_options.set("label", label + "_trim");
-    output = builder.call<emscripten::val>("dynamicSlice", output, begin_trim, sizes, trim_options);
+    output = builder.call<emscripten::val>("sliceDynamic", output, begin_trim, sizes, trim_options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -384,10 +384,10 @@ bool PadOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, const
     return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
   }
 
-  // Dynamic path: check inputs against dynamicPad's limits.
-  const std::string_view webnn_op_type = "dynamicPad";
+  // Dynamic path: check inputs against padDynamic's limits.
+  const std::string_view webnn_op_type = "padDynamic";
 
-  // Check input 0 (data tensor) against dynamicPad's "input" parameter.
+  // Check input 0 (data tensor) against padDynamic's "input" parameter.
   int32_t input_type;
   if (!GetType(*input_defs[0], input_type, logger)) {
     return false;
@@ -403,7 +403,7 @@ bool PadOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, const
     return false;
   }
 
-  // dynamicPad's beginningPadding/endingPadding are always uint32 (we cast at build time).
+  // padDynamic's beginningPadding/endingPadding are always uint32 (we cast at build time).
   // Skip type check — ONNX pads input is int64 but we handle the conversion.
 
   return true;

@@ -40,7 +40,7 @@ class ConstantOfShapeOpBuilder : public BaseOpBuilder {
 void ConstantOfShapeOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
   const auto& shape_name = node.InputDefs()[0]->Name();
   // Only skip the shape input when it is a constant initializer (consumed at build time).
-  // When it is an operand, we need it as the newShape input for dynamicExpand.
+  // When it is an operand, we need it as the newShape input for expandDynamic.
   if (model_builder.GetGraphViewer().GetConstantInitializer(shape_name)) {
     model_builder.AddInitializerToSkip(shape_name);
     model_builder.AddInputToSkip(shape_name);
@@ -57,7 +57,7 @@ Status ConstantOfShapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
   const bool is_constant_shape = initializers.count(input_defs[0]->Name()) > 0;
 
   // For constant shape: create a full-sized WebNN constant directly.
-  // For operand shape: create a scalar constant and use dynamicExpand to expand it.
+  // For operand shape: create a scalar constant and use expandDynamic to expand it.
   std::vector<uint32_t> dims;
   if (is_constant_shape) {
     std::vector<int64_t> output_shape;
@@ -141,9 +141,9 @@ Status ConstantOfShapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
 
   emscripten::val output = model_builder.GetBuilder().call<emscripten::val>("constant", desc, buffer);
 
-  // For operand shape, use dynamicExpand to expand the scalar constant to the dynamic shape.
+  // For operand shape, use expandDynamic to expand the scalar constant to the dynamic shape.
   if (!is_constant_shape) {
-    // Cast to uint32 (ONNX shape is int64, dynamicExpand requires uint32).
+    // Cast to uint32 (ONNX shape is int64, expandDynamic requires uint32).
     emscripten::val shape_operand = model_builder.GetOperand(input_defs[0]->Name());
     emscripten::val cast_options = emscripten::val::object();
     cast_options.set("label", node.Name() + "_cast_shape_uint32");
@@ -151,7 +151,7 @@ Status ConstantOfShapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
         "cast", shape_operand, emscripten::val("uint32"), cast_options);
     emscripten::val options = emscripten::val::object();
     options.set("label", node.Name());
-    output = model_builder.GetBuilder().call<emscripten::val>("dynamicExpand", output, shape_operand, options);
+    output = model_builder.GetBuilder().call<emscripten::val>("expandDynamic", output, shape_operand, options);
   }
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
@@ -187,7 +187,7 @@ bool ConstantOfShapeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer
       return false;
     }
   }
-  // When shape is an operand (not a constant initializer), dynamicExpand handles
+  // When shape is an operand (not a constant initializer), expandDynamic handles
   // the shape at runtime so no static shape validation is needed.
 
   return true;

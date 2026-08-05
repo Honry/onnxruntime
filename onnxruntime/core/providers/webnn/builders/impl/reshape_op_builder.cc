@@ -40,7 +40,7 @@ class ReshapeOpBuilder : public BaseOpBuilder {
 void ReshapeOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
   const auto& shape_name = node.InputDefs()[1]->Name();
   // Only skip the shape input when it is a constant initializer (consumed at build time).
-  // When it is an operand, we need it as the newShape input for dynamicReshape.
+  // When it is an operand, we need it as the newShape input for reshapeDynamic.
   if (model_builder.GetGraphViewer().GetConstantInitializer(shape_name)) {
     model_builder.AddInitializerToSkip(shape_name);
   }
@@ -103,7 +103,7 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
         emscripten::val shape_operand = shape_utils::ComputeShape(
             model_builder, input, target_dims, node.Name());
         output = model_builder.GetBuilder().call<emscripten::val>(
-            "dynamicReshape", input, shape_operand, options);
+            "reshapeDynamic", input, shape_operand, options);
       }
     } else {
       // Empty target shape → converting to a scalar.
@@ -125,10 +125,10 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
             "cast", shape_operand, emscripten::val("uint32"), cast_options);
       }
       output = model_builder.GetBuilder().call<emscripten::val>(
-          "dynamicReshape", input, shape_operand, options);
+          "reshapeDynamic", input, shape_operand, options);
     } else {
       // Non-Shape operand: may contain -1 (infer) or 0 (copy from input).
-      // Resolve these to actual positive values before calling dynamicReshape.
+      // Resolve these to actual positive values before calling reshapeDynamic.
       std::vector<int64_t> input_shape;
       ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
       uint32_t input_rank = static_cast<uint32_t>(input_shape.size());
@@ -140,7 +140,7 @@ Status ReshapeOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       emscripten::val resolved_shape = shape_utils::ResolveReshapeShape(
           model_builder, input, shape_operand, input_rank, output_rank, node.Name());
       output = model_builder.GetBuilder().call<emscripten::val>(
-          "dynamicReshape", input, resolved_shape, options);
+          "reshapeDynamic", input, resolved_shape, options);
     }
   }
 
@@ -160,7 +160,7 @@ bool ReshapeOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
   // When the shape input is a constant initializer, validate its contents.
   const auto* shape_init = graph_viewer.GetConstantInitializer(shape_name);
 
-  // WebNN reshape/dynamicReshape does not support 0 as dimension.
+  // WebNN reshape/reshapeDynamic does not support 0 as dimension.
   NodeAttrHelper helper(node);
   const bool allow_zero = helper.Get("allowzero", 0) == 1;
   if (allow_zero) {
@@ -201,11 +201,11 @@ bool ReshapeOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
   }
 
-  // When shape is an operand, check inputs against dynamicReshape's limits.
+  // When shape is an operand, check inputs against reshapeDynamic's limits.
   const auto& input_defs = node.InputDefs();
-  const std::string_view webnn_op_type = "dynamicReshape";
+  const std::string_view webnn_op_type = "reshapeDynamic";
 
-  // Check input 0 (data tensor) against dynamicReshape's "input" parameter.
+  // Check input 0 (data tensor) against reshapeDynamic's "input" parameter.
   int32_t input_type;
   if (!GetType(*input_defs[0], input_type, logger)) {
     return false;
@@ -221,7 +221,7 @@ bool ReshapeOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer,
     return false;
   }
 
-  // dynamicReshape's newShape is always uint32 (ComputeShape casts at build time).
+  // reshapeDynamic's newShape is always uint32 (ComputeShape casts at build time).
   // Skip type check — ONNX shape input is int64 but we handle the conversion.
 
   return true;

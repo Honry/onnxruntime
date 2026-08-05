@@ -223,13 +223,13 @@ Status BuildConstantSlice(ModelBuilder& model_builder, const Node& node,
 }
 
 // Dynamic path: at least one of starts/ends is a runtime operand.
-// WebNN dynamicSlice accepts starts/sizes as uint32 operands.
+// WebNN sliceDynamic accepts starts/sizes as uint32 operands.
 // The preprocessing subgraph:
 //   1. Reverse negative-step axes on input (constant decision)
 //   2. Transform starts/ends for reversed axes: new_val = -1 - old_val
 //   3. Expand partial axes to full rank (if axes ⊂ all dims)
 //   4. Compute sizes = ceil((ends - starts) / strides), cast to uint32
-//   5. Call dynamicSlice(input, starts, sizes, {strides})
+//   5. Call sliceDynamic(input, starts, sizes, {strides})
 Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
                          emscripten::val input, const std::vector<int64_t>& input_shape,
                          emscripten::val& output, const logging::Logger& logger) {
@@ -446,7 +446,7 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
 
   // Step 4: Normalize negative starts/ends and clamp INT_MAX ends.
   // ONNX Slice allows negative indices (relative-to-end) and INT_MAX (slice-to-end).
-  // WebNN dynamicSlice requires positive uint32 starts/sizes, so resolve these here.
+  // WebNN sliceDynamic requires positive uint32 starts/sizes, so resolve these here.
   {
     // Match the type of starts/ends operands (int64 if supported AND original type is int64).
     int32_t tind_type;
@@ -464,7 +464,7 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
         static_cast<uint32_t>(rank), label + "_ends");
   }
 
-  // Step 5: Compute sizes and call dynamicSlice(input, starts, sizes, options).
+  // Step 5: Compute sizes and call sliceDynamic(input, starts, sizes, options).
   // sizes[i] = ceil((ends[i] - starts[i]) / strides[i])
   // Since strides are constants, compute: span = ends - starts, then div by strides constant.
   std::vector<uint32_t> strides_full(rank, 1);
@@ -514,7 +514,7 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
     sizes_full = builder.call<emscripten::val>("div", span_adjusted, strides_const, common_options);
   }
 
-  // dynamicSlice requires uint32 operands.
+  // sliceDynamic requires uint32 operands.
   common_options.set("label", label + "_cast_starts_uint32");
   starts_full = builder.call<emscripten::val>("cast", starts_full, emscripten::val("uint32"), common_options);
   common_options.set("label", label + "_cast_sizes_uint32");
@@ -524,7 +524,7 @@ Status BuildDynamicSlice(ModelBuilder& model_builder, const Node& node,
   slice_options.set("strides", emscripten::val::array(strides_full));
   slice_options.set("label", label);
   output = builder.call<emscripten::val>(
-      "dynamicSlice", input, starts_full, sizes_full, slice_options);
+      "sliceDynamic", input, starts_full, sizes_full, slice_options);
 
   return Status::OK();
 }
@@ -769,10 +769,10 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
            IsInputRankSupportedByOp(node, wnn_limits, logger);
   }
 
-  // Dynamic path: check inputs against dynamicSlice's limits.
-  const std::string_view webnn_op_type = "dynamicSlice";
+  // Dynamic path: check inputs against sliceDynamic's limits.
+  const std::string_view webnn_op_type = "sliceDynamic";
 
-  // Check input 0 (data tensor) against dynamicSlice's "input" parameter.
+  // Check input 0 (data tensor) against sliceDynamic's "input" parameter.
   int32_t input_type;
   if (!GetType(*input_defs[0], input_type, logger)) {
     return false;
@@ -788,7 +788,7 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
     return false;
   }
 
-  // dynamicSlice starts/sizes are always uint32 (we cast at build time).
+  // sliceDynamic starts/sizes are always uint32 (we cast at build time).
   // Skip type check — ONNX declares starts/ends as int64 but we handle the conversion.
 
   // If any steps are negative, reverse is also needed — check its limits.
