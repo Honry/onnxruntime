@@ -398,7 +398,7 @@ bool PadOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, const
   }
   std::vector<int64_t> input_shape;
   if (!GetShape(*input_defs[0], input_shape, logger) ||
-      !IsInputRankSupported(wnn_limits, webnn_op_type, "input",
+      !IsRankSupportedByWebNNOp(wnn_limits, webnn_op_type, "input",
                             input_shape.size(), node.Name(), logger)) {
     return false;
   }

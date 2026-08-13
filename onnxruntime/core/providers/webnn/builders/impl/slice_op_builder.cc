@@ -750,7 +750,7 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
         return false;
       if (std::any_of(steps.begin(), steps.end(), [](int64_t step) { return step < 0; })) {
         if (!IsDataTypeSupportedByWebNNOp(op_type, "reverse", input_type, wnn_limits, "input", "data", logger) ||
-            !IsInputRankSupported(wnn_limits, "reverse", "input", input_shape.size(), node.Name(), logger)) {
+            !IsRankSupportedByWebNNOp(wnn_limits, "reverse", "input", input_shape.size(), node.Name(), logger)) {
           return false;
         }
       }
@@ -760,7 +760,7 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
     // Check gather support in that case.
     if (has_dynamic_input) {
       if (!IsDataTypeSupportedByWebNNOp(op_type, "gather", input_type, wnn_limits, "input", "data", logger) ||
-          !IsInputRankSupported(wnn_limits, "gather", "input", input_shape.size(), node.Name(), logger)) {
+          !IsRankSupportedByWebNNOp(wnn_limits, "gather", "input", input_shape.size(), node.Name(), logger)) {
         return false;
       }
     }
@@ -783,7 +783,7 @@ bool SliceOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, con
   }
   std::vector<int64_t> input_shape;
   if (!GetShape(*input_defs[0], input_shape, logger) ||
-      !IsInputRankSupported(wnn_limits, webnn_op_type, "input",
+      !IsRankSupportedByWebNNOp(wnn_limits, webnn_op_type, "input",
                             input_shape.size(), node.Name(), logger)) {
     return false;
   }
