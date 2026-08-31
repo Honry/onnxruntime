@@ -18,6 +18,8 @@ class FlattenOpBuilder : public BaseOpBuilder {
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
+  std::string_view GetEffectiveWebNNOpType(const Node& node,
+                                           const emscripten::val& wnn_limits) const override;
 };
 
 // Add operator related.
@@ -26,38 +28,58 @@ Status FlattenOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
                                                const Node& node,
                                                const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
-  std::vector<int64_t> input_shape;
   ORT_RETURN_IF(input_defs.size() < 1, "Flatten has no input tensor");
-  if (!GetShape(*input_defs[0], input_shape, logger)) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
-                           "FlattenOpBuilder::AddToModelBuilderImpl, cannot get input shape");
-  }
-  int64_t rank = input_shape.size();
+
+  std::vector<int64_t> input_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
+  const int64_t rank = input_shape.size();
+
   NodeAttrHelper helper(node);
-  int64_t axis = helper.Get("axis", 1);
-  ORT_ENFORCE(axis >= -rank && axis <= rank, "axis ", axis,
-              " is not in valid range [-", rank, ",", rank, "]");
-  if (axis < 0) {
-    axis += rank;
+  int64_t raw_axis = helper.Get("axis", 1);
+  ORT_RETURN_IF(raw_axis < -rank || raw_axis > rank,
+                "Flatten: axis ", raw_axis, " is out of range [-", rank, ", ", rank, "]");
+  const uint32_t axis = static_cast<uint32_t>(raw_axis < 0 ? raw_axis + rank : raw_axis);
+
+  emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
+  emscripten::val output = emscripten::val::undefined();
+
+  if (HasDynamicShape(input_shape)) {
+    // Dynamic input: flatten op is always available (introduced with dynamic shape support).
+    emscripten::val flatten_options = emscripten::val::object();
+    flatten_options.set("axis", axis);
+    flatten_options.set("label", node.Name());
+    output = model_builder.GetBuilder().call<emscripten::val>("flatten", input, flatten_options);
+  } else {
+    // Static input: use flatten if supported, otherwise fall back to reshape.
+    const emscripten::val& wnn_limits = model_builder.GetOpSupportLimits();
+    if (!wnn_limits["flatten"].isUndefined()) {
+      emscripten::val flatten_options = emscripten::val::object();
+      flatten_options.set("axis", axis);
+      flatten_options.set("label", node.Name());
+      output = model_builder.GetBuilder().call<emscripten::val>("flatten", input, flatten_options);
+    } else {
+      int64_t pre = std::accumulate(
+          input_shape.begin(), input_shape.begin() + axis, int64_t{1}, std::multiplies<int64_t>());
+      int64_t post = std::accumulate(
+          input_shape.begin() + axis, input_shape.end(), int64_t{1}, std::multiplies<int64_t>());
+      std::vector<uint32_t> new_shape{SafeInt<uint32_t>(pre), SafeInt<uint32_t>(post)};
+      emscripten::val options = emscripten::val::object();
+      options.set("label", node.Name());
+      output = model_builder.GetBuilder().call<emscripten::val>(
+          "reshape", input, emscripten::val::array(new_shape), options);
+    }
   }
-
-  // Use WebNN's reshape to implement Flatten.
-  int64_t num_pre_axis_elements = std::accumulate(
-      input_shape.begin(), input_shape.begin() + static_cast<int32_t>(axis), 1, std::multiplies<int64_t>());
-  int64_t num_post_axis_elements = std::accumulate(
-      input_shape.begin() + static_cast<int32_t>(axis), input_shape.end(), 1, std::multiplies<int64_t>());
-
-  std::vector<uint32_t> new_shape = {SafeInt<uint32_t>(num_pre_axis_elements),
-                                     SafeInt<uint32_t>(num_post_axis_elements)};
-
-  emscripten::val inputs = model_builder.GetOperand(input_defs[0]->Name());
-  emscripten::val options = emscripten::val::object();
-  options.set("label", node.Name());
-  emscripten::val output = model_builder.GetBuilder().call<emscripten::val>(
-      "reshape", inputs, emscripten::val::array(new_shape), options);
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   return Status::OK();
+}
+
+std::string_view FlattenOpBuilder::GetEffectiveWebNNOpType(
+    const Node& /*node*/, const emscripten::val& wnn_limits) const {
+  if (wnn_limits["flatten"].isUndefined()) {
+    return "reshape";
+  }
+  return "flatten";
 }
 
 void CreateFlattenOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {

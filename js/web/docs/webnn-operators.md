@@ -39,8 +39,8 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Equal | ai.onnx(7-10, 11-12, 13-18, 19+) | equal | |
 | Erf | ai.onnx(7-9, 10-12, 13+) | erf | |
 | Exp | ai.onnx(7-12, 13+) | exp | |
-| Expand | ai.onnx(8-12, 13+) | expand | 'shape' input should be a constant |
-| Flatten | ai.onnx(7-8, 9-10, 11-12, 13-20, 21+) | reshape | |
+| Expand | ai.onnx(8-12, 13+) | expand, expandDynamic | |
+| Flatten | ai.onnx(7-8, 9-10, 11-12, 13-20, 21+) | flatten | |
 | Floor | ai.onnx(7-12, 13+) | floor | |
 | Gather | ai.onnx(7-10, 11-12, 13+) | gather | |
 | GatherBlockQuantized | com.microsoft(1+) | dequantizeLinear, gather | uint8-packed 4-bit data (bits=4) is reinterpreted as uint4, which requires 'quantize_axis' to be the last axis and 'data' (and 'zero_points', if present) to be constant initializers |
@@ -100,12 +100,12 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | ReduceSum | ai.onnx(7-10, 11-12, 13+) | reduceSum | Input 'axes' if present should be a constant |
 | ReduceSumSquare | ai.onnx(7-10, 11-12, 13-17, 18+) | reduceSumSquare | Input 'axes' if present should be a constant |
 | Relu | ai.onnx(7-12, 13, 14+) | relu | |
-| Reshape | ai.onnx(7-12, 13, 14-18, 19-20, 21+) | reshape | Input 'shape' should be a constant, 0 dimension value in 'shape' is not supported |
+| Reshape | ai.onnx(7-12, 13, 14-18, 19-20, 21+) | reshape, reshapeDynamic | allowzero=1 is not supported |
 | Resize | ai.onnx(11-12, 13-17, 18, 19+) | resample2d | Only supports 4-D input, antialias == 0, exclude_outside == 0, keep_aspect_ratio_policy == 'stretch', 'linear' and 'nearest' modes, input 'scales' and 'sizes' if present must be a constant |
 | RotaryEmbedding | ai.onnx(23+), com.microsoft(1+) | add, concat, gather, mul, reshape, slice, split | |
 | ScatterElements | ai.onnx(11-12, 13-15, 16-17, 18+) | scatterElements | Only supports 'reduction' == 'none' |
 | ScatterND | ai.onnx(11-12, 13-15, 16-17, 18+) | scatterND | Only supports 'reduction' == 'none' |
-| Shape | ai.onnx(7-12, 13-14, 15-18, 19-20, 21+) | slice | |
+| Shape | ai.onnx(7-12, 13-14, 15-18, 19-20, 21+) | shape, slice | |
 | SimplifiedLayerNormalization | ai.onnx(1+) | pow, reduceMean, add, sqrt, div, mul | |
 | Sigmoid | ai.onnx(7-12, 13+) | sigmoid | |
 | Sign | ai.onnx(9-12, 13+) | sign | |
@@ -119,13 +119,13 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Softmax | ai.onnx(7-10, 11-12, 13+) | softmax | |
 | Split | ai.onnx(7-10, 11-12, 13-17, 18+) | split | Input 'split' if present should be a constant |
 | Sqrt | ai.onnx(7-12, 13+) | sqrt | |
-| Squeeze | ai.onnx(7-10, 11-12, 13-20, 21+) | reshape | Input 'axes' if present should be a constant |
+| Squeeze | ai.onnx(7-10, 11-12, 13-20, 21+) | squeeze | Input 'axes' if present should be a constant |
 | Sub | ai.onnx(7-12, 13, 14+) | sub | |
 | Tan | ai.onnx(7+) | tan | |
 | Tanh | ai.onnx(7-12, 13+) | tanh | |
 | Tile | ai.onnx(7-12, 13+) | tile | Input 'repeats' should be a constant |
 | Transpose | ai.onnx(7-12, 13-20, 21+) | transpose | |
 | Trilu | ai.onnx(14+) | triangular | Input 'k' (option 'diagonal' for WebNN) if present should be a constant |
-| Unsqueeze | ai.onnx(7-10, 11-12, 13-20, 21+) | reshape | |
+| Unsqueeze | ai.onnx(7-10, 11-12, 13-20, 21+) | unsqueeze | Input 'axes' if present should be a constant |
 | Where | ai.onnx(7-8, 9-15, 16+) | where | |
 | Xor | ai.onnx(7+) | logicalXor | |
