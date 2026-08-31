@@ -20,6 +20,8 @@ class BinaryOpBuilder : public BaseOpBuilder {
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
 
   // Operator support related.
+  bool IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node& node,
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
   bool HasSupportedInputsImpl(const GraphViewer&, const Node& node,
                               const emscripten::val& wnn_limits, const logging::Logger& logger) const override;
 };
@@ -48,6 +50,8 @@ Status BinaryOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const
     output = model_builder.GetBuilder().call<emscripten::val>("pow", input0, input1, options);
   } else if (op_type == "PRelu") {
     output = model_builder.GetBuilder().call<emscripten::val>("prelu", input0, input1, options);
+  } else if (op_type == "Mod") {
+    output = model_builder.GetBuilder().call<emscripten::val>("mod", input0, input1, options);
   } else {
     return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
                            "BinaryOpBuilder::AddToModelBuilderImpl, unknown op: ", op_type);
@@ -55,6 +59,23 @@ Status BinaryOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   return Status::OK();
+}
+
+bool BinaryOpBuilder::IsOpSupportedImpl(const GraphViewer& /* graph_viewer */, const Node& node,
+                                        const WebnnDeviceType /* device_type */,
+                                        const logging::Logger& logger) const {
+  const auto& op_type = node.OpType();
+
+  if (op_type == "Mod") {
+    NodeAttrHelper helper(node);
+    const auto fmod = helper.Get("fmod", 0);
+    if (fmod != 0) {
+      LOGS(logger, VERBOSE) << "Mod [" << node.Name() << "] only fmod=0 is supported, got fmod=" << fmod;
+      return false;
+    }
+  }
+
+  return true;
 }
 
 bool BinaryOpBuilder::HasSupportedInputsImpl(const GraphViewer&, const Node& node,
@@ -91,6 +112,7 @@ void CreateBinaryOpBuilder(const std::string& op_type, OpBuilderRegistrations& o
           "Div",
           "Pow",
           "PRelu",
+          "Mod",
       };
 
   op_registrations.builders.push_back(std::make_unique<BinaryOpBuilder>());

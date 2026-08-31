@@ -24,6 +24,7 @@ void CreateArgMaxMinOpBuilder(const std::string& op_type, OpBuilderRegistrations
 void CreateBinaryOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateCastOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateClipOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateConstantOfShapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateConvOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateConcatOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateCumSumOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
@@ -52,6 +53,7 @@ void CreateNormalizationOpBuilder(const std::string& op_type, OpBuilderRegistrat
 void CreatePadOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreatePoolOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateQDQOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateRangeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateReductionOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateReshapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateResizeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
@@ -59,6 +61,7 @@ void CreateRotaryEmbeddingOpBuilder(const std::string& op_type, OpBuilderRegistr
 void CreateScatterElementsOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateScatterNDOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateShapeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
+void CreateSizeOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateSliceOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateSoftmaxOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);
 void CreateSplitOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations);

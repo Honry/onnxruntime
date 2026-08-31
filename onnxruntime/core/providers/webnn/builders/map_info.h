@@ -64,6 +64,7 @@ const std::map<std::string_view, std::vector<std::string_view>> decomposed_op_ma
     {"MultiHeadAttention", {"Add", "Cast", "Concat", "Div", "MatMul", "Reshape", "Softmax", "Transpose"}},
     {"RotaryEmbedding", {"Add", "Concat", "Gather", "Mul", "Reshape", "Slice", "Split"}},
     {"SimplifiedLayerNormalization", {"Add", "Div", "Mul", "Pow", "ReduceMean", "Sqrt"}},
+    {"Size", {"ReduceProd", "Shape"}},
     {"SkipGroupNorm", {"Add", "InstanceNormalization", "Mul", "Reshape", "Sigmoid", "Transpose"}},
     {"SkipLayerNormalization", {"Add", "LayerNormalization"}},
     {"SkipSimplifiedLayerNormalization", {"Add", "Div", "Mul", "Pow", "ReduceMean", "Sqrt"}},
@@ -110,6 +111,16 @@ struct WebnnOpInfo {
  * This mapping is used to translate ONNX operations and their inputs into WebNN operations
  * and their respective input names.
  *
+ * Static and dynamic shapes:
+ * - An ONNX operation with both a static and a `*Dynamic` WebNN variant (e.g. Expand: "expand" and "expandDynamic")
+ *   is listed as the static variant, with only its tensor inputs. When a shape is an operand instead of a constant,
+ *   the op builder checks the `*Dynamic` variant by name.
+ * - An operation that only exists in newer WebNN implementations with dynamic shape support (shape, squeeze,
+ *   unsqueeze, flatten, range) is listed as is. A builder with a static fallback (Shape -> slice,
+ *   Squeeze/Unsqueeze/Flatten -> reshape) returns it from GetEffectiveWebNNOpType.
+ * - ConstantOfShape is listed as "expand" without inputs: its only input is the shape, which is never an operand of
+ *   "expand".
+ *
  * Order:
  *   The sorting rule is based on character length in ascending order (for better formatting),
  *   and for items with the same length, they are sorted alphabetically.
@@ -149,6 +160,7 @@ const std::unordered_map<std::string_view, WebnnOpInfo> op_inputs_map = {
     {"Expand", {"expand", {{0, "input"}}}},
     {"Max", {"max", {{0, "a"}, {1, "b"}}}},
     {"Min", {"min", {{0, "a"}, {1, "b"}}}},
+    {"Mod", {"mod", {{0, "a"}, {1, "b"}}}},
     {"Mul", {"mul", {{0, "a"}, {1, "b"}}}},
     {"Pow", {"pow", {{0, "a"}, {1, "b"}}}},
     {"Concat", {"concat", {{0, "inputs"}}}},
@@ -198,12 +210,14 @@ const std::unordered_map<std::string_view, WebnnOpInfo> op_inputs_map = {
     {"GlobalAveragePool", {"averagePool2d", {{0, "input"}}}},
     {"ReduceLogSumExp", {"reduceLogSumExp", {{0, "input"}}}},
     {"ReduceSumSquare", {"reduceSumSquare", {{0, "input"}}}},
+    {"ConstantOfShape", {"expand", {}}},
     {"GatherND", {"gatherND", {{0, "input"}, {1, "indices"}}}},
     {"GreaterOrEqual", {"greaterOrEqual", {{0, "a"}, {1, "b"}}}},
     {"Conv", {"conv2d", {{0, "input"}, {1, "filter"}, {2, "bias"}}}},
     {"GatherElements", {"gatherElements", {{0, "input"}, {1, "indices"}}}},
     {"ScatterND", {"scatterND", {{0, "input"}, {1, "indices"}, {2, "updates"}}}},
     {"Where", {"where", {{0, "condition"}, {1, "trueValue"}, {2, "falseValue"}}}},
+    {"Range", {"range", {{0, "start"}, {1, "limit"}, {2, "delta"}}}},
     {"ConvTranspose", {"convTranspose2d", {{0, "input"}, {1, "filter"}, {2, "bias"}}}},
     {"QuantizeLinear", {"quantizeLinear", {{0, "input"}, {1, "scale"}, {2, "zeroPoint"}}}},
     {"ScatterElements", {"scatterElements", {{0, "input"}, {1, "indices"}, {2, "updates"}}}},
