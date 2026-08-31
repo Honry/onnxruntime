@@ -27,6 +27,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Conv | ai.onnx(7-10, 11+) | conv2d | Only supports 3-D or 4-D input and 'W' (weight) |
 | ConvInteger | ai.onnx(10+) | cast, conv2d, dequantizeLinear | Only supports 3-D or 4-D input and 'W' (weight) |
 | ConvTranspose | ai.onnx(7-10, 11+) | convTranspose2d | Only supports 3-D or 4-D input and 'W' (weight) |
+| ConstantOfShape | ai.onnx(9-19, 20, 21-22, 23-24, 25+) | constant, expandDynamic | |
 | Cos | ai.onnx(7+) | cos | |
 | CumSum | ai.onnx(11-13, 14+) | cumulativeSum | 'axis' input should be a constant |
 | Div | ai.onnx(7-12, 13, 14+) | div | |
@@ -78,6 +79,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Max | ai.onnx(7, 8-11, 12, 13+) | max | |
 | MaxPool | ai.onnx(7, 8-9, 10, 11, 12+) | maxPool2d | Only supports 4-D input, 2-D 'kernel_shape', 'storage_order' != 1, one output |
 | Min | ai.onnx(7, 8-11, 12, 13+) | min | |
+| Mod | ai.onnx(10-12, 13+) | mod | Only supports fmod=0 |
 | Mul | ai.onnx(7-12, 13, 14+) | mul | |
 | MultiHeadAttention | com.microsoft(1+) | add, cast, concat, constant, div, matmul, reshape, softmax, transpose | Does not support inputs bias, key_padding_mask, past_sequence_length, or cache_indirection. Does not support output qk |
 | Neg | ai.onnx(7-12, 13+) | neg | |
@@ -87,6 +89,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Pow | ai.onnx(7-11, 12, 13-14, 15+) | pow | |
 | PRelu | ai.onnx(7-8, 9-15, 16+) | prelu | |
 | QuantizeLinear | ai.onnx(10-12, 13-18, 19-20, 21-22, 23+) | quantizeLinear, reshape | |
+| Range | ai.onnx(11+) | range | |
 | Reciprocal | ai.onnx(7-12, 13+) | reciprocal | |
 | Round | ai.onnx(11-21, 22+) | roundEven | |
 | ReduceL1 | ai.onnx(7-10, 11-12, 13-17, 18+) | reduceL1 | Input 'axes' if present should be a constant |
@@ -109,6 +112,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | SimplifiedLayerNormalization | ai.onnx(1+) | pow, reduceMean, add, sqrt, div, mul | |
 | Sigmoid | ai.onnx(7-12, 13+) | sigmoid | |
 | Sign | ai.onnx(9-12, 13+) | sign | |
+| Size | ai.onnx(7-12, 13-18, 19-20, 21+) | shape, reduceProduct | |
 | SkipGroupNorm | com.microsoft(1+) | add, instanceNormalization, mul, reshape, sigmoid, transpose | |
 | SkipLayerNormalization | com.microsoft(1+) | add, layerNormalization | |
 | SkipSimplifiedLayerNormalization | com.microsoft(1+) | pow, reduceMean, add, sqrt, div, mul | |
@@ -117,13 +121,13 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Sin | ai.onnx(7+) | sin | |
 | Slice | ai.onnx(7-9, 10, 11-12, 13+) | slice, reverse | Input 'starts', 'ends', 'axes', and 'steps' if present must be a constant |
 | Softmax | ai.onnx(7-10, 11-12, 13+) | softmax | |
-| Split | ai.onnx(7-10, 11-12, 13-17, 18+) | split | Input 'split' if present should be a constant |
+| Split | ai.onnx(7-10, 11-12, 13-17, 18+) | split, splitDynamic | |
 | Sqrt | ai.onnx(7-12, 13+) | sqrt | |
 | Squeeze | ai.onnx(7-10, 11-12, 13-20, 21+) | squeeze | Input 'axes' if present should be a constant |
 | Sub | ai.onnx(7-12, 13, 14+) | sub | |
 | Tan | ai.onnx(7+) | tan | |
 | Tanh | ai.onnx(7-12, 13+) | tanh | |
-| Tile | ai.onnx(7-12, 13+) | tile | Input 'repeats' should be a constant |
+| Tile | ai.onnx(7-12, 13+) | tile, tileDynamic | |
 | Transpose | ai.onnx(7-12, 13-20, 21+) | transpose | |
 | Trilu | ai.onnx(14+) | triangular | Input 'k' (option 'diagonal' for WebNN) if present should be a constant |
 | Unsqueeze | ai.onnx(7-10, 11-12, 13-20, 21+) | unsqueeze | Input 'axes' if present should be a constant |
