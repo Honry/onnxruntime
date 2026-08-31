@@ -22,8 +22,9 @@ class BaseOpBuilder : public IOpBuilder {
                            const logging::Logger& logger) const override final ORT_MUST_USE_RESULT;
 
  protected:
-  explicit BaseOpBuilder(bool allow_empty_tensor_as_input = false)
-      : allow_empty_tensor_as_input_(allow_empty_tensor_as_input) {
+  explicit BaseOpBuilder(bool allow_empty_tensor_as_input = false, bool allow_no_shape_inputs = false)
+      : allow_empty_tensor_as_input_(allow_empty_tensor_as_input),
+        allow_no_shape_inputs_(allow_no_shape_inputs) {
   }
   virtual Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                        const logging::Logger& logger) const ORT_MUST_USE_RESULT = 0;
@@ -45,6 +46,12 @@ class BaseOpBuilder : public IOpBuilder {
   virtual bool HasSupportedOutputsImpl(const Node& node, const emscripten::val& wnn_limits,
                                        const logging::Logger& logger) const;
 
+  // Returns the effective WebNN op type to check against wnn_limits.
+  // Default: returns the mapped op type from map_info.h.
+  // Override for ops with fallback (e.g., squeeze→reshape when native squeeze unavailable).
+  virtual std::string_view GetEffectiveWebNNOpType(const Node& node,
+                                                   const emscripten::val& wnn_limits) const;
+
   // ONNX Runtime only *guarantees* support for models stamped
   // with opset version 7 or above for opset domain 'ai.onnx'.
   // WebNN EP ignores node support for opset less than 7 by
@@ -60,6 +67,7 @@ class BaseOpBuilder : public IOpBuilder {
   bool HasSupportedOutputs(const Node& node, const emscripten::val& wnn_limits, const logging::Logger& logger) const;
 
   const bool allow_empty_tensor_as_input_;  // Some operators can handle ignoring an empty tensor as input.
+  const bool allow_no_shape_inputs_;        // Some operators can handle inputs without shape information.
 };
 
 }  // namespace webnn

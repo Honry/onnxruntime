@@ -46,6 +46,13 @@ class Model {
 
   const OnnxTensorInfo& GetInputOutputInfo(const std::string& name) const;
 
+  // Call MLGraph.computeShapes() to infer output shapes from concrete input shapes.
+  onnxruntime::common::Status ComputeShapes(
+      const InlinedHashMap<std::string, std::vector<int64_t>>& input_shapes,
+      InlinedHashMap<std::string, std::vector<int64_t>>& output_shapes);
+
+  bool SupportsComputeShapes() const { return supports_compute_shapes_; }
+
   // Set the mapping between input/output name and ORT kernel context
   // input/output index, at execution time.
   void SetInputMap(InlinedHashMap<std::string, size_t>&& input_map);
@@ -77,9 +84,17 @@ class Model {
   InlinedHashMap<std::string, size_t> input_map_;
   InlinedHashMap<std::string, size_t> output_map_;
 
+  // Memoization for ComputeShapes(): the last input shapes seen and the output shapes
+  // they produced. computeShapes() output is a pure function of the input shapes (the
+  // compiled MLGraph is fixed), so identical input shapes yield identical output shapes.
+  // Guarded by mutex_ (held by the caller during Predict/ComputeShapes).
+  InlinedHashMap<std::string, std::vector<int64_t>> cached_compute_input_shapes_;
+  InlinedHashMap<std::string, std::vector<int64_t>> cached_compute_output_shapes_;
+
   std::mutex mutex_;
 
   bool use_dispatch_;
+  bool supports_compute_shapes_;
 
   Model(const emscripten::val& context, const emscripten::val& path, const logging::Logger& logger, bool use_dispatch);
 
