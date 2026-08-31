@@ -27,6 +27,8 @@ class PadOpBuilder : public BaseOpBuilder {
  private:
   bool IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node& node,
                          const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
+  bool HasSupportedInputsImpl(const GraphViewer& graph_viewer, const Node& node,
+                              const emscripten::val& wnn_limits, const logging::Logger& logger) const override;
 };
 
 // Add operator related.
@@ -38,11 +40,31 @@ const InlinedHashMap<std::string, std::string> supported_mode = {
     {"edge", "edge"},
 };
 
-// Skip for pads, constant value, and axes.
 void PadOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
-  for (size_t i = 1; i < node.InputDefs().size(); i++) {
-    model_builder.AddInitializerToSkip(node.InputDefs()[i]->Name());
-    model_builder.AddInputToSkip(node.InputDefs()[i]->Name());
+  const auto& input_defs = node.InputDefs();
+  if (input_defs.size() < 2) {
+    return;  // Opset < 11: pads is an attribute, nothing to skip.
+  }
+
+  const auto& initializers(model_builder.GetInitializerTensors());
+  const bool is_constant_pads = initializers.count(input_defs[1]->Name()) > 0;
+
+  if (is_constant_pads) {
+    // Constant path: skip all non-data inputs (consumed at build time).
+    for (size_t i = 1; i < input_defs.size(); i++) {
+      model_builder.AddInitializerToSkip(input_defs[i]->Name());
+      model_builder.AddInputToSkip(input_defs[i]->Name());
+    }
+  } else {
+    // Dynamic path: pads is a runtime operand, do NOT skip it.
+    // Skip constant_value and axes (consumed at build time as constants).
+    for (size_t i = 2; i < input_defs.size(); i++) {
+      const std::string name = GetTensorName(input_defs, i);
+      if (!name.empty() && initializers.count(name) > 0) {
+        model_builder.AddInitializerToSkip(name);
+        model_builder.AddInputToSkip(name);
+      }
+    }
   }
 }
 
@@ -59,100 +81,250 @@ bool clampNegativeValues(const std::vector<int64_t>& padding,
   return false;
 }
 
-Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
-                                           const Node& node,
+Status PadOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                            const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
   const auto& initializers = model_builder.GetInitializerTensors();
-  ORT_RETURN_IF(input_defs.size() < 1, "Pad has no inputs");
-  emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
+  const auto& graph_viewer = model_builder.GetGraphViewer();
+  emscripten::val builder = model_builder.GetBuilder();
+  const std::string& label = node.Name();
+
   std::vector<int64_t> input_shape;
   ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get input shape");
+  const size_t rank = input_shape.size();
 
+  emscripten::val input = model_builder.GetOperand(input_defs[0]->Name());
+
+  // Common setup: mode.
   emscripten::val options = emscripten::val::object();
-  options.set("label", node.Name());
-
+  options.set("label", label);
   NodeAttrHelper helper(node);
   const auto pad_mode = helper.Get("mode", std::string("constant"));
-  std::vector<int64_t> start_padding;
-  std::vector<int64_t> end_padding;
-  ORT_RETURN_IF(supported_mode.find(pad_mode) == supported_mode.end(), "WebNN does not support mode", pad_mode);
-  const auto webnn_mode = supported_mode.find(pad_mode)->second;
-  options.set("mode", emscripten::val(webnn_mode));
+  ORT_RETURN_IF(supported_mode.find(pad_mode) == supported_mode.end(),
+                "WebNN does not support mode", pad_mode);
+  options.set("mode", emscripten::val(supported_mode.find(pad_mode)->second));
 
   const auto opset = node.SinceVersion();
-  // From opset 11, pads, constant value and axes are inputs.
-  if (opset >= 11) {
-    const auto& graph_viewer = model_builder.GetGraphViewer();
-    ORT_RETURN_IF(input_defs.size() < 2, "Pads is required at opset ", opset);
-    std::vector<int64_t> pads;
-    const auto& pads_tensor = *initializers.at(input_defs[1]->Name());
-    ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(pads_tensor, pads, graph_viewer, logger),
-                      "Error while reading pads tensor");
+  const bool is_constant_pads = input_defs.size() < 2 || initializers.count(input_defs[1]->Name()) > 0;
+  std::vector<int64_t> start_padding;
+  std::vector<int64_t> end_padding;
 
-    // Constant value and axes are optional. Make sure they are not empty.
-    if (!GetTensorName(input_defs, 2).empty()) {
+  if (opset < 11) {
+    // Before opset 11, pads and constant_value are attributes (always constant).
+    ORT_RETURN_IF_NOT(helper.HasAttr("pads"), "Pads is required as attribute in opset ", opset);
+    const auto pads = helper.Get("pads", std::vector<int>());
+    options.set("value", helper.Get("value", 0.0f));
+    start_padding.assign(pads.begin(), pads.begin() + pads.size() / 2);
+    end_padding.assign(pads.begin() + pads.size() / 2, pads.end());
+  } else {
+    // opset >= 11: constant_value is an optional initializer input (shared by both paths).
+    if (TensorExists(input_defs, 2)) {
       const auto value_tensor = *initializers.at(input_defs[2]->Name());
       emscripten::val value = emscripten::val::object();
-      ORT_RETURN_IF_NOT(ReadScalarTensorData(value_tensor, value, graph_viewer, logger), "Cannot read constant value");
+      ORT_RETURN_IF_NOT(ReadScalarTensorData(value_tensor, value, graph_viewer, logger),
+                        "Cannot read constant value");
       options.set("value", value);
     }
 
-    if (!GetTensorName(input_defs, 3).empty()) {
-      const auto input_rank = input_shape.size();
-      std::vector<int64_t> axes;
-      const auto& axes_tensor = *initializers.at(input_defs[3]->Name());
-      ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(axes_tensor, axes, graph_viewer, logger),
-                        "Error while reading axes tensor");
-      std::vector<size_t> axes_index;
-      std::transform(
-          axes.begin(), axes.end(), std::back_inserter(axes_index),
-          [input_rank](int64_t axis) -> int32_t { return SafeInt<int32_t>(HandleNegativeAxis(axis, input_rank)); });
-      start_padding.resize(input_rank, 0);
-      end_padding.resize(input_rank, 0);
-      for (size_t i = 0; i < axes_index.size(); i++) {
-        size_t index = axes_index[i];
-        start_padding[index] = pads[i];
-        end_padding[index] = pads[i + pads.size() / 2];
+    if (is_constant_pads) {
+      // Read pads from initializer and expand axes to full rank.
+      std::vector<int64_t> pads;
+      const auto& pads_tensor = *initializers.at(input_defs[1]->Name());
+      ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(pads_tensor, pads, graph_viewer, logger),
+                        "Error while reading pads tensor");
+      if (TensorExists(input_defs, 3)) {
+        std::vector<int64_t> axes;
+        const auto& axes_tensor = *initializers.at(input_defs[3]->Name());
+        ORT_RETURN_IF_NOT(ReadIntArrayFrom1DTensor(axes_tensor, axes, graph_viewer, logger),
+                          "Error while reading axes tensor");
+        std::vector<size_t> axes_index;
+        std::transform(
+            axes.begin(), axes.end(), std::back_inserter(axes_index),
+            [rank](int64_t axis) -> int32_t { return SafeInt<int32_t>(HandleNegativeAxis(axis, rank)); });
+        start_padding.resize(rank, 0);
+        end_padding.resize(rank, 0);
+        for (size_t i = 0; i < axes_index.size(); i++) {
+          size_t index = axes_index[i];
+          start_padding[index] = pads[i];
+          end_padding[index] = pads[i + pads.size() / 2];
+        }
+      } else {
+        start_padding.assign(pads.begin(), pads.begin() + pads.size() / 2);
+        end_padding.assign(pads.begin() + pads.size() / 2, pads.end());
       }
-    } else {
-      start_padding.assign(pads.begin(), pads.begin() + pads.size() / 2);
-      end_padding.assign(pads.begin() + pads.size() / 2, pads.end());
     }
-  } else {
-    // Before opset 11, pads, constant value are attributes.
-    ORT_RETURN_IF_NOT(helper.HasAttr("pads"), "Pads is required as attribute in opset ", opset);
-    const auto pads = helper.Get("pads", std::vector<int>());
-    const auto value = helper.Get("value", 0.0f);
-    start_padding.assign(pads.begin(), pads.begin() + pads.size() / 2);
-    end_padding.assign(pads.begin() + pads.size() / 2, pads.end());
-    options.set("value", value);
   }
 
-  // Padding of WebNN cannot be negative.
-  std::vector<uint32_t> webnn_start_padding;
-  std::vector<uint32_t> webnn_end_padding;
-  bool negative_padding = clampNegativeValues(start_padding, webnn_start_padding);
-  negative_padding |= clampNegativeValues(end_padding, webnn_end_padding);
-  emscripten::val output = model_builder.GetBuilder().call<emscripten::val>("pad", input,
-                                                                            emscripten::val::array(webnn_start_padding),
-                                                                            emscripten::val::array(webnn_end_padding),
-                                                                            options);
-  // Handle the negative padding with slice.
-  if (negative_padding) {
-    std::vector<uint32_t> starts;
-    std::vector<uint32_t> sizes;
-    for (size_t i = 0; i < start_padding.size(); i++) {
-      starts.push_back(start_padding[i] >= 0 ? SafeInt<uint32_t>(0) : SafeInt<uint32_t>(-start_padding[i]));
-      sizes.push_back(SafeInt<uint32_t>(input_shape[i] + start_padding[i] + end_padding[i]));
+  emscripten::val output = emscripten::val::undefined();
+
+  if (is_constant_pads && !HasDynamicShape(input_shape)) {
+    // Static path: input is all-static and pads are constant.
+    std::vector<uint32_t> webnn_start, webnn_end;
+    bool negative_padding = clampNegativeValues(start_padding, webnn_start);
+    negative_padding |= clampNegativeValues(end_padding, webnn_end);
+    output = builder.call<emscripten::val>("pad", input,
+                                           emscripten::val::array(webnn_start),
+                                           emscripten::val::array(webnn_end), options);
+    if (negative_padding) {
+      std::vector<uint32_t> starts, sizes;
+      for (size_t i = 0; i < start_padding.size(); i++) {
+        starts.push_back(start_padding[i] >= 0 ? SafeInt<uint32_t>(0) : SafeInt<uint32_t>(-start_padding[i]));
+        sizes.push_back(SafeInt<uint32_t>(input_shape[i] + start_padding[i] + end_padding[i]));
+      }
+      emscripten::val slice_options = emscripten::val::object();
+      slice_options.set("label", label + "_slice_output");
+      output = builder.call<emscripten::val>("slice", output,
+                                             emscripten::val::array(starts),
+                                             emscripten::val::array(sizes), slice_options);
     }
-    emscripten::val slice_options = emscripten::val::object();
-    slice_options.set("label", node.Name() + "_slice_output");
-    output = model_builder.GetBuilder().call<emscripten::val>("slice", output,
-                                                              emscripten::val::array(starts),
-                                                              emscripten::val::array(sizes),
-                                                              slice_options);
+  } else if (is_constant_pads) {
+    // Constant pads but dynamic input: use padDynamic with constant pads operands.
+    // Split ONNX pads [begin0..beginR, end0..endR] into two operands.
+    std::vector<uint32_t> start_u32(start_padding.begin(), start_padding.end());
+    std::vector<uint32_t> end_u32(end_padding.begin(), end_padding.end());
+    const emscripten::val& beginning_pads = model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, label + "_beginning_pads",
+        start_u32, {static_cast<uint32_t>(rank)});
+    const emscripten::val& ending_pads = model_builder.CreateOrGetConstant<uint32_t>(
+        ONNX_NAMESPACE::TensorProto_DataType_UINT32, label + "_ending_pads",
+        end_u32, {static_cast<uint32_t>(rank)});
+    output = builder.call<emscripten::val>("padDynamic", input, beginning_pads, ending_pads, options);
+  } else {
+    // Dynamic path: pads is a runtime operand. Call padDynamic.
+    emscripten::val pads_op = model_builder.GetOperand(input_defs[1]->Name());
+
+    // If axes is specified (constant), expand pads from partial axes to full rank via gather + where.
+    if (TensorExists(input_defs, 3)) {
+      std::vector<int64_t> axes;
+      const auto* axes_init = graph_viewer.GetConstantInitializer(input_defs[3]->Name());
+      ORT_RETURN_IF_NOT(axes_init && ReadIntArrayFrom1DTensor(*axes_init, axes, graph_viewer, logger),
+                        "Cannot read axes initializer.");
+      const size_t num_axes = axes.size();
+      for (auto& axis : axes) {
+        axis = HandleNegativeAxis(axis, rank);
+      }
+
+      // ONNX pads layout: [begin_ax0, ..., begin_axN, end_ax0, ..., end_axN]
+      // Full pads layout: [begin_dim0, ..., begin_dimR, end_dim0, ..., end_dimR]
+      std::vector<int32_t> gather_indices(2 * rank, 0);
+      std::vector<uint8_t> mask(2 * rank, 0);
+      for (size_t i = 0; i < num_axes; ++i) {
+        const size_t d = static_cast<size_t>(axes[i]);
+        gather_indices[d] = static_cast<int32_t>(i);
+        gather_indices[rank + d] = static_cast<int32_t>(num_axes + i);
+        mask[d] = 1;
+        mask[rank + d] = 1;
+      }
+
+      int32_t pads_type;
+      ORT_RETURN_IF_NOT(GetType(*input_defs[1], pads_type, logger), "Cannot get pads type");
+      const bool use_int64 = pads_type == ONNX_NAMESPACE::TensorProto_DataType_INT64 &&
+                             model_builder.IsInt64Supported();
+      const int32_t pads_data_type = use_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
+                                               : ONNX_NAMESPACE::TensorProto_DataType_INT32;
+      constexpr int32_t INT32 = ONNX_NAMESPACE::TensorProto_DataType_INT32;
+      const auto shape_1d = [](size_t n) { return std::vector<uint32_t>{static_cast<uint32_t>(n)}; };
+
+      const emscripten::val zeros_const = use_int64
+          ? model_builder.CreateOrGetConstant<int64_t>(pads_data_type, int64_t{0}, shape_1d(2 * rank))
+          : model_builder.CreateOrGetConstant<int32_t>(pads_data_type, int32_t{0}, shape_1d(2 * rank));
+      const emscripten::val gather_idx_const = model_builder.CreateOrGetConstant<int32_t>(
+          INT32, label + "_gather_idx", gather_indices, shape_1d(2 * rank));
+      const emscripten::val mask_const = model_builder.CreateOrGetConstant<uint8_t>(
+          ONNX_NAMESPACE::TensorProto_DataType_UINT8, label + "_mask", mask, shape_1d(2 * rank));
+
+      emscripten::val options = emscripten::val::object();
+      options.set("label", label + "_pads_gather");
+      emscripten::val pads_expanded = builder.call<emscripten::val>(
+          "gather", pads_op, gather_idx_const, options);
+      options.set("label", label + "_pads_select");
+      pads_op = builder.call<emscripten::val>(
+          "where", mask_const, pads_expanded, zeros_const, options);
+    }
+
+    // Split ONNX pads [begin0..beginR, end0..endR] into two operands for padDynamic.
+    emscripten::val common_options = emscripten::val::object();
+    common_options.set("label", label + "_pads_begin_slice");
+    emscripten::val beginning_pads = builder.call<emscripten::val>(
+        "slice", pads_op,
+        emscripten::val::array(std::vector<uint32_t>{0}),
+        emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
+        common_options);
+    common_options.set("label", label + "_pads_end_slice");
+    emscripten::val ending_pads = builder.call<emscripten::val>(
+        "slice", pads_op,
+        emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
+        emscripten::val::array(std::vector<uint32_t>{static_cast<uint32_t>(rank)}),
+        common_options);
+
+    // ONNX Pad allows negative pads (trim/crop). WebNN padDynamic only accepts non-negative
+    // uint32 values. Decompose: clamp negatives to 0 for padding, then sliceDynamic to trim.
+    int32_t pads_type;
+    ORT_RETURN_IF_NOT(GetType(*input_defs[1], pads_type, logger), "Cannot get pads type");
+    const bool use_int64 = pads_type == ONNX_NAMESPACE::TensorProto_DataType_INT64 &&
+                           model_builder.IsInt64Supported();
+    const int32_t pads_data_type = use_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
+                                             : ONNX_NAMESPACE::TensorProto_DataType_INT32;
+    const std::string type_str = use_int64 ? "int64" : "int32";
+
+    const emscripten::val zero_const = use_int64
+        ? model_builder.CreateOrGetConstant<int64_t>(pads_data_type, int64_t{0},
+              std::vector<uint32_t>{static_cast<uint32_t>(rank)})
+        : model_builder.CreateOrGetConstant<int32_t>(pads_data_type, int32_t{0},
+              std::vector<uint32_t>{static_cast<uint32_t>(rank)});
+
+    // Clamped pads for padding (negatives → 0).
+    common_options.set("label", label + "_begin_pos");
+    emscripten::val begin_pos = builder.call<emscripten::val>(
+        "max", beginning_pads, zero_const, common_options);
+    common_options.set("label", label + "_end_pos");
+    emscripten::val end_pos = builder.call<emscripten::val>(
+        "max", ending_pads, zero_const, common_options);
+
+    // Trim amounts (abs of negatives, 0 for positive pads).
+    common_options.set("label", label + "_neg_begin");
+    emscripten::val neg_begin = builder.call<emscripten::val>(
+        "sub", zero_const, beginning_pads, common_options);
+    common_options.set("label", label + "_begin_trim");
+    emscripten::val begin_trim = builder.call<emscripten::val>(
+        "max", neg_begin, zero_const, common_options);
+    common_options.set("label", label + "_neg_end");
+    emscripten::val neg_end = builder.call<emscripten::val>(
+        "sub", zero_const, ending_pads, common_options);
+    common_options.set("label", label + "_end_trim");
+    emscripten::val end_trim = builder.call<emscripten::val>(
+        "max", neg_end, zero_const, common_options);
+
+    // Cast clamped pads to uint32 and call padDynamic.
+    common_options.set("label", label + "_cast_begin_uint32");
+    begin_pos = builder.call<emscripten::val>("cast", begin_pos, emscripten::val("uint32"), common_options);
+    common_options.set("label", label + "_cast_end_uint32");
+    end_pos = builder.call<emscripten::val>("cast", end_pos, emscripten::val("uint32"), common_options);
+    output = builder.call<emscripten::val>("padDynamic", input, begin_pos, end_pos, options);
+
+    // Apply sliceDynamic to trim regions where pads were negative.
+    // starts = begin_trim, sizes = shape(padded) - begin_trim - end_trim
+    common_options.set("label", label + "_padded_shape");
+    emscripten::val padded_shape = builder.call<emscripten::val>("shape", output, common_options);
+    common_options.set("label", label + "_padded_shape_cast");
+    emscripten::val padded_shape_typed = builder.call<emscripten::val>(
+        "cast", padded_shape, emscripten::val(type_str), common_options);
+    common_options.set("label", label + "_trim_sizes_sub1");
+    emscripten::val sizes = builder.call<emscripten::val>(
+        "sub", padded_shape_typed, begin_trim, common_options);
+    common_options.set("label", label + "_trim_sizes_sub2");
+    sizes = builder.call<emscripten::val>("sub", sizes, end_trim, common_options);
+
+    common_options.set("label", label + "_cast_trim_starts");
+    begin_trim = builder.call<emscripten::val>("cast", begin_trim, emscripten::val("uint32"), common_options);
+    common_options.set("label", label + "_cast_trim_sizes");
+    sizes = builder.call<emscripten::val>("cast", sizes, emscripten::val("uint32"), common_options);
+
+    emscripten::val trim_options = emscripten::val::object();
+    trim_options.set("label", label + "_trim");
+    output = builder.call<emscripten::val>("sliceDynamic", output, begin_trim, sizes, trim_options);
   }
+
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   return Status::OK();
 }
@@ -162,6 +334,7 @@ bool PadOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
                                      const Node& node,
                                      const WebnnDeviceType /* device_type */,
                                      const logging::Logger& logger) const {
+  const auto& name = node.Name();
   const auto& op_type = node.OpType();
   const auto& input_defs = node.InputDefs();
   const auto opset = node.SinceVersion();
@@ -169,32 +342,72 @@ bool PadOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer,
   NodeAttrHelper helper(node);
   const auto pad_mode = helper.Get("mode", "constant");
   if (supported_mode.find(pad_mode) == supported_mode.end()) {
-    LOGS(logger, VERBOSE) << op_type << " WebNN does not support mode " << pad_mode;
+    LOGS(logger, VERBOSE) << op_type << " [" << name << "] WebNN does not support mode " << pad_mode;
     return false;
   }
 
   if (input_defs.size() < 1) {
-    LOGS(logger, VERBOSE) << op_type << " requires at least one input (data)";
+    LOGS(logger, VERBOSE) << op_type << " [" << name << "] requires at least one input (data)";
     return false;
   }
 
   if (opset >= 11) {
     if (input_defs.size() < 2) {
-      LOGS(logger, VERBOSE) << op_type << " at opset " << opset << " requires at least two inputs (data and pads)";
+      LOGS(logger, VERBOSE) << op_type << " [" << name << "] at opset " << opset
+                            << " requires at least two inputs (data and pads)";
       return false;
     }
-    for (size_t i = 1; i < input_defs.size(); i++) {
-      // Optional tensors (constant_value, axes) can be indicated by an empty name, just ignore it.
+
+    // constant_value and axes must always be constant initializers if present.
+    for (size_t i = 2; i < input_defs.size(); i++) {
       const std::string input_name = GetTensorName(input_defs, i);
       if (!input_name.empty() && !graph_viewer.GetConstantInitializer(input_name)) {
-        LOGS(logger, VERBOSE) << "Input [" << input_name << "] must be known as initializer";
+        LOGS(logger, VERBOSE) << "Input '" << input_name << "' of " << op_type << " [" << name
+                              << "] must be a constant initializer";
         return false;
       }
     }
   }
 
   return true;
-}  // namespace webnn
+}
+
+bool PadOpBuilder::HasSupportedInputsImpl(const GraphViewer& graph_viewer, const Node& node,
+                                          const emscripten::val& wnn_limits,
+                                          const logging::Logger& logger) const {
+  const auto& input_defs = node.InputDefs();
+
+  // Constant path: pads is absent or a constant initializer.
+  // Delegate to base class which checks input 0 against WebNN pad's limits.
+  const std::string pads_name = GetTensorName(input_defs, 1);
+  if (pads_name.empty() || graph_viewer.GetConstantInitializer(pads_name)) {
+    return BaseOpBuilder::HasSupportedInputsImpl(graph_viewer, node, wnn_limits, logger);
+  }
+
+  // Dynamic path: check inputs against padDynamic's limits.
+  const std::string_view webnn_op_type = "padDynamic";
+
+  // Check input 0 (data tensor) against padDynamic's "input" parameter.
+  int32_t input_type;
+  if (!GetType(*input_defs[0], input_type, logger)) {
+    return false;
+  }
+  if (!IsDataTypeSupportedByWebNNOp("Pad", webnn_op_type, input_type, wnn_limits,
+                                    "input", "data", logger)) {
+    return false;
+  }
+  std::vector<int64_t> input_shape;
+  if (!GetShape(*input_defs[0], input_shape, logger) ||
+      !IsRankSupportedByWebNNOp(wnn_limits, webnn_op_type, "input",
+                            input_shape.size(), node.Name(), logger)) {
+    return false;
+  }
+
+  // padDynamic's beginningPadding/endingPadding are always uint32 (we cast at build time).
+  // Skip type check — ONNX pads input is int64 but we handle the conversion.
+
+  return true;
+}
 
 void CreatePadOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {
   op_registrations.builders.push_back(std::make_unique<PadOpBuilder>());

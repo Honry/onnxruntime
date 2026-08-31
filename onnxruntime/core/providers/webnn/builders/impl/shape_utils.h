@@ -17,6 +17,23 @@ namespace onnxruntime {
 namespace webnn {
 namespace shape_utils {
 
+// Slice a contiguous range [start, start+size) from a 1-D shape operand.
+// The shape_operand is typically the output of builder.shape(input).
+inline emscripten::val SliceShapeRange(const emscripten::val& wnn_builder,
+                                       const emscripten::val& shape_operand,
+                                       int32_t start, int32_t size,
+                                       const std::string& label) {
+  emscripten::val starts = emscripten::val::array();
+  starts.call<void>("push", start);
+  emscripten::val sizes = emscripten::val::array();
+  sizes.call<void>("push", size);
+  emscripten::val options = emscripten::val::object();
+  if (!label.empty()) {
+    options.set("label", label);
+  }
+  return wnn_builder.call<emscripten::val>("slice", shape_operand, starts, sizes, options);
+}
+
 // Builds a 1-D shape operand for reshapeDynamic from a target shape specification
 // that may include 0 (copy from input) and -1 (infer).
 //
@@ -182,6 +199,49 @@ inline emscripten::val GetShapeInWorkingType(ModelBuilder& model_builder,
   emscripten::val shape_op = wnn_builder.call<emscripten::val>("shape", input, options);
   options.set("label", label + "_shape_cast");
   return wnn_builder.call<emscripten::val>("cast", shape_op, emscripten::val(type_str), options);
+}
+
+// Normalize negative indices by wrapping relative to dim_sizes, then clamp to [0, dim_size].
+// Handles both negative indices (ONNX relative-to-end semantics) and out-of-bounds values
+// like INT_MAX (ONNX "to end of axis" convention in Slice).
+//
+// All operands (indices, dim_sizes, zero_const) must be the same signed data type.
+// use_int64: true if operands are int64, false if int32.
+// Returns the normalized and clamped indices in the same type.
+inline emscripten::val NormalizeAndClampIndices(ModelBuilder& model_builder,
+                                               const emscripten::val& indices,
+                                               const emscripten::val& dim_sizes,
+                                               bool use_int64,
+                                               uint32_t length,
+                                               const std::string& label) {
+  emscripten::val wnn_builder = model_builder.GetBuilder();
+  const int32_t data_type = use_int64 ? ONNX_NAMESPACE::TensorProto_DataType_INT64
+                                      : ONNX_NAMESPACE::TensorProto_DataType_INT32;
+
+  const emscripten::val zero_const = use_int64
+      ? model_builder.CreateOrGetConstant<int64_t>(data_type, int64_t{0},
+            std::vector<uint32_t>{length})
+      : model_builder.CreateOrGetConstant<int32_t>(data_type, int32_t{0},
+            std::vector<uint32_t>{length});
+
+  emscripten::val options = emscripten::val::object();
+
+  // Wrap negative: val = where(val < 0, val + dim_size, val)
+  options.set("label", label + "_is_neg");
+  emscripten::val is_neg = wnn_builder.call<emscripten::val>(
+      "lesser", indices, zero_const, options);
+  options.set("label", label + "_add_dim");
+  emscripten::val wrapped = wnn_builder.call<emscripten::val>(
+      "add", indices, dim_sizes, options);
+  options.set("label", label + "_wrap");
+  emscripten::val normalized = wnn_builder.call<emscripten::val>(
+      "where", is_neg, wrapped, indices, options);
+
+  // Clamp to [0, dim_size]: min(dim_sizes), then max(0)
+  options.set("label", label + "_clamp_max");
+  normalized = wnn_builder.call<emscripten::val>("min", normalized, dim_sizes, options);
+  options.set("label", label + "_clamp_min");
+  return wnn_builder.call<emscripten::val>("max", normalized, zero_const, options);
 }
 
 // Resolve ONNX -1/0 semantics in a runtime shape operand for reshapeDynamic.
