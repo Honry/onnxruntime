@@ -248,6 +248,12 @@ Status TryCallJsAsync(const emscripten::val& target, const std::string& method, 
   return Status::OK();
 }
 
+// The WebNN op type is the one mapped from the ONNX op type, unless it is given explicitly. Pass it when the node is
+// built with a different WebNN op (see BaseOpBuilder::GetEffectiveWebNNOpType).
+bool IsInputRankSupportedByOp(const Node& node, std::string_view webnn_op_type, const emscripten::val& wnn_limits,
+                              const logging::Logger& logger);
+bool IsOutputRankSupportedByOp(const Node& node, std::string_view webnn_op_type, const emscripten::val& wnn_limits,
+                               const logging::Logger& logger);
 bool IsInputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limits, const logging::Logger& logger);
 bool IsOutputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limits, const logging::Logger& logger);
 

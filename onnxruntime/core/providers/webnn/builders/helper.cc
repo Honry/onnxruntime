@@ -164,8 +164,12 @@ bool IsRankSupportedByWebNNOp(const emscripten::val& wnn_limits,
 }
 
 bool IsInputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limits, const logging::Logger& logger) {
+  return IsInputRankSupportedByOp(node, GetWebNNOpType(node.OpType()), wnn_limits, logger);
+}
+
+bool IsInputRankSupportedByOp(const Node& node, std::string_view webnn_op_type, const emscripten::val& wnn_limits,
+                              const logging::Logger& logger) {
   const std::string_view onnx_op_type = node.OpType();
-  const std::string_view webnn_op_type = GetWebNNOpType(onnx_op_type);
 
   if (webnn_op_type.empty()) {
     LOGS(logger, VERBOSE) << "ONNX op type: [" << onnx_op_type << "]'s corresponding WebNN op is not found.";
@@ -202,12 +206,16 @@ bool IsInputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limit
 // parameter names should call IsRankSupportedByWebNNOp directly with the proper name(s).
 bool IsOutputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limits,
                                const logging::Logger& logger) {
+  return IsOutputRankSupportedByOp(node, GetWebNNOpType(node.OpType()), wnn_limits, logger);
+}
+
+bool IsOutputRankSupportedByOp(const Node& node, std::string_view webnn_op_type, const emscripten::val& wnn_limits,
+                               const logging::Logger& logger) {
   std::vector<int64_t> shape;
   if (!GetShape(*node.OutputDefs()[0], shape, logger)) {
     return false;
   }
 
-  const std::string_view webnn_op_type = GetWebNNOpType(node.OpType());
   return IsRankSupportedByWebNNOp(wnn_limits, webnn_op_type, "output", shape.size(),
                                   node.Name(), logger);
 }

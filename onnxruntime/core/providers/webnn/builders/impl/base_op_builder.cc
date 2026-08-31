@@ -63,11 +63,11 @@ bool BaseOpBuilder::HasSupportedInputsImpl(const GraphViewer&, const Node& node,
   if (!GetType(input, input_type, logger))
     return false;
 
-  const std::string_view webnn_op_type = GetWebNNOpType(op_type);
+  const std::string_view webnn_op_type = GetEffectiveWebNNOpType(node, wnn_limits);
   const std::string_view webnn_input_name = GetWebNNOpFirstInputName(op_type);
   return IsDataTypeSupportedByWebNNOp(op_type, webnn_op_type, input_type, wnn_limits,
                                       webnn_input_name, "input", logger) &&
-         IsInputRankSupportedByOp(node, wnn_limits, logger);
+         IsInputRankSupportedByOp(node, webnn_op_type, wnn_limits, logger);
 }
 
 bool BaseOpBuilder::HasSupportedOutputs(const Node& node, const emscripten::val& wnn_limits,
@@ -92,8 +92,15 @@ bool BaseOpBuilder::HasSupportedOutputsImpl(const Node& node,
   if (!GetType(output, output_type, logger))
     return false;
 
-  return IsDataTypeSupportedByOp(op_type, output_type, wnn_limits, "output", "Output", logger) &&
-         IsOutputRankSupportedByOp(node, wnn_limits, logger);
+  const std::string_view webnn_op_type = GetEffectiveWebNNOpType(node, wnn_limits);
+  return IsDataTypeSupportedByWebNNOp(op_type, webnn_op_type, output_type, wnn_limits,
+                                      "output", "Output", logger) &&
+         IsOutputRankSupportedByOp(node, webnn_op_type, wnn_limits, logger);
+}
+
+std::string_view BaseOpBuilder::GetEffectiveWebNNOpType(const Node& node,
+                                                        const emscripten::val& /*wnn_limits*/) const {
+  return GetWebNNOpType(node.OpType());
 }
 
 bool BaseOpBuilder::HasSupportedOpSet(const Node& node,
