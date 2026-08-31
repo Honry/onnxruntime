@@ -140,5 +140,7 @@ Module["jsepInit"] = (name, params) => {
     Module["webnnCreateTemporaryTensor"] =
       backend["createTemporaryTensor"].bind(backend);
     Module["webnnIsGraphInputOutputTypeSupported"] = backend["isGraphInputOutputTypeSupported"].bind(backend);
+    Module["webnnTryCall"] = backend["tryCall"].bind(backend);
+    Module["webnnTryCallAsync"] = backend["tryCallAsync"].bind(backend);
   }
 };

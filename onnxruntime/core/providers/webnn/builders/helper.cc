@@ -50,9 +50,13 @@ bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const loggin
     return false;
   }
 
-  // We already checked the shape has no dynamic dimension.
+  // For dynamic dimensions, use kDynamicDim as placeholder.
   for (const auto& dim : shape_proto->dim()) {
-    shape.push_back(dim.dim_value());
+    if (dim.has_dim_value()) {
+      shape.push_back(dim.dim_value());
+    } else {
+      shape.push_back(kDynamicDim);
+    }
   }
 
   return true;
@@ -84,11 +88,15 @@ bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_n
   }
 
   for (const auto& dim : shape_proto->dim()) {
-    // WebNN doesn't support dynamic shape - use sessionOptions.freeDimensionOverrides to fix the shape.
     if (!dim.has_dim_value()) {
-      LOGS(logger, VERBOSE) << "Dynamic shape is not supported, "
-                            << "use sessionOptions.FreeDimensionOverrides to set a fixed shape: " << node_arg_name;
-      return false;
+      // Check whether the browser supports dynamic shapes.
+      // When unsupported, reject nodes with dynamic dims so they fallback to CPU.
+      if (!IsDynamicShapeSupported()) {
+        LOGS(logger, VERBOSE) << "Dynamic shape is not supported by this WebNN context, "
+                              << "use sessionOptions.FreeDimensionOverrides to set a fixed shape: " << node_arg_name;
+        return false;
+      }
+      continue;
     }
     if (dim.dim_value() == 0 && !allow_empty_input) {
       LOGS(logger, VERBOSE) << "The shape of [" << node_arg_name << "] has 0 dimension which is not supported by WebNN";
@@ -204,6 +212,14 @@ bool IsOutputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limi
                                   node.Name(), logger);
 }
 
+void LogNodeSupport(const Node& node, bool supported, const logging::Logger& logger, std::string_view reason) {
+  LOGS(logger, VERBOSE) << "Operator type: [" << node.OpType()
+                        << "] index: [" << node.Index()
+                        << "] name: [" << node.Name()
+                        << "] supported: [" << supported
+                        << "]" << (reason.empty() ? "" : " reason: [") << reason << (reason.empty() ? "" : "]");
+}
+
 std::unordered_set<const Node*> GetSupportedNodes(const GraphViewer& graph_viewer,
                                                   const emscripten::val& wnn_builder,
                                                   const WebnnDeviceType device_type,
@@ -213,17 +229,65 @@ std::unordered_set<const Node*> GetSupportedNodes(const GraphViewer& graph_viewe
 
   for (const auto& node : graph_viewer.Nodes()) {
     const bool supported = IsNodeSupported(graph_viewer, node, device_type, wnn_limits, logger);
-    LOGS(logger, VERBOSE) << "Operator type: [" << node.OpType()
-                          << "] index: [" << node.Index()
-                          << "] name: [" << node.Name()
-                          << "] supported: [" << supported
-                          << "]";
+    LogNodeSupport(node, supported, logger);
     if (supported) {
       supported_nodes.insert(&node);
     }
   }
 
   return supported_nodes;
+}
+
+// Inputs whose values decide the output shape, for the ops that accept them as operands (the *Dynamic WebNN ops).
+static gsl::span<const size_t> GetShapeOperandIndices(std::string_view op_type) {
+  static const InlinedHashMap<std::string_view, InlinedVector<size_t>> kShapeOperandIndices = {
+      {"ConstantOfShape", {0}},
+      {"Expand", {1}},
+      {"Pad", {1}},
+      {"Range", {0, 1, 2}},
+      {"Reshape", {1}},
+      {"Resize", {3}},
+      {"Slice", {1, 2}},
+      {"Split", {1}},
+      {"Tile", {1}},
+  };
+  const auto it = kShapeOperandIndices.find(op_type);
+  return it == kShapeOperandIndices.end() ? gsl::span<const size_t>{} : gsl::span<const size_t>{it->second};
+}
+
+std::vector<const Node*> GetNodesWithValueDerivedShapeOperands(const GraphViewer& graph_viewer,
+                                                               gsl::span<const NodeIndex> nodes,
+                                                               gsl::span<const std::string> partition_inputs) {
+  // Tensors whose values depend on the values of the partition inputs. Shape and Size only read the shape of their
+  // input, so they stop the propagation.
+  InlinedHashSet<std::string> value_derived(partition_inputs.begin(), partition_inputs.end());
+  std::vector<const Node*> result;
+
+  for (const NodeIndex index : nodes) {
+    const Node& node = *graph_viewer.GetNode(index);
+    const auto& input_defs = node.InputDefs();
+    const auto is_value_derived = [&](size_t i) {
+      return i < input_defs.size() && input_defs[i]->Exists() && Contains(value_derived, input_defs[i]->Name());
+    };
+
+    const auto shape_operand_indices = GetShapeOperandIndices(node.OpType());
+    if (std::any_of(shape_operand_indices.begin(), shape_operand_indices.end(), is_value_derived)) {
+      result.push_back(&node);
+    }
+
+    if (node.OpType() != "Shape" && node.OpType() != "Size") {
+      for (size_t i = 0; i < input_defs.size(); ++i) {
+        if (is_value_derived(i)) {
+          for (const auto* output_def : node.OutputDefs()) {
+            value_derived.insert(output_def->Name());
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  return result;
 }
 
 bool AreDataTypesSame(const std::string_view op_type,
@@ -388,6 +452,11 @@ bool SetWebnnDataType(emscripten::val& desc, const int32_t data_type) {
 
 bool IsMLTensorSupported() {
   static bool is_supported = !emscripten::val::global("MLTensor").isUndefined();
+  return is_supported;
+}
+
+bool IsDynamicShapeSupported() {
+  static bool is_supported = !emscripten::val::global("MLGraph")["prototype"]["computeShapes"].isUndefined();
   return is_supported;
 }
 

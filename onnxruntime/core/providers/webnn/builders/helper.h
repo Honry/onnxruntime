@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include <core/common/status.h>
 #include "core/common/inlined_containers.h"
@@ -35,6 +36,9 @@ enum class WebnnDeviceType {
 
 WebnnDeviceType DeviceTypeFromString(const std::string_view& device_type);
 
+// Sentinel value used by GetShape() to represent dynamic (symbolic) dimensions.
+constexpr int64_t kDynamicDim = -1;
+
 // Collects all the initializer tensors in the subGraph and its ancestor graphs.
 InitializedTensorSet CollectAllInitializedTensors(const GraphViewer& graph_viewer);
 
@@ -51,6 +55,24 @@ inline std::vector<int64_t> GetResolvedAxes(const NodeAttrHelper& helper, size_t
 }
 
 bool GetShape(const NodeArg& node_arg, std::vector<int64_t>& shape, const logging::Logger& logger);
+
+// Check if a NodeArg has dynamic (symbolic) dimensions.
+// Callers must ensure the NodeArg has a shape proto (guaranteed after IsTensorShapeSupported).
+inline bool HasDynamicShape(const NodeArg& node_arg) {
+  const auto* shape_proto = node_arg.Shape();
+  assert(shape_proto != nullptr);
+  for (const auto& dim : shape_proto->dim()) {
+    if (!dim.has_dim_value()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Check if a shape vector (from GetShape()) contains dynamic dimensions (kDynamicDim placeholders).
+inline bool HasDynamicShape(const std::vector<int64_t>& shape) {
+  return std::any_of(shape.begin(), shape.end(), [](int64_t d) { return d == kDynamicDim; });
+}
 
 template <typename T>
 std::string GetShapeString(std::vector<T>& shape) {
@@ -201,6 +223,31 @@ inline bool TensorExists(const ConstPointerContainer<std::vector<NodeArg*>>& def
 bool IsTensorShapeSupported(const NodeArg& node_arg, const std::string& parent_name,
                             const logging::Logger& logger, bool allow_empty_input = false);
 
+// Calls target.method(args...) and returns its result. If the call throws, returns a failed status with the error
+// message. A JS exception cannot be caught in C++ because catching is disabled in the release build, and it aborts the
+// runtime, so the call goes through the backend, which catches it.
+template <typename... Args>
+Status TryCallJs(const emscripten::val& target, const std::string& method, emscripten::val& result, Args&&... args) {
+  emscripten::val ret = emscripten::val::module_property("webnnTryCall")(target, method, std::forward<Args>(args)...);
+  const emscripten::val error = ret["error"];
+  ORT_RETURN_IF(!error.isUndefined(), "WebNN ", method, "() failed: ", error.as<std::string>());
+  result = ret["result"];
+  return Status::OK();
+}
+
+// Same as TryCallJs, for a method that returns a Promise (e.g. build(), compute()): awaits it, and a rejection becomes
+// a failed status instead of a JS exception at the await.
+template <typename... Args>
+Status TryCallJsAsync(const emscripten::val& target, const std::string& method, emscripten::val& result,
+                      Args&&... args) {
+  emscripten::val ret =
+      emscripten::val::module_property("webnnTryCallAsync")(target, method, std::forward<Args>(args)...).await();
+  const emscripten::val error = ret["error"];
+  ORT_RETURN_IF(!error.isUndefined(), "WebNN ", method, "() failed: ", error.as<std::string>());
+  result = ret["result"];
+  return Status::OK();
+}
+
 bool IsInputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limits, const logging::Logger& logger);
 bool IsOutputRankSupportedByOp(const Node& node, const emscripten::val& wnn_limits, const logging::Logger& logger);
 
@@ -212,12 +259,23 @@ bool IsRankSupportedByWebNNOp(const emscripten::val& wnn_limits,
                               const std::string_view node_name,
                               const logging::Logger& logger);
 
+// Log whether WebNN EP supports a node, one line per node. Every fallback node is logged with "supported: [0]",
+// whichever check rejected it, so grep for it to list them. 'reason' is appended when the check isn't per-node.
+void LogNodeSupport(const Node& node, bool supported, const logging::Logger& logger, std::string_view reason = {});
+
 // Get a set of nodes supported by WebNN EP.
 std::unordered_set<const Node*> GetSupportedNodes(const GraphViewer& graph_viewer,
                                                   const emscripten::val& wnn_builder,
                                                   const WebnnDeviceType device_type,
                                                   const emscripten::val& wnn_limits,
                                                   const logging::Logger& logger);
+
+// Get the nodes of a partition whose shape operand (the new shape of Reshape, the sizes of Resize, ...) is derived
+// from the value of one of the partition inputs. WebNN infers shapes from the shapes of the inputs, never from their
+// values, so these nodes can't be built by WebNN. 'nodes' must be in topological order.
+std::vector<const Node*> GetNodesWithValueDerivedShapeOperands(const GraphViewer& graph_viewer,
+                                                               gsl::span<const NodeIndex> nodes,
+                                                               gsl::span<const std::string> partition_inputs);
 
 // Retrieve the first input name of an ONNX op's corresponding WebNN op used for validating supported input data types.
 // WebNN ops have various first input names such as 'a', 'input', 'inputs', etc.
@@ -295,6 +353,11 @@ bool GetBidirectionalBroadcastShape(std::vector<int64_t>& shape_a,
 bool SetWebnnDataType(emscripten::val& desc, const int32_t data_type);
 
 bool IsMLTensorSupported();
+
+// Whether the browser supports dynamic shapes. MLGraph.computeShapes() is only implemented once all
+// the dynamic-shape operators (shape, reshapeDynamic, sliceDynamic, ...) are in place, so its presence
+// is used as the single feature-detection signal.
+bool IsDynamicShapeSupported();
 
 uint8_t PackInt8ToUint8DoubledNibbles(int8_t value, const int32_t& data_type);
 uint16_t PackFloat32ToUint16AsFloat16(float value);

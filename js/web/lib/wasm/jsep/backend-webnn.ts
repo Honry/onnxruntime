@@ -331,6 +331,34 @@ export class WebNNBackend {
     return outputNames.includes(outputName);
   }
 
+  /**
+   * Calls `target[method](...args)`. If it throws, returns the error message instead: the wasm code cannot catch a JS
+   * exception because catching is disabled in the release build, so the exception would abort the runtime.
+   */
+  public tryCall(target: object, method: string, ...args: unknown[]): { result?: unknown; error?: string } {
+    try {
+      return { result: (target as Record<string, (...args: unknown[]) => unknown>)[method](...args) };
+    } catch (e) {
+      return { error: String(e) };
+    }
+  }
+
+  /**
+   * Same as `tryCall`, for a method that returns a Promise: a rejection is returned as the error message instead of
+   * being thrown at the `await()` in the wasm code.
+   */
+  public async tryCallAsync(
+    target: object,
+    method: string,
+    ...args: unknown[]
+  ): Promise<{ result?: unknown; error?: string }> {
+    try {
+      return { result: await (target as Record<string, (...args: unknown[]) => unknown>)[method](...args) };
+    } catch (e) {
+      return { error: String(e) };
+    }
+  }
+
   public isGraphInputOutputTypeSupported(sessionId: number, type: Tensor.Type, isInput = true): boolean {
     const dataType = onnxDataTypeToWebnnDataType.get(tensorDataTypeStringToEnum(type));
     const opLimits = this.mlOpSupportLimitsBySessionId.get(sessionId);

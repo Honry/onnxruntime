@@ -10,6 +10,7 @@
 #include "core/common/logging/logging.h"
 #include "core/graph/onnx_protobuf.h"
 #include "core/providers/common.h"
+#include "helper.h"
 #include "model.h"
 
 namespace onnxruntime {
@@ -22,6 +23,67 @@ Model::Model(const emscripten::val& context, const emscripten::val& graph, const
       use_dispatch_(use_dispatch) {}
 
 Model::~Model() {}
+
+Status Model::ComputeShapes(
+    const InlinedHashMap<std::string, std::vector<int64_t>>& input_shapes,
+    const InlinedHashMap<std::string, std::vector<int64_t>>*& output_shapes) {
+  if (!IsDynamicShapeSupported()) {
+    return ORT_MAKE_STATUS(ONNXRUNTIME, NOT_IMPLEMENTED,
+                           "MLGraph.computeShapes() is not available");
+  }
+
+  // Fast path: if the input shapes are identical to the last successful call, reuse the
+  // cached output shapes and skip the JS computeShapes() round-trip. This is a pure-function
+  // memoization keyed on input shapes, valid because the compiled MLGraph never changes.
+  // Common in LLM decode loops that repeat the same input shapes across many runs.
+  if (!cached_compute_input_shapes_.empty() &&
+      cached_compute_input_shapes_.size() == input_shapes.size()) {
+    bool same = true;
+    for (const auto& [name, shape] : input_shapes) {
+      auto it = cached_compute_input_shapes_.find(name);
+      if (it == cached_compute_input_shapes_.end() || it->second != shape) {
+        same = false;
+        break;
+      }
+    }
+    if (same) {
+      output_shapes = &cached_compute_output_shapes_;
+      return Status::OK();
+    }
+  }
+
+  emscripten::val js_input_shapes = emscripten::val::object();
+  for (const auto& [name, shape] : input_shapes) {
+    emscripten::val js_shape = emscripten::val::array();
+    for (const auto& dim : shape) {
+      js_shape.call<void>("push", SafeInt<uint32_t>(dim).Ref());
+    }
+    js_input_shapes.set(name, js_shape);
+  }
+
+  // computeShapes() throws if the shapes cannot be inferred, e.g. when they depend on input values.
+  emscripten::val js_output_shapes;
+  ORT_RETURN_IF_ERROR(TryCallJs(wnn_graph_, "computeShapes", js_output_shapes, js_input_shapes));
+
+  emscripten::val keys = emscripten::val::global("Object").call<emscripten::val>("keys", js_output_shapes);
+  const size_t num_outputs = keys["length"].as<size_t>();
+  InlinedHashMap<std::string, std::vector<int64_t>> computed_output_shapes;
+  computed_output_shapes.reserve(num_outputs);
+  for (size_t i = 0; i < num_outputs; ++i) {
+    std::string output_name = keys[i].as<std::string>();
+    // WebNN dims are uint32. Don't read them as int64_t: that maps to a BigInt64Array (WASM_BIGINT), and
+    // copying a JS array of Numbers into it throws a TypeError.
+    const auto dims = emscripten::convertJSArrayToNumberVector<uint32_t>(js_output_shapes[output_name]);
+    computed_output_shapes.emplace(output_name, std::vector<int64_t>(dims.begin(), dims.end()));
+  }
+
+  // Populate the memo only on the success path, so a failed call never poisons the cache.
+  cached_compute_input_shapes_ = input_shapes;
+  cached_compute_output_shapes_ = std::move(computed_output_shapes);
+  output_shapes = &cached_compute_output_shapes_;
+
+  return Status::OK();
+}
 
 Status Model::Predict(const InlinedHashMap<std::string, OnnxTensorData>& inputs,
                       const InlinedHashMap<std::string, OnnxTensorData>& outputs) {
@@ -136,9 +198,8 @@ onnxruntime::common::Status Model::Compute(const InlinedHashMap<std::string, Onn
 
     output_views.insert({name, view});
   }
-  emscripten::val results = wnn_context_.call<emscripten::val>(
-                                            "compute", wnn_graph_, wnn_inputs_, wnn_outputs_)
-                                .await();
+  emscripten::val results;
+  ORT_RETURN_IF_ERROR(TryCallJsAsync(wnn_context_, "compute", results, wnn_graph_, wnn_inputs_, wnn_outputs_));
 
   // Copy the outputs from pre-allocated ArrayBuffers back to the Wasm ArrayBuffer.
   for (const auto& output : outputs) {
@@ -191,7 +252,8 @@ onnxruntime::common::Status Model::Dispatch(const InlinedHashMap<std::string, On
   for (const auto& [name, _] : outputs) {
     wnn_outputs_.set(name, ml_tensors.call<emscripten::val>("shift"));
   }
-  wnn_context_.call<void>("dispatch", wnn_graph_, wnn_inputs_, wnn_outputs_);
+  emscripten::val dispatch_result;
+  ORT_RETURN_IF_ERROR(TryCallJs(wnn_context_, "dispatch", dispatch_result, wnn_graph_, wnn_inputs_, wnn_outputs_));
 
   return Status::OK();
 }
