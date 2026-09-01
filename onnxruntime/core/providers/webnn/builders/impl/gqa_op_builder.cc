@@ -99,7 +99,38 @@ void GroupQueryAttentionOpBuilder::AddInitializersToSkip(ModelBuilder& model_bui
       - When past_key/past_value are empty, this is the first token (prefill mode).
       - When do_rotary is true, cos_cache and sin_cache must be provided.
 
-    KV-cache update strategy (stateless ScatterND):
+    KV-cache update strategy is controlled by the "enableCausalLM" EP option:
+
+    ===== enableCausalLM = true (Concat / stateful path) =====
+    Cache grows each decode step: present_kv = concat(past_kv, new_kv, axis=2).
+    Suitable for causal LM inference where the runtime manages growing cache tensors.
+
+       query         key                 value
+        |             |                    |
+    (RotaryEmb)    (RotaryEmb)             |
+        |             |                    |
+      Reshape       Reshape              Reshape (B,S,kv_N,H)
+        |             |                    |
+     q_Transpose  Transpose(BNSH)    Transpose(BNSH)
+      (0,2,1,3)       |                    |
+         \   past_key |        past_value  |
+          \        \  |                \   |
+           \    Concat(axis=2)     Concat(axis=2)
+            \          |                   |
+             \     present_key       present_value -----> output[1], output[2]
+              \        |                   |
+               |     Expand(G)         Expand(G)    (attention_bias, causal mask)
+               |       |                   |           /
+               |     k_Transpose           |          /
+               |     (0,1,3,2)             |         /
+               |       |                   |        /
+            +---------------------------------------+
+            |        ScaledDotProductAttention      |
+            +---------------------------------------+
+                              |
+                            output
+
+    ===== enableCausalLM = false (ScatterND / stateless path, default) =====
     Fixed-size KV buffer: new tokens are scattered at position seqlens_k-(S-1).
     Suitable for models that manage the KV-cache externally (e.g., I/O binding).
 
@@ -445,11 +476,51 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   emscripten::val s_minus_1 = model_builder.GetBuilder().call<emscripten::val>(
       "reduceMax", seq_range, seq_reduce_options);
 
-  // present_kv computation (stateless ScatterND): scatter the new key/value tokens into the
-  // fixed-size past_kv buffer at the seqlens_k position.
+  // present_kv computation: branch based on enableCausalLM option.
+  // - CausalLM (stateful): concat(past_kv, new_kv, axis=2) — past grows each step
+  // - Stateless (ScatterND): scatter new tokens into fixed-size past buffer at seqlens_k position
   emscripten::val present_key;
   emscripten::val present_value;
-  {
+  if (model_builder.IsCausalLMEnabled()) {
+    // Concat path: key/value in BNSH, then concat(past_kv, new_kv, axis=2)
+    emscripten::val new_key_bnsh;
+    if (rotary_produced_bnsh) {
+      // Key is already BNSH from rotary embedding.
+      new_key_bnsh = rotary_key_bnsh;
+    } else {
+      // Transpose key from BSNH to BNSH.
+      transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
+      transpose_options.set("label", node.Name() + "_/GQA/key/transpose_to_bnsh");
+      new_key_bnsh = model_builder.GetBuilder().call<emscripten::val>(
+          "transpose", key_bsnh, transpose_options);
+    }
+
+    // Value always needs transpose from BSNH to BNSH.
+    transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
+    transpose_options.set("label", node.Name() + "_/GQA/value/transpose_to_bnsh");
+    emscripten::val new_value_bnsh = model_builder.GetBuilder().call<emscripten::val>(
+        "transpose", value_bsnh, transpose_options);
+
+    if (has_past_key && has_past_value) {
+      emscripten::val concat_key_inputs = emscripten::val::array();
+      concat_key_inputs.call<void>("push", past_key_input);
+      concat_key_inputs.call<void>("push", new_key_bnsh);
+      common_options.set("label", node.Name() + "_/GQA/present_key/concat");
+      present_key = model_builder.GetBuilder().call<emscripten::val>(
+          "concat", concat_key_inputs, 2, common_options);
+
+      emscripten::val concat_value_inputs = emscripten::val::array();
+      concat_value_inputs.call<void>("push", past_value_input);
+      concat_value_inputs.call<void>("push", new_value_bnsh);
+      common_options.set("label", node.Name() + "_/GQA/present_value/concat");
+      present_value = model_builder.GetBuilder().call<emscripten::val>(
+          "concat", concat_value_inputs, 2, common_options);
+    } else {
+      // No past: new key/value ARE the present key/value (prefill).
+      present_key = new_key_bnsh;
+      present_value = new_value_bnsh;
+    }
+  } else {
     // ScatterND path: scatter new key/value into past_kv buffer at the correct position.
     // When rotary_produced_bnsh: key is BNSH (rotary_key_bnsh), value transposed to BNSH.
     // Otherwise: key_bsnh/value_bsnh are in BSNH format.

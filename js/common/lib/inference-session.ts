@@ -368,10 +368,25 @@ export declare namespace InferenceSession {
    *
    * @see https://www.w3.org/TR/webnn/#dictdef-mlcontextoptions
    */
+  export interface FreeDimensionBound {
+    minSize?: number;
+    maxSize: number;
+  }
+
   export interface WebNNContextOptions {
     deviceType?: 'cpu' | 'gpu' | 'npu';
     numThreads?: number;
     powerPreference?: 'default' | 'low-power' | 'high-performance';
+    freeDimensionBounds?: { readonly [dimensionName: string]: FreeDimensionBound };
+    /**
+     * When true, the GroupQueryAttention (GQA) op uses a stateful concat-based KV-cache strategy:
+     * present_kv = concat(past_kv, new_kv). The cache grows each decode step.
+     *
+     * When false (default), GQA uses a stateless ScatterND-based strategy: new tokens are
+     * scattered into a fixed-size past_kv buffer at the position indicated by seqlens_k.
+     * This is suitable for models that manage the KV-cache externally (e.g., via I/O binding).
+     */
+    enableCausalLM?: boolean;
   }
 
   /**

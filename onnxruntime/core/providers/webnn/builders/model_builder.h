@@ -23,7 +23,8 @@ class IOpBuilder;
 class ModelBuilder {
  public:
   ModelBuilder(const GraphViewer& graph_viewer, const logging::Logger& logger, const emscripten::val& context,
-               const WebnnDeviceType wnn_device_type, const emscripten::val& wnn_limits);
+               const WebnnDeviceType wnn_device_type, const emscripten::val& wnn_limits,
+               bool enable_causal_lm);
   ~ModelBuilder() = default;
 
   Status Compile(std::unique_ptr<Model>& model) ORT_MUST_USE_RESULT;
@@ -65,6 +66,8 @@ class ModelBuilder {
                                              const std::vector<uint32_t>& shape = {});
 
   WebnnDeviceType GetWebnnDeviceType() const { return wnn_device_type_; }
+  // Returns true when GQA should use concat-based (stateful) KV-cache; false for ScatterND (stateless).
+  bool IsCausalLMEnabled() const { return enable_causal_lm_; }
 
   // The initializer will be processed separately, skip it as an initializer.
   void AddInitializerToSkip(const std::string& tensor_name);
@@ -87,6 +90,7 @@ class ModelBuilder {
   bool is_int64_supported_ = false;
   WebnnDeviceType wnn_device_type_;
   emscripten::val wnn_limits_ = emscripten::val::undefined();
+  bool enable_causal_lm_;
   InlinedHashMap<std::string, emscripten::val> wnn_operands_;
   // Cross-node reuse cache (see HasCachedOperand/GetCachedOperand/AddCachedOperand).
   InlinedHashMap<std::string, emscripten::val> cached_operands_;

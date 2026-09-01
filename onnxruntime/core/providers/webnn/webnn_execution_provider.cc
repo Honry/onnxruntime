@@ -29,7 +29,8 @@ namespace onnxruntime {
 
 constexpr const char* WEBNN = "WEBNN";
 
-WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_flags)
+WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_flags,
+                         bool enable_causal_lm)
     : IExecutionProvider{
           onnxruntime::kWebNNExecutionProvider,
           // If MLTensor is supported, we force all the tensors to be allocated as MLTensor.
@@ -38,7 +39,8 @@ WebNNExecutionProvider::WebNNExecutionProvider(const std::string& webnn_device_f
               OrtDevice::MemType::DEFAULT,
               OrtDevice::VendorIds::NONE,
               0)},
-                  wnn_device_type_(webnn::DeviceTypeFromString(webnn_device_flags)) {
+                  wnn_device_type_(webnn::DeviceTypeFromString(webnn_device_flags)),
+                  enable_causal_lm_(enable_causal_lm) {
   wnn_context_ = emscripten::val::module_property("currentContext");
   if (!wnn_context_.as<bool>()) {
     ORT_THROW("Failed to create WebNN context.");
@@ -172,7 +174,8 @@ common::Status WebNNExecutionProvider::Compile(const std::vector<FusedNodeAndGra
     Node& fused_node = fused_node_and_graph.fused_node;
     const onnxruntime::GraphViewer& graph_viewer(fused_node_and_graph.filtered_graph);
 
-    webnn::ModelBuilder builder(graph_viewer, *GetLogger(), wnn_context_, wnn_device_type_, wnn_limits_);
+    webnn::ModelBuilder builder(graph_viewer, *GetLogger(), wnn_context_, wnn_device_type_, wnn_limits_,
+                  enable_causal_lm_);
     std::unique_ptr<webnn::Model> model;
     ORT_RETURN_IF_ERROR(builder.Compile(model));
 
