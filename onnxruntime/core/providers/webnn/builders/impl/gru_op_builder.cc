@@ -72,7 +72,7 @@ Status GruOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const No
     options.set("initialHiddenState", model_builder.GetOperand(input_defs[5]->Name()));
   }
 
-  bool linear_before_reset = !!helper.Get("linear_before_reset ", 0);
+  bool linear_before_reset = !!helper.Get("linear_before_reset", 0);
   options.set("resetAfter", linear_before_reset);
 
   const auto& output_defs = node.OutputDefs();
@@ -130,6 +130,10 @@ bool GruOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_viewer, const Node
   std::vector<int64_t> input_shape;
   if (!GetShape(*input_defs[0], input_shape, logger) || input_shape.empty()) {
     LOGS(logger, ERROR) << "Cannot get input's shape";
+    return false;
+  }
+  if (input_shape[0] == kDynamicDim) {
+    LOGS(logger, VERBOSE) << "GRU: dynamic sequence length is not supported";
     return false;
   }
   int32_t steps = static_cast<int32_t>(input_shape[0]);
