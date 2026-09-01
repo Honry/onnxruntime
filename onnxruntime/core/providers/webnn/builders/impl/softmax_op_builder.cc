@@ -18,6 +18,10 @@ class SoftmaxOpBuilder : public BaseOpBuilder {
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
+
+  // Operator support related.
+  bool IsOpSupportedImpl(const GraphViewer&, const Node& node,
+                         const WebnnDeviceType /* device_type */, const logging::Logger& logger) const override;
 };
 
 Status SoftmaxOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
@@ -73,6 +77,33 @@ Status SoftmaxOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   return Status::OK();
+}
+
+bool SoftmaxOpBuilder::IsOpSupportedImpl(const GraphViewer&,
+                                         const Node& node,
+                                         const WebnnDeviceType /* device_type */,
+                                         const logging::Logger& logger) const {
+  // Opset < 13 with axis != last dim uses a reshape-based decomposition that
+  // computes M = prod(dims[0..axis)) and N = prod(dims[axis..end)). Both products
+  // require concrete (static) dim values. If axis already targets the last dim,
+  // no reshape is needed and dynamic dims are fully supported.
+  if (node.SinceVersion() < 13) {
+    const auto& input_defs = node.InputDefs();
+    std::vector<int64_t> input_shape;
+    if (!GetShape(*input_defs[0], input_shape, logger)) {
+      return false;
+    }
+    NodeAttrHelper helper(node);
+    int32_t axis = helper.Get("axis", 1);
+    const int64_t rank = static_cast<int64_t>(input_shape.size());
+    axis = SafeInt<int32_t>(HandleNegativeAxis(axis, rank));
+    const bool do_reshape = (axis != rank - 1);
+    if (do_reshape && HasDynamicShape(input_shape)) {
+      LOGS(logger, VERBOSE) << "Softmax opset < 13 with axis != last dim does not support dynamic shapes";
+      return false;
+    }
+  }
+  return true;
 }
 
 void CreateSoftmaxOpBuilder(const std::string& op_type, OpBuilderRegistrations& op_registrations) {

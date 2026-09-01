@@ -226,18 +226,10 @@ bool GemmOpBuilder::IsOpSupportedImpl(const GraphViewer&,
   std::vector<int64_t> a_shape;
   if (!GetShape(*input_defs[a_idx], a_shape, logger))
     return false;
-  if (Product(a_shape) == 0) {
-    LOGS(logger, VERBOSE) << "A must be non-empty";
-    return false;
-  }
 
   std::vector<int64_t> b_shape;
   if (!GetShape(*input_defs[b_idx], b_shape, logger))
     return false;
-  if (Product(b_shape) == 0) {
-    LOGS(logger, VERBOSE) << "B must be non-empty";
-    return false;
-  }
 
   if (op_type == "Gemm") {
     if (a_shape.size() != 2 || b_shape.size() != 2) {
@@ -250,6 +242,24 @@ bool GemmOpBuilder::IsOpSupportedImpl(const GraphViewer&,
       std::vector<int64_t> c_shape;
       if (!GetShape(*input_defs[c_idx], c_shape, logger))
         return false;
+    }
+  } else {
+    // MatMul/MatMulInteger: 1D inputs require reshape with concrete dim values.
+    if ((a_shape.size() == 1 && HasDynamicShape(a_shape)) ||
+        (b_shape.size() == 1 && HasDynamicShape(b_shape))) {
+      LOGS(logger, VERBOSE) << op_type << ": 1D input with dynamic dim is not supported";
+      return false;
+    }
+    // Also check output shape for 1D input reshape-back.
+    if (a_shape.size() == 1 || b_shape.size() == 1) {
+      std::vector<int64_t> output_shape;
+      if (!GetShape(*node.OutputDefs()[0], output_shape, logger)) {
+        return false;
+      }
+      if (HasDynamicShape(output_shape)) {
+        LOGS(logger, VERBOSE) << op_type << ": 1D input with dynamic output shape is not supported";
+        return false;
+      }
     }
   }
 
