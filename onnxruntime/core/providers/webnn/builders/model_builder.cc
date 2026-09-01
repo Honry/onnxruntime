@@ -263,26 +263,35 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
       return Status::OK();
   }
 
-  std::vector<int32_t> dims;
+  emscripten::val shape_array = emscripten::val::array();
   {  // input_output shape.
     const auto* shape_proto = node_arg.Shape();
     ORT_RETURN_IF(shape_proto == nullptr,
                   "shape_proto cannot be null for ", input_output_type, ": ", name);
     const auto& shape = shape_proto->dim();
-    if (!shape.empty()) {
-      dims.reserve(shape.size());
-      for (const auto& dim : shape) {
-        // dim_param free dimensions should have already been excluded by IsTensorShapeSupported().
-        assert(dim.has_dim_value());
-        dims.push_back(SafeInt<int32_t>(dim.dim_value()));
+    for (const auto& dim : shape) {
+      if (dim.has_dim_value()) {
+        // Static dimension: use the concrete value.
+        int32_t dim_value = SafeInt<int32_t>(dim.dim_value());
+        shape_array.call<void>("push", dim_value);
+      } else {
+        // Dynamic dimension: create an object with symbolic name for WebNN.
+        std::string dim_name = dim.dim_param();
+        if (dim_name.empty()) {
+          // ORT's shape inference may produce dynamic dims without a dim_param.
+          // Generate a synthetic name based on the tensor name and dimension index.
+          dim_name = name + "_dim_" + std::to_string(shape_array["length"].as<uint32_t>());
+        }
+
+        shape_array.call<void>("push", emscripten::val(dim_name));
       }
     }
   }
 
   emscripten::val desc = emscripten::val::object();
 
-  desc.set("dimensions", emscripten::val::array(dims));
-  desc.set("shape", emscripten::val::array(dims));
+  desc.set("dimensions", shape_array);
+  desc.set("shape", shape_array);
 
   int32_t data_type;
   {  // type
@@ -348,10 +357,15 @@ Status ModelBuilder::RegisterModelInputOutput(const NodeArg& node_arg, bool is_i
     output_names_.push_back(name);
   }
 
+  // Build shape vector for input_output_info.
   std::vector<int64_t> shape;
-  std::transform(dims.cbegin(), dims.cend(),
-                 std::back_inserter(shape),
-                 [](int32_t dim) -> int64_t { return SafeInt<int64_t>(dim); });
+  const auto* shape_proto = node_arg.Shape();
+  if (shape_proto) {
+    for (const auto& dim : shape_proto->dim()) {
+      // For dynamic dimensions, store kDynamicDim since actual shape is determined at runtime.
+      shape.push_back(dim.has_dim_value() ? dim.dim_value() : kDynamicDim);
+    }
+  }
   input_output_info_.emplace(name, OnnxTensorInfo{data_type, shape});
 
   return Status::OK();
@@ -369,7 +383,10 @@ Status ModelBuilder::AddOperations() {
   const auto& node_indices = graph_viewer_.GetNodesInTopologicalOrder();
   for (size_t i = 0; i < node_indices.size(); i++) {
     const auto* node(graph_viewer_.GetNode(node_indices[i]));
+
     if (const auto* op_builder = GetOpBuilder(*node)) {
+      LOGS(logger_, VERBOSE) << "AddOperations: processing node [" << node->Name()
+                             << "] type [" << node->OpType() << "] (" << i + 1 << "/" << node_indices.size() << ")";
       ORT_RETURN_IF_ERROR(op_builder->AddToModelBuilder(*this, *node, logger_));
     } else {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
@@ -390,6 +407,16 @@ Status ModelBuilder::RegisterModelOutputs() {
 
 Status ModelBuilder::Compile(std::unique_ptr<Model>& model) {
   ORT_RETURN_IF_ERROR(Initialize());
+
+  LOGS(logger_, INFO) << "[WebNN] Creating graph with " << input_names_.size() << " input(s) and "
+                      << output_names_.size() << " output(s).";
+  for (const auto& input_name : input_names_) {
+    LOGS(logger_, INFO) << "[WebNN] Graph input: " << input_name;
+  }
+  for (const auto& output_name : output_names_) {
+    LOGS(logger_, INFO) << "[WebNN] Graph output: " << output_name;
+  }
+
   emscripten::val named_operands = emscripten::val::object();
   for (auto& name : output_names_) {
     emscripten::val wnn_output = wnn_operands_.at(name);

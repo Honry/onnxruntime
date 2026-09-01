@@ -15,6 +15,10 @@ namespace onnxruntime {
 namespace webnn {
 
 class MultiHeadAttentionOpBuilder : public BaseOpBuilder {
+ public:
+  MultiHeadAttentionOpBuilder() : BaseOpBuilder(/*allow_empty_tensor_as_input*/ false,
+                                                /*allow_no_shape_inputs*/ true) {}
+
   // Add operator related.
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
@@ -74,38 +78,59 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
   int32_t input_query_type = 0;
   ORT_RETURN_IF_NOT(GetType(*input_defs[0], input_query_type, logger), "Could not get input data type.");
 
-  std::vector<int64_t> input_q_shape, input_k_shape, input_v_shape;
-  uint32_t batch_size, sequence_length, kv_sequence_length, hidden_size, head_size;
-  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_q_shape, logger), "Cannot get query shape");
-  const auto q_rank = input_q_shape.size();
+  uint32_t hidden_size, head_size;
+  const auto* q_shape_proto = input_defs[0]->Shape();
+  std::vector<int64_t> q_input_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], q_input_shape, logger), "Cannot get query shape");
+  const uint32_t q_rank = static_cast<uint32_t>(q_input_shape.size());
   if (q_rank == 3) {  // Query with shape (batch_size, sequence_length, hidden_size)
-    hidden_size = SafeInt<uint32_t>(input_q_shape[2]);
+    // Read hidden_size from a shape proto with a static last dim. The WebNN operand shape
+    // may contain dynamic dim descriptors (objects) after upstream reshapeDynamic, even for
+    // dims that were originally static, so .as<uint32_t>() would return 0.
+    // Try query proto first, then fall back to value proto (same hidden_size, validated in
+    // IsOpSupportedImpl).
+    hidden_size = 0;
+    if (q_shape_proto && q_shape_proto->dim_size() > 2 && q_shape_proto->dim(2).has_dim_value()) {
+      hidden_size = static_cast<uint32_t>(q_shape_proto->dim(2).dim_value());
+    } else if (input_defs.size() > 2 && input_defs[2]->Shape()) {
+      const auto* v_shape_proto = input_defs[2]->Shape();
+      if (v_shape_proto->dim_size() > 2 && v_shape_proto->dim(2).has_dim_value()) {
+        hidden_size = static_cast<uint32_t>(v_shape_proto->dim(2).dim_value());
+      }
+    }
+    ORT_RETURN_IF(hidden_size == 0,
+                  "MultiHeadAttention: cannot determine hidden_size from query or value shape protos.");
     head_size = hidden_size / num_heads;
     key_input = model_builder.GetOperand(input_defs[1]->Name());
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[1], input_k_shape, logger), "Cannot get key shape");
-    const auto k_rank = input_k_shape.size();
+
+    std::vector<int64_t> k_input_shape;
+    ORT_RETURN_IF_NOT(GetShape(*input_defs[1], k_input_shape, logger), "Cannot get key shape");
+    const uint32_t k_rank = static_cast<uint32_t>(k_input_shape.size());
 
     if (k_rank == 5) {  // packed KV with shape (batch_size, kv_sequence_length, num_heads, 2, head_size)
-      kv_sequence_length = SafeInt<uint32_t>(input_k_shape[1]);
       k_reshape_skip = false;
       v_reshape_skip = false;
       split_options.set("axis", 3);
       split_options.set("label", node.Name() + "_/MHA/key/split");
-      emscripten::val output_array =
-          model_builder.GetBuilder().call<emscripten::val>("split", key_input, 2, split_options);
+      emscripten::val output_array = emscripten::val::undefined();
+      if (HasDynamicShape(k_input_shape)) {
+        output_array = model_builder.GetBuilder().call<emscripten::val>("splitDynamic", key_input, 2, split_options);
+      } else {
+        output_array = model_builder.GetBuilder().call<emscripten::val>("split", key_input, 2, split_options);
+      }
       key_input = output_array[0];
       value_input = output_array[1];
     } else {
       if (k_rank == 3) {  // Key with shape (batch_size, kv_sequence_length, hidden_size)
-        kv_sequence_length = SafeInt<uint32_t>(input_k_shape[1]);
         k_reshape_skip = false;
       } else {  // past_key with shape (batch_size, num_heads, kv_sequence_length, head_size)
-        kv_sequence_length = SafeInt<uint32_t>(input_k_shape[2]);
         k_reshape_skip = true;
       }
       value_input = model_builder.GetOperand(input_defs[2]->Name());
-      ORT_RETURN_IF_NOT(GetShape(*input_defs[2], input_v_shape, logger), "Cannot get value shape");
-      const auto v_rank = input_v_shape.size();
+
+      std::vector<int64_t> v_input_shape;
+      ORT_RETURN_IF_NOT(GetShape(*input_defs[2], v_input_shape, logger), "Cannot get value shape");
+      const uint32_t v_rank = static_cast<uint32_t>(v_input_shape.size());
       if (v_rank == 3) {  // Value with shape (batch_size, kv_sequence_length, v_hidden_size)
         v_reshape_skip = false;
       } else {  // past_value with shape (batch_size, num_heads, kv_sequence_length, head_size)
@@ -113,15 +138,20 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
       }
     }
   } else {  // packed QKV with shape (batch_size, kv_sequence_length, num_heads, 3, head_size)
-    kv_sequence_length = SafeInt<uint32_t>(input_q_shape[2]);
-    head_size = SafeInt<uint32_t>(input_q_shape[4]);
+    ORT_RETURN_IF(q_input_shape.size() <= 4 || q_input_shape[4] <= 0,
+                  "MultiHeadAttention: packed QKV must have static head_size at dim 4");
+    head_size = static_cast<uint32_t>(q_input_shape[4]);
     hidden_size = num_heads * head_size;
     k_reshape_skip = false;
     v_reshape_skip = false;
     split_options.set("axis", 3);
     split_options.set("label", node.Name() + "_/MHA/query/split");
-    emscripten::val output_array =
-        model_builder.GetBuilder().call<emscripten::val>("split", query_input, 3, split_options);
+    emscripten::val output_array = emscripten::val::undefined();
+    if (HasDynamicShape(q_input_shape)) {
+      output_array = model_builder.GetBuilder().call<emscripten::val>("splitDynamic", query_input, 3, split_options);
+    } else {
+      output_array = model_builder.GetBuilder().call<emscripten::val>("split", query_input, 3, split_options);
+    }
     query_input = output_array[0];
     key_input = output_array[1];
     value_input = output_array[2];
@@ -132,19 +162,13 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
     attention_bias = model_builder.GetOperand(input_defs[5]->Name());
   }
 
-  batch_size = SafeInt<uint32_t>(input_q_shape[0]);
-  sequence_length = SafeInt<uint32_t>(input_q_shape[1]);
-
   const float scale_value = helper.Get("scale", 1 / sqrt(static_cast<float>(head_size)));
 
-  const std::vector<uint32_t> reshape_output_shape = {batch_size, sequence_length, hidden_size};
-  const std::vector<uint32_t> q_reshape_tensor_shape = {batch_size, sequence_length, num_heads, head_size};
-  const std::vector<uint32_t> reshape_tensor_shape = {batch_size, kv_sequence_length, num_heads, head_size};
-
   // query_input -> reshape(B,S,N,H) -> transpose(B,N,S,H) -> new_query
-  common_options.set("label", node.Name() + "_/MHA/query/reshape");
-  emscripten::val reshaped_query = model_builder.GetBuilder().call<emscripten::val>(
-      "reshape", query_input, emscripten::val::array(q_reshape_tensor_shape), common_options);
+  emscripten::val reshaped_query = shape_utils::Reshape(
+      model_builder, query_input, q_input_shape,
+      {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
+      node.Name() + "_/MHA/query/reshape");
 
   transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
   transpose_options.set("label", node.Name() + "_/MHA/query/transpose");
@@ -153,9 +177,12 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
 
   emscripten::val present_key, present_value;
   if (!k_reshape_skip) {
-    common_options.set("label", node.Name() + "_/MHA/key/reshape_1");
-    present_key = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", key_input, emscripten::val::array(reshape_tensor_shape), common_options);
+    std::vector<int64_t> key_shape;
+    ORT_RETURN_IF_NOT(GetShape(*input_defs[1], key_shape, logger), "Cannot get key shape");
+    present_key = shape_utils::Reshape(
+        model_builder, key_input, key_shape,
+        {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
+        node.Name() + "_/MHA/key/reshape_1");
 
     transpose_options.set("label", node.Name() + "_/MHA/key/transpose");
     present_key = model_builder.GetBuilder().call<emscripten::val>("transpose", present_key, transpose_options);
@@ -178,9 +205,12 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
       model_builder.GetBuilder().call<emscripten::val>("transpose", present_key, transpose_options);
 
   if (!v_reshape_skip) {
-    common_options.set("label", node.Name() + "_/MHA/value/reshape_1");
-    present_value = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", value_input, emscripten::val::array(reshape_tensor_shape), common_options);
+    std::vector<int64_t> v_input_shape_for_reshape;
+    ORT_RETURN_IF_NOT(GetShape(*input_defs[2], v_input_shape_for_reshape, logger), "Cannot get value shape");
+    present_value = shape_utils::Reshape(
+        model_builder, value_input, v_input_shape_for_reshape,
+        {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
+        node.Name() + "_/MHA/value/reshape_1");
 
     transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
     transpose_options.set("label", node.Name() + "_/MHA/value/transpose");
@@ -202,8 +232,13 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
   emscripten::val scale_constant =
       model_builder.CreateOrGetConstant<float>(input_query_type, scale_value, {1});
 
+  // Output reshape target: [B, S, hidden_size] applied after transpose to [B, S, N, H].
+  // Pass target_dims to ScaledDotProductAttention which builds ComputeShape on transposed output.
+  std::vector<int64_t> reshape_output_target{0, 0, static_cast<int64_t>(hidden_size)};
+
   emscripten::val output = ScaledDotProductAttention(model_builder, node, logger, new_query, new_key, present_value,
-                                                     scale_constant, attention_bias, reshape_output_shape);
+                                                     scale_constant, attention_bias, reshape_output_target,
+                                                     HasDynamicShape(q_input_shape));
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
 
   if (TensorExists(node.OutputDefs(), 1)) {
@@ -232,7 +267,21 @@ bool MultiHeadAttentionOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_vie
 
   std::vector<int64_t> input_shape;
   if (!GetShape(*input_defs[0], input_shape, logger)) {
-    LOGS(logger, VERBOSE) << "Cannot get input shape.";
+    // Query has no shape proto. Try to derive structural info from value input.
+    if (input_defs.size() > 2 && input_defs[2]->Shape()) {
+      std::vector<int64_t> v_shape;
+      if (GetShape(*input_defs[2], v_shape, logger) && v_shape.size() == 3) {
+        // Value has 3D shape [B, S, hidden_size]. Validate hidden_size is divisible by num_heads.
+        int64_t hidden_size = v_shape[2];
+        if (hidden_size > 0 && hidden_size % num_heads != 0) {
+          LOGS(logger, VERBOSE) << "hidden_size (" << hidden_size
+                                << ") is not divisible by num_heads (" << num_heads << ").";
+          return false;
+        }
+        return true;
+      }
+    }
+    LOGS(logger, VERBOSE) << "Cannot get query input shape and cannot infer from other inputs.";
     return false;
   }
 
