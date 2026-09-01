@@ -9,6 +9,7 @@
 #include "core/providers/webnn/builders/op_builder_factory.h"
 
 #include "base_op_builder.h"
+#include "shape_utils.h"
 
 namespace onnxruntime {
 namespace webnn {
@@ -73,27 +74,28 @@ Status GroupNormOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   // normalization_op_builder).
   const size_t rank = input_shape.size();
   const size_t channel_axis = channels_last ? rank - 1 : 1;  // NHWC: last; NCHW: 1.
-  const uint32_t batch = SafeInt<uint32_t>(input_shape[0]);
+  // The channel dim is guaranteed static by IsOpSupportedImpl; batch and spatial dims may be dynamic.
   const uint32_t channels = SafeInt<uint32_t>(input_shape[channel_axis]);
   const uint32_t group_count = SafeInt<uint32_t>(groups);
-
-  // merged_count = (C / G) * product(spatial dims). Spatial = every dim except batch and channel.
-  uint32_t spatial_count = 1;
-  for (size_t i = 1; i < rank; ++i) {
-    if (i != channel_axis) {
-      spatial_count *= SafeInt<uint32_t>(input_shape[i]);
-    }
-  }
-  const uint32_t merged_count = (channels / group_count) * spatial_count;
+  const bool is_dynamic = HasDynamicShape(input_shape);
 
   // NCHW shape the normalization runs on (channel at index 1). We reshape/affine/reshape in this
   // layout, then transpose back for channels_last. Spatial dims keep their original order.
-  std::vector<uint32_t> nchw_shape{batch, channels};
-  nchw_shape.reserve(rank);
-  for (size_t i = 1; i < rank; ++i) {
-    if (i != channel_axis) {
-      nchw_shape.push_back(SafeInt<uint32_t>(input_shape[i]));
+  // Only resolved for static input; the dynamic path derives it at runtime.
+  std::vector<uint32_t> nchw_shape;
+  uint32_t merged_count = 0;
+  if (!is_dynamic) {
+    // merged_count = (C / G) * product(spatial dims). Spatial = every dim except batch and channel.
+    uint32_t spatial_count = 1;
+    nchw_shape = {SafeInt<uint32_t>(input_shape[0]), channels};
+    nchw_shape.reserve(rank);
+    for (size_t i = 1; i < rank; ++i) {
+      if (i != channel_axis) {
+        spatial_count *= SafeInt<uint32_t>(input_shape[i]);
+        nchw_shape.push_back(SafeInt<uint32_t>(input_shape[i]));
+      }
     }
+    merged_count = (channels / group_count) * spatial_count;
   }
 
   // Per-channel affine parameters broadcast as [1, C, 1, ..., 1] over the NCHW tensor.
@@ -113,12 +115,22 @@ Status GroupNormOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
     ORT_RETURN_IF_NOT(GetShape(*input_defs[3], skip_shape, logger), "Cannot get skip shape");
     // Skip may be (N, C); reshape it to broadcast over the spatial dims in the input's layout.
     if (skip_shape.size() == 2) {
-      std::vector<uint32_t> skip_broadcast_shape(rank, 1);
-      skip_broadcast_shape[0] = batch;
-      skip_broadcast_shape[channel_axis] = channels;
       common_options.set("label", node.Name() + "_reshape_skip");
-      skip = wnn_builder.call<emscripten::val>("reshape", skip, emscripten::val::array(skip_broadcast_shape),
-                                               common_options);
+      if (HasDynamicShape(skip_shape)) {
+        // [N, 1, ..., C, ..., 1] with N copied from skip at runtime.
+        std::vector<int64_t> skip_target_dims(rank, 1);
+        skip_target_dims[0] = 0;
+        skip_target_dims[channel_axis] = channels;
+        emscripten::val skip_shape_operand = shape_utils::ComputeShape(
+            model_builder, skip, skip_target_dims, node.Name() + "_reshape_skip");
+        skip = wnn_builder.call<emscripten::val>("reshapeDynamic", skip, skip_shape_operand, common_options);
+      } else {
+        std::vector<uint32_t> skip_broadcast_shape(rank, 1);
+        skip_broadcast_shape[0] = SafeInt<uint32_t>(skip_shape[0]);
+        skip_broadcast_shape[channel_axis] = channels;
+        skip = wnn_builder.call<emscripten::val>("reshape", skip, emscripten::val::array(skip_broadcast_shape),
+                                                 common_options);
+      }
     }
     common_options.set("label", node.Name() + "_add_skip");
     input = wnn_builder.call<emscripten::val>("add", input, skip, common_options);
@@ -158,10 +170,17 @@ Status GroupNormOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   }
 
   // Reshape to [N, G, (C/G)*spatial, 1] (4D MVN variant with trailing unit dimension).
-  std::vector<uint32_t> pre_mvn_shape{batch, group_count, merged_count, 1};
   common_options.set("label", node.Name() + "_reshape_pre_mvn");
-  emscripten::val grouped = wnn_builder.call<emscripten::val>(
-      "reshape", input, emscripten::val::array(pre_mvn_shape), common_options);
+  emscripten::val grouped = emscripten::val::undefined();
+  if (is_dynamic) {
+    emscripten::val pre_mvn_shape = shape_utils::ComputeShape(
+        model_builder, input, {0, static_cast<int64_t>(group_count), -1, 1}, node.Name() + "_reshape_pre_mvn");
+    grouped = wnn_builder.call<emscripten::val>("reshapeDynamic", input, pre_mvn_shape, common_options);
+  } else {
+    std::vector<uint32_t> pre_mvn_shape{nchw_shape[0], group_count, merged_count, 1};
+    grouped = wnn_builder.call<emscripten::val>(
+        "reshape", input, emscripten::val::array(pre_mvn_shape), common_options);
+  }
 
   // instanceNormalization normalizes over spatial dims {2,3} per group — MVN with no scale/bias.
   // Do NOT set scale/bias: a spurious mul/add would break a backend's optional instance-scale match.
@@ -172,9 +191,17 @@ Status GroupNormOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
       wnn_builder.call<emscripten::val>("instanceNormalization", grouped, inorm_options);
 
   // Reshape back to the NCHW input shape (must equal the re-fusion input shape).
-  common_options.set("label", node.Name() + "_reshape_post_mvn");
-  emscripten::val restored = wnn_builder.call<emscripten::val>(
-      "reshape", normalized, emscripten::val::array(nchw_shape), common_options);
+  emscripten::val restored = emscripten::val::undefined();
+  if (is_dynamic) {
+    common_options.set("label", node.Name() + "_reshape_post_mvn_shape");
+    emscripten::val nchw_shape_operand = wnn_builder.call<emscripten::val>("shape", input, common_options);
+    common_options.set("label", node.Name() + "_reshape_post_mvn");
+    restored = wnn_builder.call<emscripten::val>("reshapeDynamic", normalized, nchw_shape_operand, common_options);
+  } else {
+    common_options.set("label", node.Name() + "_reshape_post_mvn");
+    restored = wnn_builder.call<emscripten::val>(
+        "reshape", normalized, emscripten::val::array(nchw_shape), common_options);
+  }
 
   // Reshape a per-channel (C) or per-group (num_groups) affine parameter to [1, C, 1, ..., 1] so it
   // broadcasts over the NCHW tensor. Per-group params (ai.onnx GroupNormalization opset 18) are
@@ -276,6 +303,12 @@ bool GroupNormOpBuilder::IsOpSupportedImpl(const GraphViewer&,
 
   const bool channels_last = is_contrib && helper.Get("channels_last", static_cast<int64_t>(1)) != 0;
   const int64_t channels = channels_last ? input_shape.back() : input_shape[1];
+  // The channel dim sizes the group split and the per-channel affine parameters, so it must be static.
+  // Batch and spatial dims may be dynamic.
+  if (channels == kDynamicDim) {
+    LOGS(logger, VERBOSE) << op_type << " requires a static channel dimension.";
+    return false;
+  }
   const int64_t groups = helper.Get(is_contrib ? "groups" : "num_groups", static_cast<int64_t>(0));
   if (groups <= 0 || channels % groups != 0) {
     LOGS(logger, VERBOSE) << op_type << " requires groups > 0 and channels divisible by groups.";

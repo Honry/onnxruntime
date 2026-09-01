@@ -71,28 +71,38 @@ Status PoolOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   options.set("dilations", emscripten::val::array(dilations));
 
   // Add Padding.
-  // Usually using auto padding is more efficient than using explicit padding.
-  // Try to see if we can map explicit padding to auto padding.
   const auto onnx_strides = helper.Get("strides", std::vector<int64_t>{1, 1});
   const auto onnx_pads = helper.Get("pads", std::vector<int64_t>{0, 0, 0, 0});
   auto pads = helper.Get("pads", std::vector<uint32_t>{0, 0, 0, 0});
   std::vector<int64_t> input_shape;
   ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_shape, logger), "Cannot get shape");
   AutoPadType auto_pad_type = StringToAutoPadType(helper.Get("auto_pad", "NOTSET"));
+  bool needs_dynamic_padding = false;
   if (AutoPadType::SAME_UPPER == auto_pad_type || AutoPadType::SAME_LOWER == auto_pad_type) {
-    std::vector<int64_t> pads_out;
-    ORT_RETURN_IF_ERROR(HandleAutoPad(input_shape, onnx_kernel_shape[0], onnx_kernel_shape[1],
-                                      onnx_pads,
-                                      helper.Get("strides", std::vector<int64_t>{1, 1}),
-                                      helper.Get("dilations", std::vector<int64_t>{1, 1}),
-                                      auto_pad_type,
-                                      pads_out));
-    pads = GetNarrowedIntFromInt64<uint32_t>(pads_out);
+    if (HasDynamicShape(input_shape)) {
+      // WebNN pool2d doesn't have autoPad. Compute padding dynamically and apply pad op.
+      input = ComputeDynamicSamePadding(
+          model_builder, input, input_shape,
+          onnx_kernel_shape[0], onnx_kernel_shape[1],
+          onnx_strides, auto_pad_type, node.Name());
+      needs_dynamic_padding = true;
+    } else {
+      std::vector<int64_t> pads_out;
+      ORT_RETURN_IF_ERROR(HandleAutoPad(input_shape, onnx_kernel_shape[0], onnx_kernel_shape[1],
+                                        onnx_pads,
+                                        helper.Get("strides", std::vector<int64_t>{1, 1}),
+                                        helper.Get("dilations", std::vector<int64_t>{1, 1}),
+                                        auto_pad_type,
+                                        pads_out));
+      pads = GetNarrowedIntFromInt64<uint32_t>(pads_out);
+    }
   }
   // Permute the ONNX's pads, which is [beginning_height, beginning_width, ending_height, ending_width],
   // while WebNN's padding is [beginning_height, ending_height, beginning_width, ending_width].
-  const std::vector<uint32_t> padding{pads[0], pads[2], pads[1], pads[3]};
-  options.set("padding", emscripten::val::array(padding));
+  if (!needs_dynamic_padding) {
+    const std::vector<uint32_t> padding{pads[0], pads[2], pads[1], pads[3]};
+    options.set("padding", emscripten::val::array(padding));
+  }
 
   const auto ceil_mode = helper.Get("ceil_mode", 0);
   emscripten::val output_shape_rounding = ceil_mode == 0 ? emscripten::val("floor") : emscripten::val("ceil");
@@ -109,8 +119,18 @@ Status PoolOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
 
     emscripten::val pad_options = emscripten::val::object();
     pad_options.set("label", node.Name() + "_pad");
-    input = model_builder.GetBuilder().call<emscripten::val>("pad", input, emscripten::val::array(beginning_padding),
-                                                             emscripten::val::array(ending_padding), pad_options);
+    if (HasDynamicShape(input_shape)) {
+      const emscripten::val& begin_op = model_builder.CreateOrGetConstant<uint32_t>(
+          ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_pad_begin",
+          beginning_padding, {static_cast<uint32_t>(beginning_padding.size())});
+      const emscripten::val& end_op = model_builder.CreateOrGetConstant<uint32_t>(
+          ONNX_NAMESPACE::TensorProto_DataType_UINT32, node.Name() + "_pad_end",
+          ending_padding, {static_cast<uint32_t>(ending_padding.size())});
+      input = model_builder.GetBuilder().call<emscripten::val>("padDynamic", input, begin_op, end_op, pad_options);
+    } else {
+      input = model_builder.GetBuilder().call<emscripten::val>("pad", input, emscripten::val::array(beginning_padding),
+                                                               emscripten::val::array(ending_padding), pad_options);
+    }
   }
 
   emscripten::val output = model_builder.GetBuilder().call<emscripten::val>(webnn_op_name.c_str(), input, options);
