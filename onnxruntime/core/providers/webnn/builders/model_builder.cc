@@ -383,7 +383,10 @@ Status ModelBuilder::AddOperations() {
   const auto& node_indices = graph_viewer_.GetNodesInTopologicalOrder();
   for (size_t i = 0; i < node_indices.size(); i++) {
     const auto* node(graph_viewer_.GetNode(node_indices[i]));
+
     if (const auto* op_builder = GetOpBuilder(*node)) {
+      LOGS(logger_, VERBOSE) << "AddOperations: processing node [" << node->Name()
+                             << "] type [" << node->OpType() << "] (" << i + 1 << "/" << node_indices.size() << ")";
       ORT_RETURN_IF_ERROR(op_builder->AddToModelBuilder(*this, *node, logger_));
     } else {
       return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
@@ -404,6 +407,16 @@ Status ModelBuilder::RegisterModelOutputs() {
 
 Status ModelBuilder::Compile(std::unique_ptr<Model>& model) {
   ORT_RETURN_IF_ERROR(Initialize());
+
+  LOGS(logger_, INFO) << "[WebNN] Creating graph with " << input_names_.size() << " input(s) and "
+                      << output_names_.size() << " output(s).";
+  for (const auto& input_name : input_names_) {
+    LOGS(logger_, INFO) << "[WebNN] Graph input: " << input_name;
+  }
+  for (const auto& output_name : output_names_) {
+    LOGS(logger_, INFO) << "[WebNN] Graph output: " << output_name;
+  }
+
   emscripten::val named_operands = emscripten::val::object();
   for (auto& name : output_names_) {
     emscripten::val wnn_output = wnn_operands_.at(name);
