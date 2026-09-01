@@ -19,7 +19,8 @@ class Model;
 
 class WebNNExecutionProvider : public IExecutionProvider {
  public:
-  explicit WebNNExecutionProvider(const std::string& webnn_device_flags);
+  explicit WebNNExecutionProvider(const std::string& webnn_device_flags,
+                                  bool enable_causal_lm);
   virtual ~WebNNExecutionProvider();
 
   std::vector<std::unique_ptr<ComputeCapability>>
@@ -51,6 +52,8 @@ class WebNNExecutionProvider : public IExecutionProvider {
   emscripten::val wnn_limits_ = emscripten::val::undefined();
 
   webnn::WebnnDeviceType wnn_device_type_;
+  // Controls GQA KV-cache strategy: true = concat (stateful), false = ScatterND (stateless).
+  bool enable_causal_lm_;
   InlinedHashMap<std::string, std::unique_ptr<onnxruntime::webnn::Model>> models_;
   ModelMetadefIdGenerator metadef_id_generator_;
 };
