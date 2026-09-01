@@ -88,26 +88,28 @@ Status QDQOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder,
   // For per-axis quantization/dequantization, the scale is 1-D.
   // WebNN requires the scale and zero_point tensors to have the same rank as the input tensor.
   // We need to reshape them to make them broadcastable with the input tensor.
-  if (scale_shape.size() == 1 && input_rank > 1 && block_size == 0) {
-    // Insert ones before and after the axis dimension for broadcasting of scale tensor.
-    std::vector<uint32_t> target_shape{SafeInt<uint32_t>(input_shape[axis])};
-    target_shape.insert(target_shape.begin(), axis, 1);
-    target_shape.insert(target_shape.end(), input_rank - axis - 1, 1);
-    // zero_point has the same shape as the scale tensor.
-    zero_point_shape = target_shape;
-    common_options.set("label", node.Name() + "_reshape_scale");
-    scale = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                             scale,
-                                                             emscripten::val::array(target_shape),
-                                                             common_options);
+  if (scale_shape.size() == 1 && input_rank > 1 &&
+      block_size == 0) {
+    // Insert ones before and after the axis dimension for broadcasting.
+    zero_point_shape.resize(input_rank, 1);
+    if (input_shape[axis] > 0) {
+      zero_point_shape[axis] = SafeInt<uint32_t>(input_shape[axis]);
+    }
 
+    // Scale/zero_point are always static (constants). Use reshape with concrete values.
+    std::vector<uint32_t> target_shape(input_rank, 1);
+    if (input_shape[axis] > 0) {
+      target_shape[axis] = SafeInt<uint32_t>(input_shape[axis]);
+    } else {
+      target_shape[axis] = SafeInt<uint32_t>(scale_shape[0]);
+    }
+    common_options.set("label", node.Name() + "_reshape_scale");
+    scale = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", scale, emscripten::val::array(target_shape), common_options);
     if (has_zero_point) {
-      // Reshape the zero_point tensor too.
       common_options.set("label", node.Name() + "_reshape_zero_point");
-      zero_point = model_builder.GetBuilder().call<emscripten::val>("reshape",
-                                                                    zero_point,
-                                                                    emscripten::val::array(target_shape),
-                                                                    common_options);
+      zero_point = model_builder.GetBuilder().call<emscripten::val>(
+          "reshape", zero_point, emscripten::val::array(target_shape), common_options);
     }
   }
 
