@@ -11,7 +11,10 @@
 #include "core/framework/execution_provider.h"
 #include "core/providers/webnn/builders/helper.h"
 
+#include <cstdio>
+#include <limits>
 #include <sstream>
+#include <type_traits>
 #include <emscripten.h>
 #include <emscripten/val.h>
 
@@ -123,6 +126,19 @@ class ModelBuilder {
   static const IOpBuilder* GetOpBuilder(const Node& node);
 };
 
+// Exact text of a scalar, used in constant cache keys. std::to_string(float) keeps only 6 decimals, so values such as
+// 1e-9 and 0 would share a key.
+template <typename T>
+std::string ConstantValueKey(T value) {
+  if constexpr (std::is_floating_point_v<T>) {
+    char buffer[40];
+    std::snprintf(buffer, sizeof(buffer), "%.*g", std::numeric_limits<T>::max_digits10, value);
+    return buffer;
+  } else {
+    return std::to_string(value);
+  }
+}
+
 // Create or retrieve one of the following:
 // - A WebNN constant MLOperand filled with the specified value, data type, and shape.
 // - A WebNN scalar constant MLOperand with the specified value and data type.
@@ -145,7 +161,7 @@ class ModelBuilder {
 template <typename T>
 const emscripten::val& ModelBuilder::CreateOrGetConstant(const int32_t& data_type, T value,
                                                          const std::vector<uint32_t>& shape) {
-  std::string name = "webnn_constant_" + std::to_string(data_type) + "_" + std::to_string(value);
+  std::string name = "webnn_constant_" + std::to_string(data_type) + "_" + ConstantValueKey(value);
   emscripten::val dims = emscripten::val::array();
   if (!shape.empty()) {
     dims = emscripten::val::array(shape);
