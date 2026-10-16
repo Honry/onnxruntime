@@ -55,6 +55,13 @@ present_key<--\-----Concat              |  past_value
                            output
 */
 
+// The splits of splitDynamic is an operand: `count` chunks of size 1, which separates the packed dim of the QKV or KV.
+static emscripten::val SplitSizesOfOnes(ModelBuilder& model_builder, uint32_t count) {
+  return model_builder.CreateOrGetConstant<uint32_t>(
+      ONNX_NAMESPACE::TensorProto_DataType_UINT32, "webnn_MHA_split_sizes_of_ones_" + std::to_string(count),
+      std::vector<uint32_t>(count, 1), {count});
+}
+
 Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                                           const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
@@ -65,6 +72,9 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
 
   bool k_reshape_skip, v_reshape_skip;
   emscripten::val query_input, key_input, value_input;
+  // Input shapes of the key/value reshapes below. They are not the shapes of inputs 1 and 2 when the key/value come
+  // from a packed input, in which case those inputs are absent.
+  std::vector<int64_t> key_reshape_shape, value_reshape_shape;
 
   NodeAttrHelper helper(node);
   const uint32_t num_heads = helper.Get("num_heads", 0);
@@ -106,11 +116,15 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
     if (k_rank == 5) {  // packed KV with shape (batch_size, kv_sequence_length, num_heads, 2, head_size)
       k_reshape_skip = false;
       v_reshape_skip = false;
+      // The split leaves a dim of 1 at axis 3.
+      key_reshape_shape = {k_input_shape[0], k_input_shape[1], k_input_shape[2], 1, k_input_shape[4]};
+      value_reshape_shape = key_reshape_shape;
       split_options.set("axis", 3);
       split_options.set("label", node.Name() + "_/MHA/key/split");
       emscripten::val output_array = emscripten::val::undefined();
       if (HasDynamicShape(k_input_shape)) {
-        output_array = model_builder.GetBuilder().call<emscripten::val>("splitDynamic", key_input, 2, split_options);
+        output_array = model_builder.GetBuilder().call<emscripten::val>(
+            "splitDynamic", key_input, SplitSizesOfOnes(model_builder, 2), split_options);
       } else {
         output_array = model_builder.GetBuilder().call<emscripten::val>("split", key_input, 2, split_options);
       }
@@ -119,6 +133,7 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
     } else {
       if (k_rank == 3) {  // Key with shape (batch_size, kv_sequence_length, hidden_size)
         k_reshape_skip = false;
+        key_reshape_shape = k_input_shape;
       } else {  // past_key with shape (batch_size, num_heads, kv_sequence_length, head_size)
         k_reshape_skip = true;
       }
@@ -129,6 +144,7 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
       const uint32_t v_rank = static_cast<uint32_t>(v_input_shape.size());
       if (v_rank == 3) {  // Value with shape (batch_size, kv_sequence_length, v_hidden_size)
         v_reshape_skip = false;
+        value_reshape_shape = v_input_shape;
       } else {  // past_value with shape (batch_size, num_heads, kv_sequence_length, head_size)
         v_reshape_skip = true;
       }
@@ -140,11 +156,15 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
     hidden_size = num_heads * head_size;
     k_reshape_skip = false;
     v_reshape_skip = false;
+    // The split leaves a dim of 1 at axis 3.
+    key_reshape_shape = {q_input_shape[0], q_input_shape[1], q_input_shape[2], 1, q_input_shape[4]};
+    value_reshape_shape = key_reshape_shape;
     split_options.set("axis", 3);
     split_options.set("label", node.Name() + "_/MHA/query/split");
     emscripten::val output_array = emscripten::val::undefined();
     if (HasDynamicShape(q_input_shape)) {
-      output_array = model_builder.GetBuilder().call<emscripten::val>("splitDynamic", query_input, 3, split_options);
+      output_array = model_builder.GetBuilder().call<emscripten::val>(
+          "splitDynamic", query_input, SplitSizesOfOnes(model_builder, 3), split_options);
     } else {
       output_array = model_builder.GetBuilder().call<emscripten::val>("split", query_input, 3, split_options);
     }
@@ -173,10 +193,8 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
 
   emscripten::val present_key, present_value;
   if (!k_reshape_skip) {
-    std::vector<int64_t> key_shape;
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[1], key_shape, logger), "Cannot get key shape");
     present_key = shape_utils::Reshape(
-        model_builder, key_input, key_shape,
+        model_builder, key_input, key_reshape_shape,
         {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
         node.Name() + "_/MHA/key/reshape_1");
 
@@ -201,10 +219,8 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
       model_builder.GetBuilder().call<emscripten::val>("transpose", present_key, transpose_options);
 
   if (!v_reshape_skip) {
-    std::vector<int64_t> v_input_shape_for_reshape;
-    ORT_RETURN_IF_NOT(GetShape(*input_defs[2], v_input_shape_for_reshape, logger), "Cannot get value shape");
     present_value = shape_utils::Reshape(
-        model_builder, value_input, v_input_shape_for_reshape,
+        model_builder, value_input, value_reshape_shape,
         {0, 0, static_cast<int64_t>(num_heads), static_cast<int64_t>(head_size)},
         node.Name() + "_/MHA/value/reshape_1");
 
@@ -232,9 +248,17 @@ Status MultiHeadAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_bu
   // Pass target_dims to ScaledDotProductAttention which builds ComputeShape on transposed output.
   std::vector<int64_t> reshape_output_target{0, 0, static_cast<int64_t>(hidden_size)};
 
+  // With a static query, B and S are known and the output is reshaped with concrete dims.
+  std::vector<uint32_t> static_output_shape;
+  if (!HasDynamicShape(q_input_shape)) {
+    const uint32_t batch_size = SafeInt<uint32_t>(q_input_shape[0]);
+    const uint32_t sequence_length = SafeInt<uint32_t>(q_input_shape[1]);
+    static_output_shape = {batch_size, sequence_length, hidden_size};
+  }
+
   emscripten::val output = ScaledDotProductAttention(model_builder, node, logger, new_query, new_key, present_value,
                                                      scale_constant, attention_bias, reshape_output_target,
-                                                     HasDynamicShape(q_input_shape));
+                                                     static_output_shape.empty() ? nullptr : &static_output_shape);
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
 
   if (TensorExists(node.OutputDefs(), 1)) {

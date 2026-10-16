@@ -56,7 +56,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | GreaterOrEqual | ai.onnx(12-15, 16+) | greaterOrEqual | |
 | GroupNorm | com.microsoft(1+) | add, instanceNormalization, mul, reshape, sigmoid, transpose | |
 | GroupNormalization | ai.onnx(18-20, 21+) | add, expand, instanceNormalization, mul, reshape | |
-| GroupQueryAttention | com.microsoft(1+) | add, cast, concat, constant, cumulativeSum, div, expand, lesser, matmul, reshape, scatterND, softmax, transpose, where | Only supports input total_sequence_length is constant and past_sequence_length of past kv equals to present_sequence_length of present kv. |
+| GroupQueryAttention | com.microsoft(1+) | add, cast, concat, cumulativeSum, div, equal, expand, expandDynamic, gather, lesser, matmul, mul, range, reshape, reshapeDynamic, scatterND, shape, softmax, squeeze, sub, transpose, unsqueeze, where | Static shapes only support input total_sequence_length is constant and past_sequence_length of past kv equals to present_sequence_length of present kv. |
 | GRU | ai.onnx(7-13, 14-21, 22+) | gru | Only supports 'layout' == 0. 'clip' is not supported. The activation functions in 'activations' must be one of 'Relu', 'Tanh', 'Sigmoid'. Forward and backward activations must be the same if bidirectional. 'sequence_lens' if present should be constant with values equal to the first dimension length of input 'X' |
 | HardSigmoid | ai.onnx(7+) | hardSigmoid | |
 | HardSwish | ai.onnx(14+) | hardSwish | |
@@ -81,7 +81,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Min | ai.onnx(7, 8-11, 12, 13+) | min | |
 | Mod | ai.onnx(10-12, 13+) | mod | Only supports fmod=0 |
 | Mul | ai.onnx(7-12, 13, 14+) | mul | |
-| MultiHeadAttention | com.microsoft(1+) | add, cast, concat, constant, div, matmul, reshape, softmax, transpose | Does not support inputs bias, key_padding_mask, past_sequence_length, or cache_indirection. Does not support output qk |
+| MultiHeadAttention | com.microsoft(1+) | add, cast, concat, div, matmul, reshape, reshapeDynamic, softmax, split, splitDynamic, transpose | Does not support inputs bias, key_padding_mask, past_sequence_length, or cache_indirection. Does not support output qk |
 | Neg | ai.onnx(7-12, 13+) | neg | |
 | Not | ai.onnx(7+) | logicalNot | |
 | Or | ai.onnx(7+) | logicalOr | |
@@ -105,7 +105,7 @@ platforms. Check the [WebNN status](https://webmachinelearning.github.io/webnn-s
 | Relu | ai.onnx(7-12, 13, 14+) | relu | |
 | Reshape | ai.onnx(7-12, 13, 14-18, 19-20, 21+) | reshape, reshapeDynamic | allowzero=1 is not supported |
 | Resize | ai.onnx(11-12, 13-17, 18, 19+) | resample2d, resample2dDynamic | Only supports 4-D input, antialias == 0, exclude_outside == 0, keep_aspect_ratio_policy == 'stretch', 'linear' and 'nearest' modes, input 'scales' if present must be a constant |
-| RotaryEmbedding | ai.onnx(23+), com.microsoft(1+) | add, concat, gather, mul, reshape, slice, split | |
+| RotaryEmbedding | ai.onnx(23+), com.microsoft(1+) | add, concat, gather, mul, range, reshape, reshapeDynamic, shape, slice, split, squeeze, unsqueeze | |
 | ScatterElements | ai.onnx(11-12, 13-15, 16-17, 18+) | scatterElements | Only supports 'reduction' == 'none' |
 | ScatterND | ai.onnx(11-12, 13-15, 16-17, 18+) | scatterND | Only supports 'reduction' == 'none' |
 | Shape | ai.onnx(7-12, 13-14, 15-18, 19-20, 21+) | shape, slice | |

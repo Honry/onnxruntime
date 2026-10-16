@@ -188,9 +188,19 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
   // RotaryEmbedding nodes over the same sequence share one [0..S-1] range.
   const std::string seq_range_key = GetDimIdentity(*input_defs[0], input_is_4d ? 2 : 1);
 
-  // Fully static shapes use static ops, otherwise dynamic ops.
-  const bool has_dynamic_input =
-      HasDynamicShape(input_shape) || HasDynamicShape(cos_cache_shape) || HasDynamicShape(position_ids_shape);
+  // Fully static shapes use static ops with concrete dims, otherwise dynamic ops.
+  RotaryStaticDims static_dims_storage{};
+  const RotaryStaticDims* static_dims = nullptr;
+  if (!HasDynamicShape(input_shape) && !HasDynamicShape(cos_cache_shape) && !HasDynamicShape(position_ids_shape)) {
+    static_dims_storage.batch_size = SafeInt<uint32_t>(input_shape[0]);
+    static_dims_storage.sequence_length = SafeInt<uint32_t>(input_is_4d ? input_shape[2] : input_shape[1]);
+    static_dims_storage.max_sequence_length = SafeInt<uint32_t>(cos_cache_shape[0]);
+    static_dims_storage.position_ids_batch = 1;
+    if (position_ids_shape.size() == 2) {
+      static_dims_storage.position_ids_batch = SafeInt<uint32_t>(position_ids_shape[0]);
+    }
+    static_dims = &static_dims_storage;
+  }
 
   emscripten::val output;
   ORT_RETURN_IF_ERROR(ApplyRotaryEmbedding(
@@ -208,7 +218,7 @@ Status RotaryEmbeddingOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_build
       has_position_ids,
       position_ids_is_offset,
       input_is_4d,  // output_bnsh: 4D input is BNSH, output stays BNSH; 3D needs BSNH for reshape
-      has_dynamic_input,
+      static_dims,
       output,
       seq_range_key));
 

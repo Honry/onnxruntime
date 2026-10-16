@@ -61,6 +61,55 @@ static emscripten::val GroupBroadcast(ModelBuilder& model_builder,
   return wnn_builder.call<emscripten::val>("reshapeDynamic", expanded, reshape_shape, reshape_options);
 }
 
+// Build the number of tokens already in the KV cache, i.e. the offset of the new tokens (int32).
+// Same as the CPU EP:
+//   - No past KV cache, or first prompt (sequence_length == total_sequence_length): 0. seqlens_k is not used, so a
+//     right-padded prompt (seqlens_k + 1 < sequence_length) still starts at 0 instead of a negative offset.
+//   - Otherwise: seqlens_k + 1 - sequence_length.
+// Returns [B].
+static emscripten::val BuildPastSequenceLengths(ModelBuilder& model_builder,
+                                                const emscripten::val& query_input,
+                                                const emscripten::val& seqlens_k,
+                                                const emscripten::val& total_sequence_length,
+                                                bool has_past,
+                                                const std::string& label) {
+  emscripten::val wnn_builder = model_builder.GetBuilder();
+  emscripten::val zero = model_builder.CreateOrGetConstant<int32_t>(
+      ONNX_NAMESPACE::TensorProto_DataType_INT32, static_cast<int32_t>(0), {1});
+  if (!has_past) {
+    // Always 0, but keep the dependency on seqlens_k. dispatch() rejects an input that is not part of the graph,
+    // and the graph input behind seqlens_k (e.g. attention_mask) would become unreachable without it.
+    emscripten::val mul_options = emscripten::val::object();
+    mul_options.set("label", label + "_zero");
+    return wnn_builder.call<emscripten::val>("mul", seqlens_k, zero, mul_options);
+  }
+
+  emscripten::val one = model_builder.CreateOrGetConstant<int32_t>(
+      ONNX_NAMESPACE::TensorProto_DataType_INT32, static_cast<int32_t>(1), {1});
+
+  // sequence_length as int32 [1], from dim 1 of query (B, S, W).
+  emscripten::val shape_options = emscripten::val::object();
+  shape_options.set("label", label + "_query_shape");
+  emscripten::val query_shape = wnn_builder.call<emscripten::val>("shape", query_input, shape_options);
+  emscripten::val s_shape = shape_utils::SliceShapeRange(wnn_builder, query_shape, 1, 1, label + "_slice_s");
+  emscripten::val cast_options = emscripten::val::object();
+  cast_options.set("label", label + "_s_to_int32");
+  emscripten::val sequence_length = wnn_builder.call<emscripten::val>(
+      "cast", s_shape, emscripten::val("int32"), cast_options);
+
+  emscripten::val options = emscripten::val::object();
+  options.set("label", label + "_total_seqlens");
+  emscripten::val total_seqlens = wnn_builder.call<emscripten::val>("add", seqlens_k, one, options);
+  options.set("label", label + "_subsequent_prompt");
+  emscripten::val past_seqlens = wnn_builder.call<emscripten::val>("sub", total_seqlens, sequence_length, options);
+
+  options.set("label", label + "_is_first_prompt");
+  emscripten::val is_first_prompt = wnn_builder.call<emscripten::val>(
+      "equal", sequence_length, total_sequence_length, options);
+  options.set("label", label + "_select");
+  return wnn_builder.call<emscripten::val>("where", is_first_prompt, zero, past_seqlens, options);
+}
+
 class GroupQueryAttentionOpBuilder : public BaseOpBuilder {
  public:
   void AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const override;
@@ -68,6 +117,12 @@ class GroupQueryAttentionOpBuilder : public BaseOpBuilder {
  private:
   Status AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
                                const logging::Logger& logger) const override ORT_MUST_USE_RESULT;
+  // For browsers without dynamic shape support: static ops only, all the shapes are static.
+  Status AddStaticShapeToModelBuilder(ModelBuilder& model_builder, const Node& node,
+                                      const logging::Logger& logger) const ORT_MUST_USE_RESULT;
+  // Uses dynamic ops, so the sequence lengths do not need to be known when building the graph.
+  Status AddDynamicShapeToModelBuilder(ModelBuilder& model_builder, const Node& node,
+                                       const logging::Logger& logger) const ORT_MUST_USE_RESULT;
 
   // Operator support related.
  private:
@@ -79,12 +134,541 @@ class GroupQueryAttentionOpBuilder : public BaseOpBuilder {
                                const logging::Logger& logger) const override;
 };
 
+// Browsers without dynamic shape support only have the static WebNN ops. A node with a dynamic shape is not
+// supported there (see IsTensorShapeSupported), so all the shapes of the nodes that reach the static path are static.
+static bool UseStaticShapePath() {
+  return !IsDynamicShapeSupported();
+}
+
 void GroupQueryAttentionOpBuilder::AddInitializersToSkip(ModelBuilder& model_builder, const Node& node) const {
-  // We check the value of input total_sequence_length in function IsOpSupportedImpl,
-  // and it should be an initializer and does not participate in Op calculation.
+  // The static path checks total_sequence_length in IsOpSupportedImpl (it must be an initializer) and does not use it
+  // in Op calculation. The dynamic path uses it at runtime to tell the first prompt from a subsequent one, which only
+  // matters when there is a past KV cache.
+  if (!UseStaticShapePath() && TensorExists(node.InputDefs(), 3)) {
+    return;
+  }
   const auto input_name = node.InputDefs()[6]->Name();
   model_builder.AddInitializerToSkip(input_name);
   model_builder.AddInputToSkip(input_name);
+}
+
+static std::vector<int32_t> generate_indices(int32_t batch_size, int32_t kv_num_heads, int32_t sequence_length) {
+  std::vector<int32_t> indices;
+  for (int32_t i = 0; i < sequence_length; ++i) {
+    for (int32_t j = 0; j < batch_size * kv_num_heads; ++j) {
+      indices.push_back(j / kv_num_heads);
+      indices.push_back(j % kv_num_heads);
+    }
+  }
+  return indices;
+}
+
+static std::vector<int32_t> repeat_sequence(int32_t sequence_length, int32_t kv_num_heads, int32_t batch_size) {
+  std::vector<int32_t> repeated;
+  for (int32_t i = 0; i < sequence_length; ++i) {
+    for (int32_t j = 0; j < batch_size * kv_num_heads; ++j) {
+      repeated.push_back(i);
+    }
+  }
+  return repeated;
+}
+
+Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
+                                                           const logging::Logger& logger) const {
+  if (UseStaticShapePath()) {
+    return AddStaticShapeToModelBuilder(model_builder, node, logger);
+  }
+  return AddDynamicShapeToModelBuilder(model_builder, node, logger);
+}
+
+Status GroupQueryAttentionOpBuilder::AddStaticShapeToModelBuilder(ModelBuilder& model_builder, const Node& node,
+                                                                  const logging::Logger& logger) const {
+  // The KV-cache update always scatters into the fixed-size past buffer: the enableCausalLM option (concat) is for
+  // a growing cache, whose shapes are dynamic.
+  const auto& input_defs = node.InputDefs();
+
+  NodeAttrHelper helper(node);
+  const int32_t local_window_size = helper.Get("local_window_size", -1);
+  const uint32_t kv_num_heads = helper.Get("kv_num_heads", 0);
+  const uint32_t num_heads = helper.Get("num_heads", 0);
+  const bool do_rotary = static_cast<bool>(helper.Get("do_rotary", 0));
+  const bool rotary_interleaved = static_cast<bool>(helper.Get("rotary_interleaved", 0));
+
+  // Check if optional inputs exist
+  const bool has_key = TensorExists(input_defs, 1);
+  const bool has_value = TensorExists(input_defs, 2);
+  const bool has_past_key = TensorExists(input_defs, 3);
+  const bool has_past_value = TensorExists(input_defs, 4);
+  const bool has_cos_cache = TensorExists(input_defs, 7);
+  const bool has_sin_cache = TensorExists(input_defs, 8);
+  const bool has_position_ids = TensorExists(input_defs, 9);
+
+  emscripten::val query_input = model_builder.GetOperand(input_defs[0]->Name());
+  emscripten::val key_input = has_key ? model_builder.GetOperand(input_defs[1]->Name()) : emscripten::val::undefined();
+  emscripten::val value_input = has_value ? model_builder.GetOperand(input_defs[2]->Name()) : emscripten::val::undefined();
+  emscripten::val past_key_input = has_past_key ? model_builder.GetOperand(input_defs[3]->Name()) : emscripten::val::undefined();
+  emscripten::val past_value_input = has_past_value ? model_builder.GetOperand(input_defs[4]->Name()) : emscripten::val::undefined();
+  emscripten::val seqlens_k_input = model_builder.GetOperand(input_defs[5]->Name());
+  emscripten::val cos_cache = has_cos_cache ? model_builder.GetOperand(input_defs[7]->Name()) : emscripten::val::undefined();
+  emscripten::val sin_cache = has_sin_cache ? model_builder.GetOperand(input_defs[8]->Name()) : emscripten::val::undefined();
+
+  std::vector<int64_t> input_q_shape;
+  ORT_RETURN_IF_NOT(GetShape(*input_defs[0], input_q_shape, logger), "Cannot get query shape");
+
+  // Calculate hidden_size and head_size based on whether key/value are provided
+  uint32_t qkv_hidden_size;
+  uint32_t head_size;
+  if (has_key) {
+    // query shape is (batch_size, sequence_length, num_heads * head_size)
+    qkv_hidden_size = SafeInt<uint32_t>(input_q_shape[2]);
+    head_size = SafeInt<uint32_t>(qkv_hidden_size / num_heads);
+  } else {
+    // query contains packed QKV: (batch_size, sequence_length, num_heads * head_size + 2 * kv_num_heads * head_size)
+    // hidden_size = num_heads * head_size, so we derive: head_size = d / (num_heads + 2 * kv_num_heads)
+    uint32_t d = SafeInt<uint32_t>(input_q_shape[2]);
+    head_size = d / (num_heads + 2 * kv_num_heads);
+    qkv_hidden_size = num_heads * head_size;
+  }
+
+  // Get past_sequence_length from past_key if available, otherwise it's 0 (first token)
+  uint32_t past_sequence_length = 0;
+  if (has_past_key) {
+    std::vector<int64_t> input_past_k_shape;
+    ORT_RETURN_IF_NOT(GetShape(*input_defs[3], input_past_k_shape, logger), "Cannot get past_key shape");
+    past_sequence_length = SafeInt<uint32_t>(input_past_k_shape[2]);
+  }
+
+  const uint32_t batch_size = SafeInt<uint32_t>(input_q_shape[0]);
+  const uint32_t qkv_sequence_length = SafeInt<uint32_t>(input_q_shape[1]);
+
+  emscripten::val position_ids = emscripten::val::undefined();
+  bool use_position_ids_as_offset = false;
+  if (has_position_ids) {
+    position_ids = model_builder.GetOperand(input_defs[9]->Name());
+  } else {
+    // If position_ids is not provided, we need to derive it from the context.
+    // We distinguish prefill vs decode by qkv_sequence_length (not has_past_key), because
+    // with pre-allocated KV cache (freeDimensionOverrides), has_past_key is always true.
+    //
+    // - Prefill (qkv_sequence_length > 1): positions start from 0
+    // - Decode (qkv_sequence_length == 1): position = seqlens_k (the actual sequence position)
+    //
+    // Note: We cannot use past_sequence_length from the static shape because it represents the
+    // pre-allocated cache size (total_sequence_length), not the actual number of valid tokens.
+    if (qkv_sequence_length == 1) {
+      // During decode, use seqlens_k as the position offset for rotary embedding.
+      // seqlens_k has shape [batch_size], but we need [batch_size, 1] to properly broadcast
+      // with position_ids_range which has shape [1, sequence_length] in ApplyRotaryEmbedding.
+      emscripten::val reshape_options = emscripten::val::object();
+      reshape_options.set("label", node.Name() + "_/GQA/seqlens_k_reshape_for_position");
+
+      emscripten::val reshaped_seqlens_k = model_builder.GetBuilder().call<emscripten::val>(
+          "reshape", seqlens_k_input, emscripten::val::array(std::vector<uint32_t>({batch_size, 1})), reshape_options);
+
+      // seqlens_k is INT32, but position_ids_range in ApplyRotaryEmbedding may be INT64
+      // if int64 is supported. We need to cast to match the expected type.
+      if (model_builder.IsInt64Supported()) {
+        emscripten::val cast_options = emscripten::val::object();
+        cast_options.set("label", node.Name() + "_/GQA/seqlens_k_cast_to_int64");
+        position_ids = model_builder.GetBuilder().call<emscripten::val>(
+            "cast", reshaped_seqlens_k, emscripten::val("int64"), cast_options);
+      } else {
+        position_ids = reshaped_seqlens_k;
+      }
+    } else {
+      // During prefill, use 0 as the offset (positions will be 0, 1, 2, ..., sequence_length-1)
+      if (model_builder.IsInt64Supported()) {
+        position_ids = model_builder.CreateOrGetConstant<int64_t>(
+            ONNX_NAMESPACE::TensorProto_DataType_INT64, static_cast<int64_t>(0), {1});
+      } else {
+        position_ids = model_builder.CreateOrGetConstant<int32_t>(
+            ONNX_NAMESPACE::TensorProto_DataType_INT32, static_cast<int32_t>(0), {1});
+      }
+    }
+    use_position_ids_as_offset = true;
+  }
+
+  const uint32_t group_size = SafeInt<uint32_t>(num_heads / kv_num_heads);
+
+  const float scale_value = helper.Get("scale", 1 / sqrt(static_cast<float>(head_size)));
+
+  const std::vector<uint32_t> reshape_output_shape = {batch_size, qkv_sequence_length, qkv_hidden_size};
+  const std::vector<uint32_t> scatter_indices_shape = {batch_size, qkv_sequence_length, kv_num_heads, 3};
+  const std::vector<uint32_t> reshape_tensor_shape = {batch_size, qkv_sequence_length, num_heads, head_size};
+
+  emscripten::val common_options = emscripten::val::object();
+
+  int32_t q_type = 0;
+  ORT_RETURN_IF_NOT(GetType(*input_defs[0], q_type, logger), "Could not get input data type.");
+
+  // Split packed QKV if key and value are not provided separately
+  if (!has_key) {
+    // query contains packed QKV: (batch_size, sequence_length, num_heads * head_size + 2 * kv_num_heads * head_size)
+    const uint32_t kv_hidden_size = kv_num_heads * head_size;
+    const std::vector<uint32_t> splits{qkv_hidden_size, kv_hidden_size, kv_hidden_size};
+    emscripten::val split_options = emscripten::val::object();
+    split_options.set("label", node.Name() + "_/GQA/split_packed_qkv");
+    split_options.set("axis", 2);
+    emscripten::val split_result = model_builder.GetBuilder().call<emscripten::val>(
+        "split", query_input, emscripten::val::array(splits), split_options);
+    query_input = split_result[0];
+    key_input = split_result[1];
+    value_input = split_result[2];
+  }
+
+  // Apply rotary embedding if do_rotary is true
+  if (do_rotary && has_cos_cache && has_sin_cache) {
+    // Determine rotary_embedding_dim from cos_cache shape
+    std::vector<int64_t> cos_cache_shape;
+    ORT_RETURN_IF_NOT(GetShape(*input_defs[7], cos_cache_shape, logger), "Cannot get cos_cache shape");
+    const uint32_t rotary_embedding_dim = static_cast<uint32_t>(cos_cache_shape[1] * 2);
+
+    // The positions have one row per batch entry when they are explicit, or derived from seqlens_k when decoding.
+    uint32_t position_ids_batch = 1;
+    if (has_position_ids) {
+      std::vector<int64_t> position_ids_shape;
+      ORT_RETURN_IF_NOT(GetShape(*input_defs[9], position_ids_shape, logger), "Cannot get position_ids shape");
+      if (position_ids_shape.size() == 2) {
+        position_ids_batch = SafeInt<uint32_t>(position_ids_shape[0]);
+      }
+    } else if (qkv_sequence_length == 1) {
+      position_ids_batch = batch_size;
+    }
+    const uint32_t max_sequence_length = SafeInt<uint32_t>(cos_cache_shape[0]);
+    const RotaryStaticDims rotary_static_dims{batch_size, qkv_sequence_length, max_sequence_length,
+                                              position_ids_batch};
+
+    // Reshape query to (batch_size, sequence_length, num_heads, head_size) for rotary embedding
+    const std::vector<uint32_t> query_reshape_for_rotary = {batch_size, qkv_sequence_length, num_heads, head_size};
+    common_options.set("label", node.Name() + "_/GQA/query/reshape_for_rotary");
+    emscripten::val reshaped_query_for_rotary = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", query_input, emscripten::val::array(query_reshape_for_rotary), common_options);
+
+    // Apply rotary embedding to query
+    emscripten::val rotary_query_output;
+    ORT_RETURN_IF_ERROR(ApplyRotaryEmbedding(
+        model_builder,
+        node.Name() + "_query",
+        reshaped_query_for_rotary,
+        cos_cache,
+        sin_cache,
+        position_ids,
+        q_type,
+        num_heads,
+        head_size,
+        rotary_embedding_dim,
+        rotary_interleaved,
+        true,
+        use_position_ids_as_offset,  // position_ids_is_offset
+        false,                       // output_bnsh: BSNH, reshaped back to (B, S, hidden_size) below
+        &rotary_static_dims,
+        rotary_query_output));
+
+    // Reshape back to (batch_size, sequence_length, hidden_size)
+    common_options.set("label", node.Name() + "_/GQA/query/reshape_after_rotary");
+    query_input = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", rotary_query_output, emscripten::val::array(std::vector<uint32_t>({batch_size, qkv_sequence_length, qkv_hidden_size})), common_options);
+
+    // Reshape key to (batch_size, sequence_length, kv_num_heads, head_size) for rotary embedding
+    const std::vector<uint32_t> key_reshape_for_rotary = {batch_size, qkv_sequence_length, kv_num_heads, head_size};
+    common_options.set("label", node.Name() + "_/GQA/key/reshape_for_rotary");
+    emscripten::val reshaped_key_for_rotary = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", key_input, emscripten::val::array(key_reshape_for_rotary), common_options);
+
+    // Apply rotary embedding to key
+    emscripten::val rotary_key_output;
+    ORT_RETURN_IF_ERROR(ApplyRotaryEmbedding(
+        model_builder,
+        node.Name() + "_key",
+        reshaped_key_for_rotary,
+        cos_cache,
+        sin_cache,
+        position_ids,
+        q_type,
+        kv_num_heads,
+        head_size,
+        rotary_embedding_dim,
+        rotary_interleaved,
+        true,
+        use_position_ids_as_offset,  // position_ids_is_offset
+        false,                       // output_bnsh
+        &rotary_static_dims,
+        rotary_key_output));
+
+    // Reshape back to (batch_size, sequence_length, kv_hidden_size)
+    const uint32_t kv_hidden_size = kv_num_heads * head_size;
+    common_options.set("label", node.Name() + "_/GQA/key/reshape_after_rotary");
+    key_input = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", rotary_key_output, emscripten::val::array(std::vector<uint32_t>({batch_size, qkv_sequence_length, kv_hidden_size})), common_options);
+  }
+
+  // Reshape and transpose the input "query"
+  common_options.set("label", node.Name() + "_/GQA/query/reshape");
+  emscripten::val reshaped_query = model_builder.GetBuilder().call<emscripten::val>(
+      "reshape", query_input, emscripten::val::array(reshape_tensor_shape), common_options);
+
+  emscripten::val transpose_options = emscripten::val::object();
+  transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
+  transpose_options.set("label", node.Name() + "_/GQA/query/transpose");
+  emscripten::val new_query =
+      model_builder.GetBuilder().call<emscripten::val>("transpose", reshaped_query, transpose_options);
+
+  // Reshape the inputs "key" and "value" for scatterND
+  std::vector<uint32_t> reshape_kv_shape = {batch_size, qkv_sequence_length, kv_num_heads, head_size};
+  common_options.set("label", node.Name() + "_/GQA/key/reshape_1");
+  emscripten::val key_for_scatter = model_builder.GetBuilder().call<emscripten::val>(
+      "reshape", key_input, emscripten::val::array(reshape_kv_shape), common_options);
+
+  common_options.set("label", node.Name() + "_/GQA/value/reshape_1");
+  emscripten::val value_for_scatter = model_builder.GetBuilder().call<emscripten::val>(
+      "reshape", value_input, emscripten::val::array(reshape_kv_shape), common_options);
+
+  /* Calculate scatter_indices for kv's scatterND
+                                                                                 if_prefill (0/1 constant)
+                                                                                          |
+  scatter_indices_left_constant         scatter_indices_right_constant           0 ---> Where <--- Cast <---seqlens_k
+                |                                      |                                  |
+                |                                     Add <--------------------------- scatter_pos*
+                |                                      |
+                +------------------+-------------------+
+                                   |
+                            scatter_indices
+  */
+  // Prepare the constant materials for scatter indices
+  auto left = generate_indices(batch_size, kv_num_heads, qkv_sequence_length);
+  auto right = repeat_sequence(qkv_sequence_length, kv_num_heads, batch_size);
+
+  std::string left_name = "webnn_GQA_left_constant_of_scatter_indices_" + std::to_string(batch_size) + "_" +
+                          std::to_string(qkv_sequence_length) + "_" + std::to_string(kv_num_heads) + "_2";
+  emscripten::val left_constant = model_builder.CreateOrGetConstant<int32_t>(
+      ONNX_NAMESPACE::TensorProto_DataType_INT32, left_name, left,
+      std::vector<uint32_t>({batch_size * qkv_sequence_length * kv_num_heads, 2}));
+
+  std::string right_name = "webnn_GQA_right_constant_of_scatter_indices_" + std::to_string(batch_size) + "_" +
+                           std::to_string(qkv_sequence_length) + "_" + std::to_string(kv_num_heads) + "_1";
+  emscripten::val right_constant = model_builder.CreateOrGetConstant<int32_t>(
+      ONNX_NAMESPACE::TensorProto_DataType_INT32, right_name, right,
+      std::vector<uint32_t>({batch_size * qkv_sequence_length * kv_num_heads, 1}));
+
+  // The prefilling and decoding stages require different index construction for ScatterND operations.
+  // Similar to other EPs like CPU and DirectML, when qkv_sequence_length > 1, the key and value are scattered to the
+  // beginning of kv cache.
+  std::vector<uint8_t> first_condition({(qkv_sequence_length > 1)});
+  std::string condition_name = "webnn_GQA_condition_constant_for_where_1";
+  emscripten::val condition_constant = model_builder.CreateOrGetConstant<uint8_t>(
+      ONNX_NAMESPACE::TensorProto_DataType_UINT8, condition_name, first_condition, std::vector<uint32_t>({1}));
+
+  emscripten::val value_zero_constant =
+      model_builder.CreateOrGetConstant<int>(ONNX_NAMESPACE::TensorProto_DataType_INT32, 0, {1});
+
+  // Use concat and reshape to achieve scatter_indices
+  common_options.set("label", node.Name() + "_/GQA/scatter/where");
+  emscripten::val scatter_pos = model_builder.GetBuilder().call<emscripten::val>(
+      "where", condition_constant, value_zero_constant, seqlens_k_input, common_options);
+
+  common_options.set("label", node.Name() + "_/GQA/right_constant/add");
+  right_constant = model_builder.GetBuilder().call<emscripten::val>("add", right_constant, scatter_pos, common_options);
+
+  common_options.set("label", node.Name() + "_/GQA/concat_for_pre_scatter_indices");
+  std::vector<emscripten::val> inputs({left_constant, right_constant});
+  uint32_t axis = 1;
+  emscripten::val pre_scatter_indices =
+      model_builder.GetBuilder().call<emscripten::val>("concat", emscripten::val::array(inputs), axis, common_options);
+
+  common_options.set("label", node.Name() + "_/GQA/pre_scatter_indices/reshape");
+  emscripten::val scatter_indices = model_builder.GetBuilder().call<emscripten::val>(
+      "reshape", pre_scatter_indices, emscripten::val::array(scatter_indices_shape), common_options);
+
+  // scatterND for present_key and present_value, or use key/value directly if no past
+  emscripten::val present_key;
+  emscripten::val present_value;
+  if (has_past_key && has_past_value) {
+    common_options.set("label", node.Name() + "_/GQA/present_key/ScatterND");
+    present_key = model_builder.GetBuilder().call<emscripten::val>(
+        "scatterND", past_key_input, scatter_indices, key_for_scatter, common_options);
+
+    common_options.set("label", node.Name() + "_/GQA/present_value/ScatterND");
+    present_value = model_builder.GetBuilder().call<emscripten::val>(
+        "scatterND", past_value_input, scatter_indices, value_for_scatter, common_options);
+  } else {
+    // No past_key/past_value, use key/value directly as present_key/present_value (first token case)
+    // Transpose key and value to BNSH format: (B, S, kv_N, H) -> (B, kv_N, S, H)
+    transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 2, 1, 3})));
+    transpose_options.set("label", node.Name() + "_/GQA/key/transpose_to_bnsh");
+    present_key = model_builder.GetBuilder().call<emscripten::val>("transpose", key_for_scatter, transpose_options);
+
+    transpose_options.set("label", node.Name() + "_/GQA/value/transpose_to_bnsh");
+    present_value = model_builder.GetBuilder().call<emscripten::val>("transpose", value_for_scatter, transpose_options);
+  }
+
+  emscripten::val true_present_key;
+  emscripten::val true_present_value;
+  // If no past_key, the sequence length is qkv_sequence_length, otherwise it is past_sequence_length.
+  // In prefill stage, sequence_length == total_sequence_length.
+  // In decoding stage, past_sequence_length == total_sequence_length.
+  // So we can use total_sequence_length (which is provided in input[6]) or derive it from the logic above.
+  uint32_t current_total_seq_len;
+  if (!has_past_key && !has_past_value) {
+    // Prefill: current_total_seq_len is simply qkv_sequence_length (which should == total_sequence_length)
+    current_total_seq_len = qkv_sequence_length;
+  } else {
+    // Decoding: current_total_seq_len is past_sequence_length
+    current_total_seq_len = past_sequence_length;
+  }
+
+  if (group_size != 1) {
+    // Broadcast key and value for group query by reshape, expand and reshape.
+    // present kv shape (B,kv_N,P,H) -> (B,kv_N,1,P,H) -> (B,kv_N,N/kv_N,P,H) -> (B,N,P,H) broadcasted kv shape
+    const std::vector<uint32_t> group_broadcast_tensor_shape_1 = {batch_size, kv_num_heads, 1, current_total_seq_len,
+                                                                  head_size};
+    const std::vector<uint32_t> group_broadcast_tensor_shape_2 = {batch_size, kv_num_heads, group_size,
+                                                                  current_total_seq_len, head_size};
+    const std::vector<uint32_t> group_broadcast_tensor_shape_3 = {batch_size, num_heads, current_total_seq_len,
+                                                                  head_size};
+    common_options.set("label", node.Name() + "_/GQA/true_present_key/reshape_1");
+    true_present_key = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", present_key, emscripten::val::array(group_broadcast_tensor_shape_1), common_options);
+    common_options.set("label", node.Name() + "_/GQA/true_present_key/expand");
+    true_present_key = model_builder.GetBuilder().call<emscripten::val>(
+        "expand", true_present_key, emscripten::val::array(group_broadcast_tensor_shape_2), common_options);
+    common_options.set("label", node.Name() + "_/GQA/true_present_key/reshape_2");
+    true_present_key = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", true_present_key, emscripten::val::array(group_broadcast_tensor_shape_3), common_options);
+
+    common_options.set("label", node.Name() + "_/GQA/true_present_value/reshape_1");
+    true_present_value = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", present_value, emscripten::val::array(group_broadcast_tensor_shape_1), common_options);
+    common_options.set("label", node.Name() + "_/GQA/true_present_value/expand");
+    true_present_value = model_builder.GetBuilder().call<emscripten::val>(
+        "expand", true_present_value, emscripten::val::array(group_broadcast_tensor_shape_2), common_options);
+    common_options.set("label", node.Name() + "_/GQA/true_present_value/reshape_2");
+    true_present_value = model_builder.GetBuilder().call<emscripten::val>(
+        "reshape", true_present_value, emscripten::val::array(group_broadcast_tensor_shape_3), common_options);
+  } else {  // no need for broadcast
+    true_present_key = present_key;
+    true_present_value = present_value;
+  }
+
+  // Transpose key for matrix multiplication
+  transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({0, 1, 3, 2})));
+  transpose_options.set("label", node.Name() + "_/GQA/present_key/transpose");
+  true_present_key = model_builder.GetBuilder().call<emscripten::val>("transpose", true_present_key, transpose_options);
+
+  emscripten::val scale_constant = model_builder.CreateOrGetConstant<float>(q_type, scale_value, {1});
+
+  /* Calculate attention_bias for masking softmax
+        ones_array (shape=B,N,S,P)                          range_of_qkv_sequence_length_constant (0,1,2,...) (shape=S)
+          |                                                                 |
+        CumSum (axis=3, exclusive=true, reversed=false)                    Add <--- scatter_pos
+          |                                                                 |
+          |                                                               Expand (shape=P,S)
+          |                                                                 |
+          +-------------------------------> Lesser <---------------------Transpose (1,0)
+                                                |
+                                      1 ---> Where (attn_mask) <--- finfo_min (minimum value of FP32)
+                                                |
+                                          attention_bias
+  */
+  emscripten::val value_int_one_constant =
+      model_builder.CreateOrGetConstant<int>(ONNX_NAMESPACE::TensorProto_DataType_INT32, 1, {1});
+
+  std::vector<uint32_t> mask_shape_ones_shape = {batch_size, num_heads, qkv_sequence_length, current_total_seq_len};
+  common_options.set("label", node.Name() + "_/GQA/GQA_mask_shape_ones/expand");
+  emscripten::val mask_shape_ones_shape_constant = model_builder.GetBuilder().call<emscripten::val>(
+      "expand", value_int_one_constant, emscripten::val::array(mask_shape_ones_shape), common_options);
+
+  emscripten::val cumsum_options = emscripten::val::object();
+  cumsum_options.set("label", node.Name() + "_range_of_mask_shape");
+  cumsum_options.set("exclusive", true);
+  cumsum_options.set("reversed", false);
+  emscripten::val neq_left = model_builder.GetBuilder().call<emscripten::val>(
+      "cumulativeSum", mask_shape_ones_shape_constant, gsl::narrow<uint32_t>(3), cumsum_options);
+
+  std::vector<uint32_t> reshape_pre_neq_right = {current_total_seq_len, qkv_sequence_length};
+  std::vector<int32_t> pre_neq_right_data_range(qkv_sequence_length);
+  std::iota(pre_neq_right_data_range.begin(), pre_neq_right_data_range.end(), 1);
+
+  std::string pre_neq_right_data_range_name =
+      "webnn_GQA_pre_neq_right_data_range_" + std::to_string(qkv_sequence_length);
+  emscripten::val pre_neq_right_data_range_constant = model_builder.CreateOrGetConstant<int32_t>(
+      ONNX_NAMESPACE::TensorProto_DataType_INT32, pre_neq_right_data_range_name, pre_neq_right_data_range,
+      std::vector<uint32_t>({qkv_sequence_length}));
+
+  common_options.set("label", node.Name() + "_/GQA/attn_mask/add");
+  emscripten::val pre_neq_right = model_builder.GetBuilder().call<emscripten::val>(
+      "add", pre_neq_right_data_range_constant, scatter_pos, common_options);
+
+  common_options.set("label", node.Name() + "_/GQA/expand_neq_right");
+  emscripten::val expanded_neq_right = model_builder.GetBuilder().call<emscripten::val>(
+      "expand", pre_neq_right, emscripten::val::array(reshape_pre_neq_right), common_options);
+
+  transpose_options.set("permutation", emscripten::val::array(std::vector<uint32_t>({1, 0})));
+  transpose_options.set("label", node.Name() + "_/GQA/neq_right/transpose");
+  emscripten::val neq_right =
+      model_builder.GetBuilder().call<emscripten::val>("transpose", expanded_neq_right, transpose_options);
+
+  common_options.set("label", node.Name() + "_/GQA/attn_mask/condition_1");
+  emscripten::val condition_1 =
+      model_builder.GetBuilder().call<emscripten::val>("lesser", neq_left, neq_right, common_options);
+
+  emscripten::val condition = condition_1;
+  // For local window size not equal to -1, new attention mask pattern for applying sliding window
+  /*
+     condition_1 (old attn_mask) ---> CumSum (axis=3, exclusive=true, reversed=true)
+          |                             |
+          |                           Lesser <--- local_window_size
+          |                             |
+      LogicalAnd <----------------- condition_2
+          |
+    new attn_mask
+  */
+  if (local_window_size != -1) {
+    // Cast condition
+    common_options.set("label", node.Name() + "_/GQA/attn_mask/condition_2/cast");
+    emscripten::val casted_condition_1 =
+        model_builder.GetBuilder().call<emscripten::val>("cast", condition_1, emscripten::val("int32"), common_options);
+
+    cumsum_options = emscripten::val::object();
+    cumsum_options.set("label", node.Name() + "_/GQA/attn_mask/condition_2/cumsum");
+    cumsum_options.set("exclusive", true);
+    cumsum_options.set("reversed", true);
+    emscripten::val neq_left_2 = model_builder.GetBuilder().call<emscripten::val>(
+        "cumulativeSum", casted_condition_1, gsl::narrow<uint32_t>(3), cumsum_options);
+
+    emscripten::val local_window_size_constant =
+        model_builder.CreateOrGetConstant<int>(ONNX_NAMESPACE::TensorProto_DataType_INT32, local_window_size, {1});
+
+    common_options.set("label", node.Name() + "_/GQA/attn_mask/condition_2");
+    emscripten::val condition_2 =
+        model_builder.GetBuilder().call<emscripten::val>("lesser", neq_left_2, local_window_size_constant, common_options);
+
+    common_options.set("label", node.Name() + "_/GQA/attn_mask/condition/and");
+    condition = model_builder.GetBuilder().call<emscripten::val>(
+        "logicalAnd", condition_1, condition_2, common_options);
+  }
+
+  // For attended positions, use 0.0 (no change to attention scores)
+  // For masked positions, use a very large negative number (softmax → 0)
+  emscripten::val value_zero_constant_float = model_builder.CreateOrGetConstant<float>(q_type, 0, {1});
+
+  // finfo_min: the minimum value of float32
+  emscripten::val finfo_min_constant = model_builder.CreateOrGetConstant<float>(q_type, -3.4028234663852886e+38, {1});
+
+  common_options.set("label", node.Name() + "_/GQA/attn_mask/where");
+  emscripten::val attn_mask = model_builder.GetBuilder().call<emscripten::val>("where", condition, value_zero_constant_float,
+                                                                               finfo_min_constant, common_options);
+
+  // Execute ScaledDotProductAttention
+  emscripten::val output =
+      ScaledDotProductAttention(model_builder, node, logger, new_query, true_present_key, true_present_value,
+                                scale_constant, attn_mask,
+                                {0, 0, static_cast<int64_t>(qkv_hidden_size)}, &reshape_output_shape);
+
+  model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
+  model_builder.AddOperand(node.OutputDefs()[1]->Name(), std::move(present_key));
+  model_builder.AddOperand(node.OutputDefs()[2]->Name(), std::move(present_value));
+
+  return Status::OK();
 }
 
 /** GroupQueryAttention SubGraph.
@@ -131,7 +715,7 @@ void GroupQueryAttentionOpBuilder::AddInitializersToSkip(ModelBuilder& model_bui
                             output
 
     ===== enableCausalLM = false (ScatterND / stateless path, default) =====
-    Fixed-size KV buffer: new tokens are scattered at position seqlens_k-(S-1).
+    Fixed-size KV buffer: new tokens are scattered at the past sequence length.
     Suitable for models that manage the KV-cache externally (e.g., I/O binding).
 
        query         key                 value
@@ -161,8 +745,8 @@ void GroupQueryAttentionOpBuilder::AddInitializersToSkip(ModelBuilder& model_bui
                             output
 */
 
-Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_builder, const Node& node,
-                                                           const logging::Logger& logger) const {
+Status GroupQueryAttentionOpBuilder::AddDynamicShapeToModelBuilder(ModelBuilder& model_builder, const Node& node,
+                                                                   const logging::Logger& logger) const {
   const auto& input_defs = node.InputDefs();
 
   NodeAttrHelper helper(node);
@@ -239,72 +823,62 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   ORT_RETURN_IF(head_size == 0,
                 "GroupQueryAttention: cannot determine head_size from query, key, or past_key shape protos.");
   qkv_hidden_size = num_heads * head_size;
+  if (!has_key) {
+    // The split of the packed QKV gives key/value of shape (B, S, kv_hidden_size).
+    input_k_shape = {input_q_shape[0], input_q_shape[1], static_cast<int64_t>(kv_num_heads * head_size)};
+    input_v_shape = input_k_shape;
+  }
+
+  // The offset of the new tokens in the KV cache. Every layer of a decoder stack shares seqlens_k,
+  // total_sequence_length and the query sequence dimension, so they reuse one offset (and one position
+  // offset below); keying on the seq identity (not just seqlens_k) keeps this correct if a graph ever mixes
+  // sequence lengths. Empty seq identity disables sharing. Without sharing, the duplicated chains would
+  // survive as distinct SSA tensors the backend's CSE cannot merge.
+  const std::string seq_id = GetDimIdentity(*input_defs[0], 1);
+  const std::string past_seqlens_key =
+      seq_id.empty() ? std::string()
+                     : "gqa_past_seqlens:" + input_defs[5]->Name() + ":" +
+                           (has_past_key ? input_defs[6]->Name() : std::string()) + ":" + seq_id;
+  emscripten::val past_seqlens;
+  if (!past_seqlens_key.empty() && model_builder.HasCachedOperand(past_seqlens_key)) {
+    past_seqlens = model_builder.GetCachedOperand(past_seqlens_key);
+  } else {
+    emscripten::val total_sequence_length =
+        has_past_key ? model_builder.GetOperand(input_defs[6]->Name()) : emscripten::val::undefined();
+    past_seqlens = BuildPastSequenceLengths(model_builder, query_input, seqlens_k_input, total_sequence_length,
+                                            has_past_key, node.Name() + "_/GQA/past_seqlens");
+    if (!past_seqlens_key.empty()) {
+      model_builder.AddCachedOperand(past_seqlens_key, past_seqlens);
+    }
+  }
 
   emscripten::val position_ids = emscripten::val::undefined();
   bool use_position_ids_as_offset = false;
-  // Cache key for the derived position offset. The offset is seqlens_k - (S - 1), so it is fully
-  // determined by the seqlens_k input and the query sequence dimension. Every layer of a decoder
-  // stack shares both, so they reuse one offset; keying on the seq identity (not just seqlens_k)
-  // keeps it correct if a graph ever mixes sequence lengths. Empty seq identity disables sharing.
-  const std::string pos_seq_id = GetDimIdentity(*input_defs[0], 1);
-  const std::string pos_offset_key =
-      pos_seq_id.empty() ? std::string()
-                         : "gqa_pos_offset:" + input_defs[5]->Name() + ":" + pos_seq_id;
+  const std::string pos_offset_key = past_seqlens_key.empty() ? std::string() : past_seqlens_key + ":position";
   if (has_position_ids) {
     position_ids = model_builder.GetOperand(input_defs[9]->Name());
   } else if (!pos_offset_key.empty() && model_builder.HasCachedOperand(pos_offset_key)) {
-    // Reuse the offset computed by the first layer instead of rebuilding the identical
-    // shape→slice→range→reduceMax→sub→unsqueeze→cast chain per layer — those duplicates would
-    // otherwise survive as distinct SSA tensors the backend's CSE cannot merge.
     position_ids = model_builder.GetCachedOperand(pos_offset_key);
     use_position_ids_as_offset = true;
   } else {
-    // If position_ids is not provided, derive it from seqlens_k as the per-batch position offset.
-    // The model computes seqlens_k = reduceSum(attention_mask) - 1 = past_seq_len + (S - 1).
-    // We subtract (S - 1) to recover past_sequence_length, which serves as the position offset:
-    //   - Prefill (S = L):  offset = (L-1) - (L-1) = 0  → positions [0..S-1]
-    //   - Decode  (S = 1):  offset = seqlens_k - 0 = seqlens_k → position [seqlens_k]
-
-    // Compute S-1 dynamically from query sequence_length using BuildRange + reduceMax.
-    // Get [S] shape from query_input dim 1 via shape() → slice.
-    emscripten::val pos_shape_options = emscripten::val::object();
-    pos_shape_options.set("label", node.Name() + "_/GQA/pos/query_shape");
-    emscripten::val pos_query_shape = model_builder.GetBuilder().call<emscripten::val>(
-        "shape", query_input, pos_shape_options);
-    emscripten::val pos_s_shape = shape_utils::SliceShapeRange(
-        model_builder.GetBuilder(), pos_query_shape, 1, 1,
-        node.Name() + "_/GQA/pos/query_slice_s");
-    emscripten::val pos_range = BuildRange(
-        model_builder, pos_s_shape, node.Name() + "_/GQA/pos/range");
-    emscripten::val pos_reduce_options = emscripten::val::object();
-    pos_reduce_options.set("label", node.Name() + "_/GQA/pos/s_minus_1");
-    emscripten::val pos_s_minus_1 = model_builder.GetBuilder().call<emscripten::val>(
-        "reduceMax", pos_range, pos_reduce_options);
-
-    // Correct seqlens_k by subtracting (S-1) to get past_sequence_length as position offset.
-    emscripten::val pos_options = emscripten::val::object();
-    pos_options.set("label", node.Name() + "_/GQA/pos/corrected_seqlens_k");
-    emscripten::val corrected_seqlens_k = model_builder.GetBuilder().call<emscripten::val>(
-        "sub", seqlens_k_input, pos_s_minus_1, pos_options);
-
-    // Unsqueeze [B] → [B, 1] instead of dim-descriptor reshape.
+    // If position_ids is not provided, the position offset is the number of tokens already in the KV cache.
+    // Unsqueeze [B] → [B, 1] so it broadcasts with the [1, S] position range in ApplyRotaryEmbedding.
     emscripten::val reshape_options = emscripten::val::object();
     reshape_options.set("label", node.Name() + "_/GQA/seqlens_k_reshape_for_position");
-    emscripten::val reshaped_seqlens_k = model_builder.GetBuilder().call<emscripten::val>(
-        "unsqueeze", corrected_seqlens_k, emscripten::val::array(std::vector<uint32_t>{1}), reshape_options);
+    emscripten::val reshaped_past_seqlens = model_builder.GetBuilder().call<emscripten::val>(
+        "unsqueeze", past_seqlens, emscripten::val::array(std::vector<uint32_t>{1}), reshape_options);
 
-    // seqlens_k is INT32, but position_ids_range in ApplyRotaryEmbedding may be INT64
+    // past_seqlens is INT32, but position_ids_range in ApplyRotaryEmbedding may be INT64
     // if int64 is supported. We need to cast to match the expected type.
     if (model_builder.IsInt64Supported()) {
       emscripten::val cast_options = emscripten::val::object();
       cast_options.set("label", node.Name() + "_/GQA/seqlens_k_cast_to_int64");
       position_ids = model_builder.GetBuilder().call<emscripten::val>(
-          "cast", reshaped_seqlens_k, emscripten::val("int64"), cast_options);
+          "cast", reshaped_past_seqlens, emscripten::val("int64"), cast_options);
     } else {
-      position_ids = reshaped_seqlens_k;
+      position_ids = reshaped_past_seqlens;
     }
     use_position_ids_as_offset = true;
-    // Cache for reuse by the remaining attention layers (no-op when sharing is disabled).
     if (!pos_offset_key.empty()) {
       model_builder.AddCachedOperand(pos_offset_key, position_ids);
     }
@@ -347,11 +921,9 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
     // TransposeOptimizer would cancel (breaking OpenVINO's RoPE pattern matching).
     const bool rotary_output_bnsh = true;
 
-    // Identity of the query/key sequence dimension (dim 1), used to share the [0..S-1] rotary range
-    // across every layer and across the paired Q/K calls. All GQA layers see the same sequence
-    // dimension, so they collapse to one range — matching the single model-level arange a typical
-    // PyTorch export produces.
-    const std::string seq_range_key = GetDimIdentity(*input_defs[0], 1);
+    // seq_id (identity of the query/key sequence dimension) shares the [0..S-1] rotary range across every
+    // layer and across the paired Q/K calls. All GQA layers see the same sequence dimension, so they
+    // collapse to one range — matching the single model-level arange a typical PyTorch export produces.
 
     // Reshape query to (batch_size, sequence_length, num_heads, head_size) for rotary embedding
     emscripten::val reshaped_query_for_rotary = shape_utils::Reshape(
@@ -376,9 +948,9 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
         true,
         use_position_ids_as_offset,  // position_ids_is_offset
         rotary_output_bnsh,
-        HasDynamicShape(input_q_shape),
+        nullptr,  // Dynamic ops: they also work for static shapes, and never read MLOperand.shape.
         rotary_query_output,
-        seq_range_key));
+        seq_id));
 
     // Reshape key to (batch_size, sequence_length, kv_num_heads, head_size) for rotary embedding
     emscripten::val reshaped_key_for_rotary = shape_utils::Reshape(
@@ -403,9 +975,9 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
         true,
         use_position_ids_as_offset,  // position_ids_is_offset
         rotary_output_bnsh,
-        HasDynamicShape(input_q_shape),
+        nullptr,
         rotary_key_output,
-        seq_range_key));
+        seq_id));
 
     // BNSH outputs: use directly, skip reshape-to-flat + later reshape+transpose
     query_input = rotary_query_output;    // [B, N, S, H]
@@ -454,27 +1026,6 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
         {0, 0, static_cast<int64_t>(kv_num_heads), static_cast<int64_t>(head_size)},
         node.Name() + "_/GQA/value/reshape_bsnh");
   }
-
-  // Compute s_minus_1 = S-1 dynamically as a scalar INT32 value.
-  // S-1 is used below to derive past_sequence_length from seqlens_k.
-  // Build range [0, 1, ..., S-1] via BuildRange, then reduceMax to get scalar S-1.
-  // S is at dim 1 in BSNH (value_bsnh) or dim 2 in BNSH (new_query).
-  // Get [S] shape via shape() → slice from the appropriate operand.
-  emscripten::val seq_source_operand = rotary_produced_bnsh ? new_query : value_bsnh;
-  uint32_t seq_dim_index = rotary_produced_bnsh ? 2 : 1;
-  emscripten::val seq_shape_options = emscripten::val::object();
-  seq_shape_options.set("label", node.Name() + "_/GQA/seq_source_shape");
-  emscripten::val seq_source_shape = model_builder.GetBuilder().call<emscripten::val>(
-      "shape", seq_source_operand, seq_shape_options);
-  emscripten::val seq_ones_shape = shape_utils::SliceShapeRange(
-      model_builder.GetBuilder(), seq_source_shape, seq_dim_index, 1,
-      node.Name() + "_/GQA/seq_slice_s");
-  emscripten::val seq_range = BuildRange(
-      model_builder, seq_ones_shape, node.Name() + "_/GQA/seq_range");
-  emscripten::val seq_reduce_options = emscripten::val::object();
-  seq_reduce_options.set("label", node.Name() + "_/GQA/s_minus_1");
-  emscripten::val s_minus_1 = model_builder.GetBuilder().call<emscripten::val>(
-      "reduceMax", seq_range, seq_reduce_options);
 
   // present_kv computation: branch based on enableCausalLM option.
   // - CausalLM (stateful): concat(past_kv, new_kv, axis=2) — past grows each step
@@ -555,15 +1106,10 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
       // dim_b=0 always, dim_s and dim_k swap between layouts.
       const uint32_t scatter_dim_s = rotary_produced_bnsh ? 2 : 1;
 
-      // scatter_pos_for_scatter: [B] → [B,1,1] = unsqueeze(seqlens_k, axes=[1,2])
+      // scatter_pos_for_scatter: [B] → [B,1,1] = unsqueeze(past_seqlens, axes=[1,2])
       common_options.set("label", node.Name() + "_/GQA/scatter/scatter_pos_reshape");
       emscripten::val scatter_pos_for_scatter = model_builder.GetBuilder().call<emscripten::val>(
-          "unsqueeze", seqlens_k_input, emscripten::val::array(std::vector<uint32_t>{1, 2}), common_options);
-
-      // Correct scatter offset: seqlens_k - (S - 1) = past_sequence_length
-      common_options.set("label", node.Name() + "_/GQA/scatter/scatter_pos_fix");
-      scatter_pos_for_scatter = model_builder.GetBuilder().call<emscripten::val>(
-          "sub", scatter_pos_for_scatter, s_minus_1, common_options);
+          "unsqueeze", past_seqlens, emscripten::val::array(std::vector<uint32_t>{1, 2}), common_options);
 
       // expand_shape: [B, kv_N, S] (BNSH) or [B, S, kv_N] (BSNH)
       // Get first 3 dims of key_for_scatter via shape() → slice.
@@ -777,22 +1323,14 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   range_s_plus_one = model_builder.GetBuilder().call<emscripten::val>(
       "cumulativeSum", range_s_plus_one, gsl::narrow<uint32_t>(0), range_cumsum_options);
 
-  // Derive past_sequence_length from seqlens_k for the causal mask offset.
-  // The model computes seqlens_k = reduceSum(attention_mask) - 1 = past_seq + (S - 1).
-  // Subtracting (S-1) recovers past_seq:
-  //   - Prefill (S = L):  past_seq = (L-1) - (L-1) = 0
-  //   - Decode  (S = 1):  past_seq = seqlens_k - 0 = seqlens_k
+  // The causal mask offset is past_seqlens of the first batch entry (the mask is shared across the batch).
   emscripten::val first_index_constant =
       model_builder.CreateOrGetConstant<int>(ONNX_NAMESPACE::TensorProto_DataType_INT32, 0, {1});
   emscripten::val gather_offset_options = emscripten::val::object();
   gather_offset_options.set("label", node.Name() + "_/GQA/attn_mask/scatter_pos_gather_first");
   gather_offset_options.set("axis", 0);
   emscripten::val scatter_pos_for_mask = model_builder.GetBuilder().call<emscripten::val>(
-      "gather", seqlens_k_input, first_index_constant, gather_offset_options);
-
-  common_options.set("label", node.Name() + "_/GQA/attn_mask/scatter_pos_fix");
-  scatter_pos_for_mask = model_builder.GetBuilder().call<emscripten::val>(
-      "sub", scatter_pos_for_mask, s_minus_1, common_options);
+      "gather", past_seqlens, first_index_constant, gather_offset_options);
 
   // neq_right = range_s_plus_one + past_seq → [S] values: [past_seq+1, past_seq+2, ..., past_seq+S]
   common_options.set("label", node.Name() + "_/GQA/attn_mask/add");
@@ -881,8 +1419,7 @@ Status GroupQueryAttentionOpBuilder::AddToModelBuilderImpl(ModelBuilder& model_b
   // Execute ScaledDotProductAttention
   emscripten::val output =
       ScaledDotProductAttention(model_builder, node, logger, new_query, true_present_key, true_present_value,
-                                scale_constant, attn_mask, reshape_output_target,
-                                HasDynamicShape(input_q_shape));
+                                scale_constant, attn_mask, reshape_output_target, nullptr);
 
   model_builder.AddOperand(node.OutputDefs()[0]->Name(), std::move(output));
   model_builder.AddOperand(node.OutputDefs()[1]->Name(), std::move(present_key));
@@ -920,6 +1457,11 @@ bool GroupQueryAttentionOpBuilder::IsOpSupportedImpl(const GraphViewer& graph_vi
   const auto* total_sequence_length_initializer = graph_viewer.GetConstantInitializer(total_sequence_length_name);
   emscripten::val total_sequence_length = emscripten::val::undefined();
   if (!total_sequence_length_initializer) {
+    // The static path does not use the value at runtime, so it has to be known when building the graph.
+    if (UseStaticShapePath()) {
+      LOGS(logger, VERBOSE) << "total_sequence_length must be constant";
+      return false;
+    }
     LOGS(logger, VERBOSE) << "total_sequence_length is not a constant";
   } else {
     const auto total_sequence_length_tensor = *total_sequence_length_initializer;

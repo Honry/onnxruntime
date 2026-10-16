@@ -4,6 +4,9 @@
 
 #pragma once
 
+#include <numeric>
+#include <vector>
+
 #include "core/providers/webnn/builders/helper.h"
 #include "core/providers/webnn/builders/impl/shape_utils.h"
 
@@ -59,6 +62,16 @@ inline emscripten::val BuildRange(ModelBuilder& model_builder,
   options.set("label", label + "_sub");
   return wnn_builder.call<emscripten::val>("sub", ones, one_constant, options);
 }
+
+// Concrete dims for the static path of ApplyRotaryEmbedding. They come from the ONNX shapes: the static path must not
+// read MLOperand.shape, which is not available on every browser and is symbolic when an upstream op is dynamic.
+struct RotaryStaticDims {
+  uint32_t batch_size;
+  uint32_t sequence_length;
+  uint32_t max_sequence_length;  // Dim 0 of the cos/sin cache.
+  // Dim 0 of the positions: batch_size when each batch entry has its own positions, otherwise 1.
+  uint32_t position_ids_batch;
+};
 
 /*
     RotaryEmbedding Helper: Apply rotary positional embedding to input tensor.
@@ -137,13 +150,16 @@ inline Status ApplyRotaryEmbedding(
     bool has_position_ids,
     bool position_ids_is_offset,
     bool output_bnsh,        // If true, output stays in BNSH format (no back-transpose)
-    bool has_dynamic_input,  // If true, use dynamic ops (reshapeDynamic, unsqueeze, squeeze, expandDynamic)
+    // nullptr: use dynamic ops (reshapeDynamic, unsqueeze, squeeze, expandDynamic).
+    // Otherwise use static ops with these concrete dims.
+    const RotaryStaticDims* static_dims,
     emscripten::val& output,
     // Identity token for the input's sequence dimension (from GetDimIdentity). The [0..S-1] range
     // built below depends only on this dimension, so callers sharing a seq identity (every layer of
     // a decoder stack, plus the paired Q/K calls) reuse one range. Empty disables sharing.
     const std::string& seq_range_cache_key = "") {
   emscripten::val wnn_builder = model_builder.GetBuilder();
+  const bool has_dynamic_input = static_dims == nullptr;
   ORT_RETURN_IF_NOT(head_size >= rotary_embedding_dim,
                     "Rotary embedding dimension must be less than or equal to head_size");
   const uint32_t half_rotary_embedding_dim = rotary_embedding_dim / 2;
@@ -173,10 +189,8 @@ inline Status ApplyRotaryEmbedding(
     deinterleave_reshape_options.set("label", node_name + "_rotary_deinterleave_reshape");
     if (!has_dynamic_input) {
       // Static path: use reshape with concrete uint32 values.
-      // Input shape is known: [B, S, num_heads, rotary_dim] where B, S are static.
-      emscripten::val input_dims = rope_input["shape"];
       std::vector<uint32_t> deinterleave_shape{
-          input_dims[0].as<uint32_t>(), input_dims[1].as<uint32_t>(),
+          static_dims->batch_size, static_dims->sequence_length,
           num_heads, half_rotary_embedding_dim, 2};
       rope_input = wnn_builder.call<emscripten::val>(
           "reshape", rope_input, emscripten::val::array(deinterleave_shape), deinterleave_reshape_options);
@@ -202,9 +216,8 @@ inline Status ApplyRotaryEmbedding(
     flat_reshape_options.set("label", node_name + "_rotary_deinterleave_flat");
     if (!has_dynamic_input) {
       // Static path: use reshape with concrete uint32 values.
-      emscripten::val transposed_dims = rope_input["shape"];
       std::vector<uint32_t> flat_shape{
-          transposed_dims[0].as<uint32_t>(), transposed_dims[1].as<uint32_t>(),
+          static_dims->batch_size, static_dims->sequence_length,
           num_heads, rotary_embedding_dim};
       rope_input = wnn_builder.call<emscripten::val>(
           "reshape", rope_input, emscripten::val::array(flat_shape), flat_reshape_options);
@@ -249,6 +262,29 @@ inline Status ApplyRotaryEmbedding(
     if (!seq_range_full_key.empty() && model_builder.HasCachedOperand(seq_range_full_key)) {
       return model_builder.GetCachedOperand(seq_range_full_key);
     }
+    if (!has_dynamic_input) {
+      // The sequence length is static, so use a constant range. The output size of the range op is symbolic even
+      // when its limit is known, but the static path below needs concrete dims.
+      const uint32_t s_len = static_dims->sequence_length;
+      emscripten::val constant_range;
+      if (model_builder.IsInt64Supported()) {
+        std::vector<int64_t> data(s_len);
+        std::iota(data.begin(), data.end(), 0);
+        constant_range = model_builder.CreateOrGetConstant<int64_t>(
+            ONNX_NAMESPACE::TensorProto_DataType_INT64, "webnn_rotary_range_int64_" + std::to_string(s_len), data,
+            {s_len});
+      } else {
+        std::vector<int32_t> data(s_len);
+        std::iota(data.begin(), data.end(), 0);
+        constant_range = model_builder.CreateOrGetConstant<int32_t>(
+            ONNX_NAMESPACE::TensorProto_DataType_INT32, "webnn_rotary_range_int32_" + std::to_string(s_len), data,
+            {s_len});
+      }
+      if (!seq_range_full_key.empty()) {
+        model_builder.AddCachedOperand(seq_range_full_key, constant_range);
+      }
+      return constant_range;
+    }
     // Get [S] shape from input dim 1 via shape() → slice, then use BuildRange.
     emscripten::val shape_options = emscripten::val::object();
     shape_options.set("label", node_name + "_rotary_range_shape" + label_suffix);
@@ -278,8 +314,7 @@ inline Status ApplyRotaryEmbedding(
     unsqueeze_options.set("label", node_name + "_rotary_position_ids_range_reshape");
     if (!has_dynamic_input) {
       // Static path: use reshape with concrete [1, S].
-      uint32_t s_len = position_ids_range["shape"][0].as<uint32_t>();
-      std::vector<uint32_t> reshape_1s{1, s_len};
+      std::vector<uint32_t> reshape_1s{1, static_dims->sequence_length};
       position_ids_range = wnn_builder.call<emscripten::val>(
           "reshape", position_ids_range, emscripten::val::array(reshape_1s), unsqueeze_options);
     } else {
@@ -310,64 +345,85 @@ inline Status ApplyRotaryEmbedding(
   //   [1, 1, S, half_dim] broadcasts as: dim 0: 1→B, dim 1: 1→N, dim 2: S=S, dim 3: half=half ✓
   emscripten::val cos_4d, sin_4d;
 
-  // Reshape cos/sin cache [max_seq, half_dim] → [1, 1, max_seq, half_dim].
-  emscripten::val reshaped_cos, reshaped_sin;
-  emscripten::val unsqueeze_cache_options = emscripten::val::object();
-  if (!has_dynamic_input) {
-    // Static path: use reshape with concrete values (cos/sin cache are always static initializers).
-    uint32_t max_seq = cos_cache["shape"][0].as<uint32_t>();
-    uint32_t half_dim = cos_cache["shape"][1].as<uint32_t>();
-    std::vector<uint32_t> cache_4d_shape{1, 1, max_seq, half_dim};
-    unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_cos_cache");
-    reshaped_cos = wnn_builder.call<emscripten::val>(
-        "reshape", cos_cache, emscripten::val::array(cache_4d_shape), unsqueeze_cache_options);
-    unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_sin_cache");
-    reshaped_sin = wnn_builder.call<emscripten::val>(
-        "reshape", sin_cache, emscripten::val::array(cache_4d_shape), unsqueeze_cache_options);
+  if (static_dims != nullptr && has_position_ids && static_dims->position_ids_batch > 1) {
+    // Each batch entry has its own positions: gather rows of the 2D cache with [B, S] indices on axis 0
+    // → [B, S, half_dim], then reshape to [B, 1, S, half_dim] to broadcast over the heads.
+    const std::vector<uint32_t> per_batch_shape{static_dims->position_ids_batch, 1, static_dims->sequence_length,
+                                                half_rotary_embedding_dim};
+    emscripten::val gather_cos_options = emscripten::val::object();
+    gather_cos_options.set("label", node_name + "_rotary_gather_cos");
+    gather_cos_options.set("axis", 0);
+    cos_4d = wnn_builder.call<emscripten::val>("gather", cos_cache, gather_position_ids, gather_cos_options);
+    emscripten::val reshape_cos_options = emscripten::val::object();
+    reshape_cos_options.set("label", node_name + "_rotary_reshape_gathered_cos");
+    cos_4d = wnn_builder.call<emscripten::val>(
+        "reshape", cos_4d, emscripten::val::array(per_batch_shape), reshape_cos_options);
+    emscripten::val gather_sin_options = emscripten::val::object();
+    gather_sin_options.set("label", node_name + "_rotary_gather_sin");
+    gather_sin_options.set("axis", 0);
+    sin_4d = wnn_builder.call<emscripten::val>("gather", sin_cache, gather_position_ids, gather_sin_options);
+    emscripten::val reshape_sin_options = emscripten::val::object();
+    reshape_sin_options.set("label", node_name + "_rotary_reshape_gathered_sin");
+    sin_4d = wnn_builder.call<emscripten::val>(
+        "reshape", sin_4d, emscripten::val::array(per_batch_shape), reshape_sin_options);
   } else {
-    // Dynamic path: use unsqueeze.
-    emscripten::val cache_axes = emscripten::val::array(std::vector<uint32_t>{0, 1});
-    unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_cos_cache");
-    reshaped_cos = wnn_builder.call<emscripten::val>(
-        "unsqueeze", cos_cache, cache_axes, unsqueeze_cache_options);
-    unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_sin_cache");
-    reshaped_sin = wnn_builder.call<emscripten::val>(
-        "unsqueeze", sin_cache, cache_axes, unsqueeze_cache_options);
-  }
-
-  // Get 1D position indices for gathering on axis=2.
-  emscripten::val gather_indices_1d;
-  if (has_position_ids) {
-    // Squeeze/reshape gather_position_ids from [B, S] to [S] (remove batch dim, B=1 for inference).
+    // Reshape cos/sin cache [max_seq, half_dim] → [1, 1, max_seq, half_dim].
+    emscripten::val reshaped_cos, reshaped_sin;
+    emscripten::val unsqueeze_cache_options = emscripten::val::object();
     if (!has_dynamic_input) {
-      // Static path: use reshape with concrete [S].
-      uint32_t s_len = gather_position_ids["shape"][1].as<uint32_t>();
-      emscripten::val reshape_pos_options = emscripten::val::object();
-      reshape_pos_options.set("label", node_name + "_rotary_flatten_position_ids");
-      gather_indices_1d = wnn_builder.call<emscripten::val>(
-          "reshape", gather_position_ids, emscripten::val::array(std::vector<uint32_t>{s_len}), reshape_pos_options);
+      // Static path: use reshape with concrete values (cos/sin cache are always static initializers).
+      std::vector<uint32_t> cache_4d_shape{1, 1, static_dims->max_sequence_length, half_rotary_embedding_dim};
+      unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_cos_cache");
+      reshaped_cos = wnn_builder.call<emscripten::val>(
+          "reshape", cos_cache, emscripten::val::array(cache_4d_shape), unsqueeze_cache_options);
+      unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_sin_cache");
+      reshaped_sin = wnn_builder.call<emscripten::val>(
+          "reshape", sin_cache, emscripten::val::array(cache_4d_shape), unsqueeze_cache_options);
     } else {
-      // Dynamic path: use squeeze.
-      emscripten::val squeeze_options = emscripten::val::object();
-      squeeze_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0}));
-      squeeze_options.set("label", node_name + "_rotary_flatten_position_ids");
-      gather_indices_1d = wnn_builder.call<emscripten::val>(
-          "squeeze", gather_position_ids, squeeze_options);
+      // Dynamic path: use unsqueeze.
+      emscripten::val cache_axes = emscripten::val::array(std::vector<uint32_t>{0, 1});
+      unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_cos_cache");
+      reshaped_cos = wnn_builder.call<emscripten::val>(
+          "unsqueeze", cos_cache, cache_axes, unsqueeze_cache_options);
+      unsqueeze_cache_options.set("label", node_name + "_rotary_reshape_sin_cache");
+      reshaped_sin = wnn_builder.call<emscripten::val>(
+          "unsqueeze", sin_cache, cache_axes, unsqueeze_cache_options);
     }
-  } else {
-    gather_indices_1d = build_sequence_range("_for_cos_sin");
-  }
 
-  // Gather on axis=2 with 1D indices [S] → [1, 1, S, half_dim] (4D).
-  // OV knows: dim 0=1 (from data), dim 1=1 (from data), dim 3=half_dim (from data).
-  emscripten::val gather_cos_options = emscripten::val::object();
-  gather_cos_options.set("label", node_name + "_rotary_gather_cos");
-  gather_cos_options.set("axis", 2);
-  cos_4d = wnn_builder.call<emscripten::val>("gather", reshaped_cos, gather_indices_1d, gather_cos_options);
-  emscripten::val gather_sin_options = emscripten::val::object();
-  gather_sin_options.set("label", node_name + "_rotary_gather_sin");
-  gather_sin_options.set("axis", 2);
-  sin_4d = wnn_builder.call<emscripten::val>("gather", reshaped_sin, gather_indices_1d, gather_sin_options);
+    // Get 1D position indices for gathering on axis=2.
+    emscripten::val gather_indices_1d;
+    if (has_position_ids) {
+      // Squeeze/reshape gather_position_ids from [B, S] to [S] (remove batch dim, B=1 for inference).
+      if (!has_dynamic_input) {
+        // Static path: use reshape with concrete [S].
+        emscripten::val reshape_pos_options = emscripten::val::object();
+        reshape_pos_options.set("label", node_name + "_rotary_flatten_position_ids");
+        gather_indices_1d = wnn_builder.call<emscripten::val>(
+            "reshape", gather_position_ids,
+            emscripten::val::array(std::vector<uint32_t>{static_dims->sequence_length}), reshape_pos_options);
+      } else {
+        // Dynamic path: use squeeze.
+        emscripten::val squeeze_options = emscripten::val::object();
+        squeeze_options.set("axes", emscripten::val::array(std::vector<uint32_t>{0}));
+        squeeze_options.set("label", node_name + "_rotary_flatten_position_ids");
+        gather_indices_1d = wnn_builder.call<emscripten::val>(
+            "squeeze", gather_position_ids, squeeze_options);
+      }
+    } else {
+      gather_indices_1d = build_sequence_range("_for_cos_sin");
+    }
+
+    // Gather on axis=2 with 1D indices [S] → [1, 1, S, half_dim] (4D).
+    // OV knows: dim 0=1 (from data), dim 1=1 (from data), dim 3=half_dim (from data).
+    emscripten::val gather_cos_options = emscripten::val::object();
+    gather_cos_options.set("label", node_name + "_rotary_gather_cos");
+    gather_cos_options.set("axis", 2);
+    cos_4d = wnn_builder.call<emscripten::val>("gather", reshaped_cos, gather_indices_1d, gather_cos_options);
+    emscripten::val gather_sin_options = emscripten::val::object();
+    gather_sin_options.set("label", node_name + "_rotary_gather_sin");
+    gather_sin_options.set("axis", 2);
+    sin_4d = wnn_builder.call<emscripten::val>("gather", reshaped_sin, gather_indices_1d, gather_sin_options);
+  }
 
   // Core RoPE formula (matches OpenVINO RoPEFusionGPTOSS pattern):
   //   Input in BNSH: [B, num_heads, S, head_size]
@@ -449,11 +505,11 @@ inline Status ApplyRotaryEmbedding(
     emscripten::val reinterleave_reshape_options = emscripten::val::object();
     reinterleave_reshape_options.set("label", node_name + "_rotary_reinterleave_reshape");
     if (!has_dynamic_input) {
-      // Static path: use reshape with concrete uint32 values.
-      emscripten::val out_dims = output["shape"];
+      // Static path: use reshape with concrete uint32 values. The output is [B, N, S, rotary_dim] (BNSH) or
+      // [B, S, N, rotary_dim] (BSNH).
       std::vector<uint32_t> reinterleave_shape{
-          out_dims[0].as<uint32_t>(), out_dims[1].as<uint32_t>(),
-          out_dims[2].as<uint32_t>(), 2, half_rotary_embedding_dim};
+          static_dims->batch_size, output_bnsh ? num_heads : static_dims->sequence_length,
+          output_bnsh ? static_dims->sequence_length : num_heads, 2, half_rotary_embedding_dim};
       output = wnn_builder.call<emscripten::val>(
           "reshape", output, emscripten::val::array(reinterleave_shape), reinterleave_reshape_options);
     } else {
@@ -478,10 +534,9 @@ inline Status ApplyRotaryEmbedding(
     final_reshape_options.set("label", node_name + "_rotary_reinterleave_flat");
     if (!has_dynamic_input) {
       // Static path: use reshape with concrete uint32 values.
-      emscripten::val transposed_dims = output["shape"];
       std::vector<uint32_t> final_shape{
-          transposed_dims[0].as<uint32_t>(), transposed_dims[1].as<uint32_t>(),
-          transposed_dims[2].as<uint32_t>(), rotary_embedding_dim};
+          static_dims->batch_size, output_bnsh ? num_heads : static_dims->sequence_length,
+          output_bnsh ? static_dims->sequence_length : num_heads, rotary_embedding_dim};
       output = wnn_builder.call<emscripten::val>(
           "reshape", output, emscripten::val::array(final_shape), final_reshape_options);
     } else {
@@ -542,7 +597,9 @@ inline emscripten::val ScaledDotProductAttention(ModelBuilder& model_builder, co
                                                  emscripten::val key, emscripten::val value, emscripten::val scale,
                                                  emscripten::val attn_mask,
                                                  const std::vector<int64_t>& reshape_output_target,
-                                                 bool has_dynamic_input) {
+                                                 // Concrete [B, S, hidden_size] for the static path, nullptr to use
+                                                 // dynamic ops. The static path must not read MLOperand.shape.
+                                                 const std::vector<uint32_t>* static_output_shape) {
   emscripten::val common_options = emscripten::val::object();
   // B,H,S,N * B,H,kv_S,N = B,H,S,kv_S
   common_options.set("label", node.Name() + "_/Attention/qkv/matmul_1");
@@ -574,23 +631,14 @@ inline emscripten::val ScaledDotProductAttention(ModelBuilder& model_builder, co
   options.set("label", node.Name() + "_/Attention/qkv/transpose");
   attn_output = model_builder.GetBuilder().call<emscripten::val>("transpose", attn_output, options);
 
-  // Reshape the transposed attn_output [B, S, N, H] to [B, S, hidden] using target_dims.
+  // Reshape the transposed attn_output [B, S, N, H] to [B, S, hidden].
   common_options.set("label", node.Name() + "_/Attention/qkv/reshape");
-  if (!has_dynamic_input) {
-    // Static path: use reshape with concrete uint32 values derived from operand shape.
-    emscripten::val attn_dims = attn_output["shape"];
-    std::vector<uint32_t> output_shape;
-    for (size_t i = 0; i < reshape_output_target.size(); ++i) {
-      if (reshape_output_target[i] == 0) {
-        output_shape.push_back(attn_dims[static_cast<int>(i)].as<uint32_t>());
-      } else {
-        output_shape.push_back(static_cast<uint32_t>(reshape_output_target[i]));
-      }
-    }
+  if (static_output_shape != nullptr) {
+    // Static path: use reshape with concrete uint32 values.
     attn_output = model_builder.GetBuilder().call<emscripten::val>(
-        "reshape", attn_output, emscripten::val::array(output_shape), common_options);
+        "reshape", attn_output, emscripten::val::array(*static_output_shape), common_options);
   } else {
-    // Dynamic path: use ComputeShape + reshapeDynamic.
+    // Dynamic path: use ComputeShape + reshapeDynamic with target_dims.
     emscripten::val reshape_output_shape = shape_utils::ComputeShape(
         model_builder, attn_output, reshape_output_target, node.Name() + "_/Attention/qkv/reshape");
     attn_output = model_builder.GetBuilder().call<emscripten::val>(
